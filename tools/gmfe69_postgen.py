@@ -73,6 +73,7 @@ STACK_MARK = "MOH_PARTICLE_STACK_WRITE_FASTPATH"
 RNG_MARK = "MOH_PARTICLE_RNG_WRITE_FASTPATH"
 MEM1_MARK = "MOH_PARTICLE_MEM1_SINGLE_CHECK"
 RESERVE_MARK = "MOH_PARTICLE_RESERVE_UNLIKELY"
+JOURNAL_MARK = "MOH_PARTICLE_JOURNAL_UNLIKELY"
 
 PARTICLE_HELPER = r'''
 /* MOH_PARTICLE_STACK_WRITE_HELPER
@@ -82,10 +83,29 @@ PARTICLE_HELPER = r'''
  * big-endian store and generic fallback semantics.
  */
 #if defined(__GNUC__) || defined(__clang__)
+/* This TU-local redeclaration lets Clang use direct RIP-relative loads for the
+ * debug-only journal globals without touching cpu.h (and therefore without
+ * forcing every generated chunk to rebuild). */
+extern PPCMemWriteJournal g_mem_write_journal __attribute__((visibility("hidden")));
+extern void* g_mem_write_journal_user __attribute__((visibility("hidden")));
+
 #define MOH_PARTICLE_ALWAYS_INLINE __attribute__((always_inline))
+#define MOH_PARTICLE_COLD_NOINLINE __attribute__((cold, noinline))
 #else
 #define MOH_PARTICLE_ALWAYS_INLINE
+#define MOH_PARTICLE_COLD_NOINLINE
 #endif
+
+/* MOH_PARTICLE_JOURNAL_UNLIKELY
+ * Lockstep is debug-only. Preserve its exact RAM pre-image callback, but keep
+ * the callback body out of CParticleSystem::RenderSystem's hot path.
+ */
+static MOH_PARTICLE_COLD_NOINLINE
+void moh_particle_journal_write32(u32 offset)
+{
+    g_mem_write_journal(offset, 4u, g_mem_write_journal_user);
+}
+
 static inline MOH_PARTICLE_ALWAYS_INLINE
 void moh_particle_stack_write32(CPUState* cpu, u32 addr, u32 value)
 {
@@ -114,8 +134,12 @@ void moh_particle_stack_write32(CPUState* cpu, u32 addr, u32 value)
                 cpu->reserve_valid = false;
         }
 
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(g_mem_write_journal != NULL, 0))
+#else
         if (g_mem_write_journal)
-            g_mem_write_journal(offset, 4u, g_mem_write_journal_user);
+#endif
+            moh_particle_journal_write32(offset);
 
         write_be32(cpu->ram + offset, value);
         return;
@@ -123,6 +147,7 @@ void moh_particle_stack_write32(CPUState* cpu, u32 addr, u32 value)
 
     mem_write32(cpu, addr, value);
 }
+#undef MOH_PARTICLE_COLD_NOINLINE
 #undef MOH_PARTICLE_ALWAYS_INLINE
 '''
 
@@ -294,6 +319,7 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
         STACK_HELPER_MARK: 1,
         MEM1_MARK: 1,
         RESERVE_MARK: 1,
+        JOURNAL_MARK: 1,
     }
     final = particle.read_text()
     for marker, expected in checks.items():
@@ -418,11 +444,12 @@ def apply_gmfe69_export_postgen(path: Path) -> None:
         end = text.find(state_anchor, start)
         if end < 0:
             raise RuntimeError("GMFE69 export postgen: malformed existing burst function")
-        # Remove a previously-emitted divider helper immediately before the burst
-        # only if it is in this generated export; it is reinserted canonically below.
-        helper_start = text.rfind("#if defined(__GNUC__) || defined(__clang__)", 0, start)
-        if helper_start >= 0 and "static u64 chassis_div_u64_u32" in text[helper_start:start]:
-            start = helper_start
+        # Replace only the burst function.
+        #
+        # Do NOT move `start` backwards to the /12 divider helper: the generated
+        # export places `chassis_dispatch()` between that helper and the burst.
+        # Moving `start` to the helper would therefore delete the normal
+        # dispatcher while s_desc still references it.
         text = text[:start] + _final_burst(cases) + text[end:]
     else:
         pos = text.find(state_anchor)
