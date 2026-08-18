@@ -172,6 +172,41 @@ u32 classify_f32(f32 value) {
     return sign ? 0x08u : 0x04u;
 }
 
+/* MOH_FMA_FPRF_F64_FASTPATH
+ *
+ * ppc_fma(single=true) has already rounded its finite result through f32 and
+ * converted it back to f64 before FPRF classification.  Re-converting that
+ * exact f32-representable f64 to f32 solely for classify_f32() is redundant.
+ *
+ * The only subtle case is an f32 subnormal: after promotion to f64 it has a
+ * normal f64 exponent.  Detect the f32-normal threshold (2^-126) explicitly.
+ * NaN/Inf/zero/sign categories are identical to classify_f32().
+ */
+static inline u32 moh_classify_single_result_f64(f64 value) {
+    const u64 bits = f64_bits(value);
+    const u64 sign = bits >> 63;
+    const u64 magnitude = bits & 0x7FFFFFFFFFFFFFFFull;
+    const u64 exponent = bits & 0x7FF0000000000000ull;
+    const u64 fraction = bits & 0x000FFFFFFFFFFFFFull;
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(exponent != 0x7FF0000000000000ull &&
+                         magnitude >= 0x3810000000000000ull, 1))
+#else
+    if (exponent != 0x7FF0000000000000ull &&
+        magnitude >= 0x3810000000000000ull)
+#endif
+        return sign ? 0x08u : 0x04u;
+
+    if (exponent == 0x7FF0000000000000ull)
+        return fraction ? 0x11u : (sign ? 0x09u : 0x05u);
+    if (magnitude == 0)
+        return sign ? 0x12u : 0x02u;
+
+    /* Any non-zero exact f32 value below 2^-126 is an f32 subnormal. */
+    return sign ? 0x18u : 0x14u;
+}
+
 void set_fprf(CPUState* cpu, u32 value) {
     cpu->fpscr = (cpu->fpscr & ~(0x1Fu << 12)) | ((value & 0x1Fu) << 12);
 }
@@ -264,19 +299,39 @@ unsigned leading_zeroes_u64(u64 value) {
 
 f64 force_25_bit(f64 value) {
     u64 bits = f64_bits(value);
-    u64 fraction = bits & 0x000FFFFFFFFFFFFFull;
+    const u64 exponent = bits & 0x7FF0000000000000ull;
+
+    /* MOH_FORCE25_NORMAL_FASTPATH
+     * For every non-zero exponent (normal, Inf and NaN), the original
+     *     (bits & FFFFFFFFF8000000) + (bits & 08000000)
+     * is algebraically identical modulo u64 to
+     *     (bits + 08000000) & FFFFFFFFF0000000.
+     *
+     * GMFE69's hot single-precision FMAs overwhelmingly use this case. Keep
+     * the exact original subnormal algorithm below for exponent == 0.
+     */
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(exponent != 0, 1)) {
+#else
+    if (exponent != 0) {
+#endif
+        bits = (bits + 0x0000000008000000ull) & 0xFFFFFFFFF0000000ull;
+        return f64_value(bits);
+    }
+
+    const u64 fraction = bits & 0x000FFFFFFFFFFFFFull;
+    if (fraction == 0)
+        return f64_value(bits); /* +0 / -0 are already exact. */
+
     u64 keep_mask = 0xFFFFFFFFF8000000ull;
     u64 round = 0x0000000008000000ull;
-
-    if ((bits & 0x7FF0000000000000ull) == 0 && fraction != 0) {
-        unsigned shift = leading_zeroes_u64(fraction) - 11;
-        if (shift < 28) {
-            keep_mask = ~((1ull << (27 - shift)) - 1);
-            round >>= shift;
-        } else {
-            keep_mask = ~0ull;
-            round = 0;
-        }
+    unsigned shift = leading_zeroes_u64(fraction) - 11;
+    if (shift < 28) {
+        keep_mask = ~((1ull << (27 - shift)) - 1);
+        round >>= shift;
+    } else {
+        keep_mask = ~0ull;
+        round = 0;
     }
 
     bits = (bits & keep_mask) + (bits & round);
@@ -340,10 +395,64 @@ bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
 
     if (negative && !isnan(result))
         result = -result;
-    set_fprf(cpu, single ? classify_f32((f32)result) : classify_f64(result));
+    set_fprf(cpu, single ? moh_classify_single_result_f64(result) : classify_f64(result));
     *output = result;
     return true;
 }
+
+
+/* MOH_GMFE69_FMADDS_HELPER
+ *
+ * Exact common-path specialization for the very hot GMFE69 particle fmadds
+ * sites. Exceptional operands and the rare PowerPC halfway correction fall
+ * back to ppc_fma(), preserving NaN/FPSCR/VE behavior.
+ */
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+__attribute__((target("fma")))
+#endif
+bool ppc_fmadds_gmfe69_fast(CPUState* cpu, f64 a, f64 c, f64 b,
+                            f64* output)
+{
+    const f64 rounded_c = force_25_bit(c);
+    f64 result = fma(a, rounded_c, b);
+    const u64 bits = f64_bits(result);
+
+    /* MOH_GMFE69_FMADDS_RESULT_GUARD
+     * The original ppc_fma performs its NaN/Inf architectural handling only
+     * after calculating the FMA. A finite result therefore proves the common
+     * path needs none of that handling. Any NaN/Inf result falls back to the
+     * exact generic helper, covering exceptional inputs and finite overflow.
+     */
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(
+            (bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull,
+            0))
+#else
+    if ((bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull)
+#endif
+        return ppc_fma(cpu, a, c, b, true, false, false, output);
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(
+            (bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull,
+            0))
+#else
+    if ((bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull)
+#endif
+        return ppc_fma(cpu, a, c, b, true, false, false, output);
+
+    /* MOH_GMFE69_FMADDS_F32_CLASSIFY
+     * Keep the already-rounded single value alive for FPRF classification.
+     * This is exactly what generic ppc_fma(single=true) classifies, while
+     * avoiding a redundant reconstruction/classification through f64 bits.
+     */
+    const f32 single_result = (f32)result;
+    result = (f64)single_result;
+    set_fprf(cpu, classify_f32(single_result));
+    *output = result;
+    return true;
+}
+
 
 f64 make_quiet(f64 value) {
     return f64_value(f64_bits(value) | 0x0008000000000000ull);

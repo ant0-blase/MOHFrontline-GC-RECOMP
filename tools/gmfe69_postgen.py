@@ -67,13 +67,74 @@ PARTICLE_RNG_TARGETS = {
     0x8007E450: 3,
 }
 
+
+# MOH_PARTICLE_FMADDS_PERMANENT_POSTGEN
+PARTICLE_FMADDS_TARGETS = (
+    0x8007E204, 0x8007E210, 0x8007E230, 0x8007E238,
+    0x8007E294, 0x8007E2E8, 0x8007E2F4,
+    0x8007E30C, 0x8007E320, 0x8007E328, 0x8007E32C, 0x8007E330,
+    0x8007E354, 0x8007E36C, 0x8007E37C, 0x8007E394, 0x8007E3A0,
+    0x8007E3F0, 0x8007E404, 0x8007E40C, 0x8007E424, 0x8007E444,
+    0x8007E454, 0x8007E464,
+    0x8007E538, 0x8007E550, 0x8007E568, 0x8007E588,
+    0x8007E5A0, 0x8007E5A4, 0x8007E5A8, 0x8007E5B0, 0x8007E5B4,
+    0x8007E5B8, 0x8007E5CC, 0x8007E5D4, 0x8007E5E0, 0x8007E5E4,
+    0x8007E5EC,
+)
+
+# MOH_PARTICLE_STACK_LFS_PERMANENT_POSTGEN
+STACK_LFS_MARK = "MOH_PARTICLE_STACK_LFS_FASTPATH"
+STACK_LFS_HELPER_MARK = "MOH_PARTICLE_STACK_LFS_HELPER"
+
+STACK_LFS_HELPER = r"""
+/* MOH_PARTICLE_STACK_LFS_HELPER
+ *
+ * Fast-path GameCube stack loads from MEM1. r1-backed stack addresses are
+ * overwhelmingly normal MEM1; preserve exact generic memory behavior outside
+ * that range.
+ */
+static inline __attribute__((always_inline))
+u32 moh_particle_stack_read32(CPUState* cpu, u32 addr)
+{
+    const u32 offset = addr - GC_RAM_BASE;
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(cpu->ram_size >= 4u &&
+                         offset <= (cpu->ram_size - 4u), 1))
+#else
+    if (cpu->ram_size >= 4u &&
+        offset <= (cpu->ram_size - 4u))
+#endif
+        return read_be32(cpu->ram + offset);
+
+    return mem_read32(cpu, addr);
+}
+
+"""
+
+STACK_LFS_COMMENT_RE = re.compile(
+    r'//\s*([0-9A-Fa-f]{8}):\s+lfs\s+f(\d+),\s*(-?\d+)\(r1\)'
+)
+
+STACK_LFS_BODY_RE = re.compile(
+    r'(?P<indent>[ \t]*)\{\s*\n'
+    r'(?P=indent)[ \t]+u32 ea = ctx->gpr\[1\] \+ \(u32\)\(s32\)\((?P<off>-?\d+)\);\s*\n'
+    r'(?P=indent)[ \t]+f64 value = \(f64\)dolrecomp_f32_from_bits\(mem_read32\(ctx, ea\)\);\s*\n'
+    r'(?P=indent)[ \t]+ctx->fpr\[(?P<fpr>\d+)\] = value;\s*\n'
+    r'(?P=indent)[ \t]+ctx->ps1\[(?P=fpr)\] = value;\s*\n'
+    r'(?P=indent)\}',
+    re.MULTILINE,
+)
+
+FMADDS_MARK = "MOH_PARTICLE_FMADDS_FASTPATH"
+FMADDS_PROTO_MARK = "MOH_PARTICLE_FMADDS_PROTO"
+
 LFD_MARK = "MOH_PARTICLE_LFD_FASTPATH"
 STACK_HELPER_MARK = "MOH_PARTICLE_STACK_WRITE_HELPER"
 STACK_MARK = "MOH_PARTICLE_STACK_WRITE_FASTPATH"
 RNG_MARK = "MOH_PARTICLE_RNG_WRITE_FASTPATH"
 MEM1_MARK = "MOH_PARTICLE_MEM1_SINGLE_CHECK"
 RESERVE_MARK = "MOH_PARTICLE_RESERVE_UNLIKELY"
-JOURNAL_MARK = "MOH_PARTICLE_JOURNAL_UNLIKELY"
 
 PARTICLE_HELPER = r'''
 /* MOH_PARTICLE_STACK_WRITE_HELPER
@@ -83,29 +144,10 @@ PARTICLE_HELPER = r'''
  * big-endian store and generic fallback semantics.
  */
 #if defined(__GNUC__) || defined(__clang__)
-/* This TU-local redeclaration lets Clang use direct RIP-relative loads for the
- * debug-only journal globals without touching cpu.h (and therefore without
- * forcing every generated chunk to rebuild). */
-extern PPCMemWriteJournal g_mem_write_journal __attribute__((visibility("hidden")));
-extern void* g_mem_write_journal_user __attribute__((visibility("hidden")));
-
 #define MOH_PARTICLE_ALWAYS_INLINE __attribute__((always_inline))
-#define MOH_PARTICLE_COLD_NOINLINE __attribute__((cold, noinline))
 #else
 #define MOH_PARTICLE_ALWAYS_INLINE
-#define MOH_PARTICLE_COLD_NOINLINE
 #endif
-
-/* MOH_PARTICLE_JOURNAL_UNLIKELY
- * Lockstep is debug-only. Preserve its exact RAM pre-image callback, but keep
- * the callback body out of CParticleSystem::RenderSystem's hot path.
- */
-static MOH_PARTICLE_COLD_NOINLINE
-void moh_particle_journal_write32(u32 offset)
-{
-    g_mem_write_journal(offset, 4u, g_mem_write_journal_user);
-}
-
 static inline MOH_PARTICLE_ALWAYS_INLINE
 void moh_particle_stack_write32(CPUState* cpu, u32 addr, u32 value)
 {
@@ -134,12 +176,8 @@ void moh_particle_stack_write32(CPUState* cpu, u32 addr, u32 value)
                 cpu->reserve_valid = false;
         }
 
-#if defined(__GNUC__) || defined(__clang__)
-        if (__builtin_expect(g_mem_write_journal != NULL, 0))
-#else
         if (g_mem_write_journal)
-#endif
-            moh_particle_journal_write32(offset);
+            g_mem_write_journal(offset, 4u, g_mem_write_journal_user);
 
         write_be32(cpu->ram + offset, value);
         return;
@@ -147,7 +185,6 @@ void moh_particle_stack_write32(CPUState* cpu, u32 addr, u32 value)
 
     mem_write32(cpu, addr, value);
 }
-#undef MOH_PARTICLE_COLD_NOINLINE
 #undef MOH_PARTICLE_ALWAYS_INLINE
 '''
 
@@ -286,6 +323,132 @@ def _patch_particle_rng(text: str) -> str:
     return text
 
 
+
+
+def _patch_particle_stack_lfs(text: str) -> str:
+    if STACK_LFS_HELPER_MARK not in text:
+        include_anchor = '#include "../generated.h"\n'
+        if include_anchor not in text:
+            raise RuntimeError("particle stack lfs: generated include anchor not found")
+        text = text.replace(
+            include_anchor,
+            include_anchor + "\n" + STACK_LFS_HELPER,
+            1,
+        )
+
+    comments = list(STACK_LFS_COMMENT_RE.finditer(text))
+    targets = [
+        (int(m.group(1), 16), int(m.group(2)), int(m.group(3)))
+        for m in comments
+    ]
+
+    if len(targets) != 144:
+        raise RuntimeError(
+            f"particle stack lfs: expected 144 r1-backed lfs sites, "
+            f"found {len(targets)}"
+        )
+
+    for pc, fpr, off in sorted(targets, reverse=True):
+        start, end = _block_bounds(text, pc)
+        block = text[start:end]
+
+        if STACK_LFS_MARK in block:
+            continue
+
+        cm = STACK_LFS_COMMENT_RE.search(block)
+        if not cm:
+            raise RuntimeError(f"{pc:08X}: stack lfs comment missing")
+        if int(cm.group(2)) != fpr or int(cm.group(3)) != off:
+            raise RuntimeError(f"{pc:08X}: stack lfs metadata mismatch")
+
+        bm = STACK_LFS_BODY_RE.search(block)
+        if not bm:
+            raise RuntimeError(
+                f"{pc:08X}: standard stack lfs generated body not found"
+            )
+        if int(bm.group("off")) != off or int(bm.group("fpr")) != fpr:
+            raise RuntimeError(f"{pc:08X}: stack lfs body mismatch")
+
+        indent = bm.group("indent")
+        replacement = (
+            indent + "{\n"
+            + indent + f"    u32 ea = ctx->gpr[1] + (u32)(s32)({off});\n"
+            + indent + "    f64 value = (f64)dolrecomp_f32_from_bits("
+              "moh_particle_stack_read32(ctx, ea)); "
+              f"/* {STACK_LFS_MARK} */\n"
+            + indent + f"    ctx->fpr[{fpr}] = value;\n"
+            + indent + f"    ctx->ps1[{fpr}] = value;\n"
+            + indent + "}"
+        )
+
+        block = block[:bm.start()] + replacement + block[bm.end():]
+        text = text[:start] + block + text[end:]
+
+    return text
+
+
+def _patch_particle_fmadds(text: str) -> str:
+    # Normalize the legacy manually-installed prototype marker first.
+    # It used FMADDS_MARK itself, which made marker verification count
+    # 39 call-sites + 1 prototype = 40.
+    legacy_proto = (
+        "/* MOH_PARTICLE_FMADDS_FASTPATH: compact exact fmadds common path. */"
+    )
+    if legacy_proto in text:
+        text = text.replace(
+            legacy_proto,
+            f"/* {FMADDS_PROTO_MARK}: exact GMFE69 particle fmadds helper. */",
+            1,
+        )
+
+    if FMADDS_PROTO_MARK not in text:
+        fn = re.search(
+            r"(?m)^[A-Za-z_][A-Za-z0-9_ \t\*]*\bmg_img\d+_func_8007AE80\s*\(",
+            text,
+        )
+        if not fn:
+            raise RuntimeError(
+                "particle fmadds: generated 0x8007AE80 function declaration not found"
+            )
+        proto = (
+            f"/* {FMADDS_PROTO_MARK}: exact GMFE69 particle fmadds helper. */\n"
+            "extern bool ppc_fmadds_gmfe69_fast(CPUState* cpu, f64 a, f64 c, f64 b,\n"
+            "                                       f64* output);\n\n"
+        )
+        text = text[:fn.start()] + proto + text[fn.start():]
+
+    pattern = re.compile(
+        r"ppc_fma\(\s*ctx\s*,\s*"
+        r"(ctx->fpr\[\d+\])\s*,\s*"
+        r"(ctx->fpr\[\d+\])\s*,\s*"
+        r"(ctx->fpr\[\d+\])\s*,\s*"
+        r"true\s*,\s*false\s*,\s*false\s*,\s*&result\s*\)"
+    )
+
+    for pc in sorted(PARTICLE_FMADDS_TARGETS, reverse=True):
+        start, end = _block_bounds(text, pc)
+        block = text[start:end]
+        if FMADDS_MARK in block:
+            continue
+
+        matches = list(pattern.finditer(block))
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"{pc:08X}: expected exactly one particle fmadds ppc_fma "
+                f"(true,false,false), found {len(matches)}"
+            )
+
+        match = matches[0]
+        replacement = (
+            f"ppc_fmadds_gmfe69_fast(ctx, {match.group(1)}, {match.group(2)}, "
+            f"{match.group(3)}, &result) /* {FMADDS_MARK} */"
+        )
+        block = block[:match.start()] + replacement + block[match.end():]
+        text = text[:start] + block + text[end:]
+
+    return text
+
+
 def apply_gmfe69_generated_postgen(generated: Path) -> None:
     generated = Path(generated)
     chunks = generated / "chunks"
@@ -310,16 +473,21 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
     text = _patch_particle_lfd(text)
     text = _patch_particle_stack(text)
     text = _patch_particle_rng(text)
+    text = _patch_particle_fmadds(text)
+    text = _patch_particle_stack_lfs(text)
     particle.write_text(text)
 
     checks = {
         LFD_MARK: 11,
         STACK_MARK: 7,
         RNG_MARK: 11,
+        FMADDS_MARK: 39,
+        FMADDS_PROTO_MARK: 1,
+        STACK_LFS_MARK: 144,
+        STACK_LFS_HELPER_MARK: 1,
         STACK_HELPER_MARK: 1,
         MEM1_MARK: 1,
         RESERVE_MARK: 1,
-        JOURNAL_MARK: 1,
     }
     final = particle.read_text()
     for marker, expected in checks.items():
