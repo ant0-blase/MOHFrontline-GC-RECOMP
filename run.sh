@@ -9,6 +9,7 @@ GAME="$ROOT/extracted"
 USER_DIR="$ROOT/user"
 
 FOV="default"
+WEAPON_FOV="follow"
 ASPECT="default"
 FPS="default"
 PASS_ARGS=()
@@ -18,7 +19,9 @@ usage() {
 Usage: ./run.sh [MOH options] [ModernGekko options]
 
 MOH Frontline PC enhancements:
-  --fov <degrees|default>     Final horizontal FOV. Example: --fov 90
+  --fov <degrees|default>     Final horizontal world FOV. Example: --fov 90
+  --weapon-fov <degrees|follow>
+                              Viewmodel FOV. Omitted/follow = follows --fov
   --aspect <ratio|auto|default>
                               default/original, auto, 4:3, 16:10, 16:9,
                               21:9, 32:9, WIDTH:HEIGHT or WIDTHxHEIGHT
@@ -50,6 +53,11 @@ while (($#)); do
     --fov)
       need_value "$1" "${2:-}"
       FOV="$2"
+      shift 2
+      ;;
+    --weapon-fov)
+      need_value "$1" "${2:-}"
+      WEAPON_FOV="$2"
       shift 2
       ;;
     --aspect)
@@ -98,8 +106,8 @@ if [[ ! -f "$GAME/sys/main.dol" ]]; then
 fi
 mkdir -p "$USER_DIR"
 
-unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_ASPECT_VALUE \
-      MOH_ASPECT_NUM MOH_ASPECT_DEN MOH_FPS_TARGET 2>/dev/null || true
+unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_WEAPON_FOV_DEGREES \
+      MOH_ASPECT_VALUE MOH_ASPECT_NUM MOH_ASPECT_DEN MOH_FPS_TARGET 2>/dev/null || true
 
 # FOV: an explicit value is the final horizontal FOV on the selected aspect.
 case "${FOV,,}" in
@@ -112,6 +120,19 @@ case "${FOV,,}" in
     fi
     export MOH_CAMERA_PATCH=1
     export MOH_FOV_DEGREES="$FOV"
+    ;;
+esac
+
+case "${WEAPON_FOV,,}" in
+  follow)
+    ;;
+  *)
+    if ! awk -v v="$WEAPON_FOV" 'BEGIN { exit !(v+0==v && v>=20 && v<179) }'; then
+      echo "error: --weapon-fov must be follow or a number from 20 to <179" >&2
+      exit 2
+    fi
+    export MOH_CAMERA_PATCH=1
+    export MOH_WEAPON_FOV_DEGREES="$WEAPON_FOV"
     ;;
 esac
 
@@ -183,7 +204,7 @@ case "${FPS,,}" in
 esac
 
 if [[ -n "${MOH_CAMERA_PATCH:-}" || -n "${MOH_TIMING_PATCH:-}" ]]; then
-  echo "MOH native enhancements: aspect=${ASPECT} fov=${FOV} fps=${FPS}"
+  echo "MOH native enhancements: aspect=${ASPECT} fov=${FOV} weapon-fov=${WEAPON_FOV} fps=${FPS}"
 fi
 
 exec "$RUNTIME" \

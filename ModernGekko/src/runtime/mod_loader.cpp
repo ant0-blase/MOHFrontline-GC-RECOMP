@@ -1,4 +1,6 @@
 #include "moderngekko/mod_loader.hpp"
+#include "Common/Config/Config.h"
+#include "Core/Config/MainSettings.h"
 
 #if defined(MODERNGEKKO_ENABLE_DYNAMIC_MODULES)
 #include "Common/DynamicLibrary.h"
@@ -8,6 +10,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <queue>
 #include <unordered_map>
@@ -17,6 +20,8 @@
 namespace moderngekko {
 namespace {
 constexpr std::uint32_t MAX_ITEMS = 1u << 20;
+constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_ON = 0xFFFFF100u;
+constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_OFF = 0xFFFFF101u;
 
 struct Version {
   std::array<std::uint32_t, 3> parts{};
@@ -652,6 +657,20 @@ bool ModManager::Empty() const { return m_impl->mods.empty(); }
 
 bool ModManager::HostCall(CPUState *state, std::uint32_t address,
                           void *user_data) {
+  // Reserved GMFE69 control tokens emitted directly by the native game module.
+  // They toggle Dolphin's VI-frequency override only while the real gameplay
+  // loop is active; shell/menu/FMVs/DVD loading remain at original timing.
+  if (address == MOH_HOSTCALL_VI_GAMEPLAY_ON ||
+      address == MOH_HOSTCALL_VI_GAMEPLAY_OFF) {
+    const bool enable = address == MOH_HOSTCALL_VI_GAMEPLAY_ON;
+    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK_ENABLE, enable);
+    std::fprintf(stderr,
+                 "[moh-enh] gameplay VI overclock %s (factor %.4f)\n",
+                 enable ? "ON" : "OFF",
+                 Config::Get(Config::MAIN_VI_OVERCLOCK));
+    return true;
+  }
+
   return user_data &&
          static_cast<ModManager *>(user_data)->Dispatch(state, address);
 }

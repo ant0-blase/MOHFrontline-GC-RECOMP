@@ -8,8 +8,10 @@ extern "C" {
 #endif
 
 int moh_camera_override(CPUState* ctx);
+int moh_weapon_projection_override(CPUState* ctx);
 int moh_timing_enabled(void);
-int moh_timing_wait(CPUState* ctx);
+void moh_timing_set_gameplay(CPUState* ctx, int active);
+void moh_timing_frame_advance(void);
 f64 moh_timing_delta_ticks(void);
 u32 moh_timing_integer_ticks(void);
 f64 moh_timing_game_time_seconds(void);

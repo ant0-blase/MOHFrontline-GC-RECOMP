@@ -249,20 +249,30 @@ def apply_gmfe69_generated_enhancements(generated: Path):
     }
 """)
 
-    # DolRecomp lifts this busy-wait into a static loop helper.  Patch that
-    # helper itself so even same-chunk direct gotos cannot bypass the timing hook.
-    _inject_after_label(generated, "8001B92C", """    {
-        const int moh_wait_action = moh_timing_wait(ctx);
-        if (moh_wait_action > 0) {
-            ctx->pc = 0x8001B938u;
-            return;
-        }
-        if (moh_wait_action < 0) {
-            ctx->pc = 0x8001B92Cu;
-            return;
-        }
+    # The player weapon/viewmodel builds its own Perspective matrix and never
+    # goes through CCamera::SetPerspective.  Adjust its already-computed tangent
+    # pair immediately before each Perspective call.
+    for weapon_proj_label in ("800A8458", "800A84A8"):
+        _inject_after_label(generated, weapon_proj_label, """    (void)moh_weapon_projection_override(ctx);
+""")
+
+    # Arm high-rate VI only for actual in-level gameplay.  The shell/menu and
+    # LoadTheGame paths must keep original GameCube timing because their state
+    # machines and DVD/streaming waits are VBlank-sensitive.
+    _inject_after_label(generated, "80018378", """    moh_timing_set_gameplay(ctx, 1);
+""")
+    _inject_after_label(generated, "80018570", """    moh_timing_set_gameplay(ctx, 0);
+""")
+    _inject_after_label(generated, "80019794", """    moh_timing_set_gameplay(ctx, 0);
+""")
+
+    # Keep the original CScreen::Wait VBlank synchronization.  ModernGekko's
+    # native VI-frequency override supplies faster VBlanks; only advance MOH's
+    # virtual 60-Hz simulation clock after the original wait has completed.
+    _inject_after_label(generated, "8001B938", """    if (moh_timing_enabled()) {
+        moh_timing_frame_advance();
     }
-""", occurrence="first")
+""")
     _inject_after_label(generated, "8001B940", """    if (moh_timing_enabled()) {
         ctx->gpr[4] = moh_timing_vsyncs(ctx);
         goto label_8001B944;
@@ -300,6 +310,12 @@ def apply_gmfe69_generated_enhancements(generated: Path):
 
     _inject_after_label(generated, "80017E2C", """    if (moh_timing_enabled()) {
         ctx->fpr[1] = moh_timing_game_time_seconds();
+        ctx->pc = ctx->lr & ~3u;
+        goto return_dispatch_80016E80;
+    }
+""")
+    _inject_after_label(generated, "80017E60", """    if (moh_timing_enabled()) {
+        ctx->gpr[3] = moh_timing_frame_count();
         ctx->pc = ctx->lr & ~3u;
         goto return_dispatch_80016E80;
     }

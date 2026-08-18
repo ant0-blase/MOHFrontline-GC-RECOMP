@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -307,8 +308,50 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
       }
     }
   }
-  if (std::getenv("MOH_TIMING_PATCH"))
+  if (std::getenv("MOH_TIMING_PATCH")) {
+    // Use Dolphin's native VBI-frequency override rather than sleeping or
+    // polling inside the recompiled CPU thread.  This is the mechanism Dolphin
+    // exposes specifically for game FPS patches: VI/VBlank runs faster while
+    // the rest of CoreTiming/audio keeps normal real-time pacing.
+    constexpr double ntsc_vps = 59.94005994005994;
+    constexpr double uncapped_vi_ceiling = 1000.0;
+    const char* fps_text = std::getenv("MOH_FPS_TARGET");
+    double target_vps = 60.0;
+    bool uncapped = false;
+
+    if (fps_text && std::string_view(fps_text) == "unlimited") {
+      target_vps = uncapped_vi_ceiling;
+      uncapped = true;
+    } else if (fps_text && *fps_text) {
+      char* end = nullptr;
+      const double parsed = std::strtod(fps_text, &end);
+      if (end != fps_text && *end == '\0' && std::isfinite(parsed) && parsed > 0.0)
+        target_vps = parsed;
+    }
+
+    const float vi_factor = static_cast<float>(target_vps / ntsc_vps);
+
+    // Arm the requested VI rate, but deliberately keep it disabled during
+    // boot, shell/menu, FMVs and level loading.  The GMFE69 native module
+    // toggles VIOverclockEnable through a reserved StaticRecomp host call only
+    // while the main gameplay loop is active.  Frontend/DVD timing therefore
+    // remains exactly at the original GameCube VBI rate.
+    Config::SetBase(Config::MAIN_VI_OVERCLOCK_ENABLE, false);
+    Config::SetBase(Config::MAIN_VI_OVERCLOCK, vi_factor);
+    Config::SetBase(Config::MAIN_PRECISION_FRAME_TIMING, true);
     Config::SetBase(Config::GFX_VSYNC, false);
+
+    if (uncapped)
+      std::fprintf(stderr,
+                   "[moh-enh] gameplay-only VI unlock armed: uncapped "
+                   "(1000 Hz ceiling, factor %.4f)\n",
+                   vi_factor);
+    else
+      std::fprintf(stderr,
+                   "[moh-enh] gameplay-only VI unlock armed: %.3f Hz "
+                   "(factor %.4f); menus/loading remain 59.94 Hz\n",
+                   target_vps, vi_factor);
+  }
   Config::SetBase(Config::GFX_SHADER_CACHE, true);
   Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
                   ShaderCompilationMode::AsynchronousUberShaders);
@@ -342,12 +385,20 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
     recomp_source = StaticRecompModuleSource::Attached(
         reinterpret_cast<const StaticRecompModuleDesc *>(
             impl->config.module.descriptor));
-  if (!impl->mods->Empty()) {
+  // GMFE69 gameplay-only FPS control uses two reserved host-call tokens from
+  // the native module.  Those control calls must remain available even when
+  // no external --mods directory is loaded.  Previously host_call was only
+  // wired when ModManager was non-empty, so the game switched to fractional
+  // delta while VIOverclockEnable stayed false (classic slow-motion).
+  const bool moh_control_calls = std::getenv("MOH_TIMING_PATCH") != nullptr;
+  if (!impl->mods->Empty() || moh_control_calls) {
     recomp_source.host_call = &ModManager::HostCall;
+    recomp_source.host_call_user = impl->mods.get();
+  }
+  if (!impl->mods->Empty()) {
     recomp_source.host_call_contains = &ModManager::HostCallContains;
     recomp_source.host_call_range_contains =
         &ModManager::HostCallRangeContains;
-    recomp_source.host_call_user = impl->mods.get();
   }
   jit.SetStaticRecompModuleSource(std::move(recomp_source));
 
