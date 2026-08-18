@@ -1,0 +1,98 @@
+# =============================================================================
+# Medal of Honor: Frontline (GMFE69) recompilation
+# Keep this ignore file intentionally narrow: source changes must stay visible.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Original copyrighted game data - never commit
+# -----------------------------------------------------------------------------
+/iso/*
+!/iso/README.md
+/extracted/*
+!/extracted/README.md
+
+# Common disc/image variants if copied somewhere by mistake
+*.iso
+*.gcm
+*.rvz
+*.wbfs
+*.wia
+
+# -----------------------------------------------------------------------------
+# Project-generated build/publish output
+# -----------------------------------------------------------------------------
+/.cache/
+/build/
+/build-*/
+/port-build/
+/port-build-*/
+/recomp-c/
+/recomp-llvm/
+/module/
+/runtime/
+/.build.lock
+
+# ModernGekko local out-of-tree/in-tree build directories
+/ModernGekko/build/
+/ModernGekko/build-*/
+/ModernGekko/.cache/
+
+# -----------------------------------------------------------------------------
+# Runtime state / profiling / local captures
+# -----------------------------------------------------------------------------
+/user/
+/perf/
+perf.data
+perf.data.*
+*.log
+*.trace
+*.prof
+*.core
+/core
+/core.*
+
+# Local inspection output
+/unknown-opcodes*.csv
+
+# -----------------------------------------------------------------------------
+# Compiler/CMake/Ninja leftovers outside the normal ignored build directories
+# -----------------------------------------------------------------------------
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+*.o
+*.obj
+*.d
+
+# -----------------------------------------------------------------------------
+# Python caches
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# -----------------------------------------------------------------------------
+# Patch rejects / local scratch / editor noise
+# -----------------------------------------------------------------------------
+*.bak
+*.bak[0-9]*
+*.orig
+*.rej
+*.pre-*
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+PID=*
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
