@@ -1,6 +1,7 @@
 #include "moderngekko/mod_loader.hpp"
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
+#include "VideoCommon/MohPcLayer.h"
 
 #if defined(MODERNGEKKO_ENABLE_DYNAMIC_MODULES)
 #include "Common/DynamicLibrary.h"
@@ -22,6 +23,8 @@ namespace {
 constexpr std::uint32_t MAX_ITEMS = 1u << 20;
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_ON = 0xFFFFF100u;
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_OFF = 0xFFFFF101u;
+constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_ENTER = 0xFFFFF110u;
+constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_EXIT = 0xFFFFF111u;
 
 struct Version {
   std::array<std::uint32_t, 3> parts{};
@@ -657,6 +660,11 @@ bool ModManager::Empty() const { return m_impl->mods.empty(); }
 
 bool ModManager::HostCall(CPUState *state, std::uint32_t address,
                           void *user_data) {
+  if (address == MOH_HOSTCALL_GAMEPLAY_ENTER || address == MOH_HOSTCALL_GAMEPLAY_EXIT) {
+    const bool active = address == MOH_HOSTCALL_GAMEPLAY_ENTER;
+    MohPcLayer::SetGameplayActive(active);
+    return true;
+  }
   // Reserved GMFE69 control tokens emitted directly by the native game module.
   // They toggle Dolphin's VI-frequency override only while the real gameplay
   // loop is active; shell/menu/FMVs/DVD loading remain at original timing.

@@ -296,6 +296,16 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
             HINTS "${_moderngekko_sdk_usr}/share/wayland-protocols/unstable/idle-inhibit"
                   "/usr/share/wayland-protocols/unstable/idle-inhibit"
             REQUIRED)
+        find_file(MODERNGEKKO_RELATIVE_POINTER_XML relative-pointer-unstable-v1.xml
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Externals/SDL/SDL/wayland-protocols"
+                  "${_moderngekko_sdk_usr}/share/wayland-protocols/unstable/relative-pointer"
+                  "/usr/share/wayland-protocols/unstable/relative-pointer"
+            REQUIRED)
+        find_file(MODERNGEKKO_POINTER_CONSTRAINTS_XML pointer-constraints-unstable-v1.xml
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Externals/SDL/SDL/wayland-protocols"
+                  "${_moderngekko_sdk_usr}/share/wayland-protocols/unstable/pointer-constraints"
+                  "/usr/share/wayland-protocols/unstable/pointer-constraints"
+            REQUIRED)
         find_library(MODERNGEKKO_WAYLAND_CURSOR_LIBRARY wayland-cursor
             HINTS "${_moderngekko_sdk_lib}" REQUIRED)
         find_library(MODERNGEKKO_XKBCOMMON_LIBRARY xkbcommon
@@ -314,6 +324,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
             "${_moderngekko_wayland_generated}/idle-inhibit-unstable-v1-client-protocol.h")
         set(_moderngekko_idle_inhibit_code
             "${_moderngekko_wayland_generated}/idle-inhibit-unstable-v1-protocol.c")
+        set(_moderngekko_relative_pointer_header
+            "${_moderngekko_wayland_generated}/relative-pointer-unstable-v1-client-protocol.h")
+        set(_moderngekko_relative_pointer_code
+            "${_moderngekko_wayland_generated}/relative-pointer-unstable-v1-protocol.c")
+        set(_moderngekko_pointer_constraints_header
+            "${_moderngekko_wayland_generated}/pointer-constraints-unstable-v1-client-protocol.h")
+        set(_moderngekko_pointer_constraints_code
+            "${_moderngekko_wayland_generated}/pointer-constraints-unstable-v1-protocol.c")
         add_custom_command(
             OUTPUT "${_moderngekko_xdg_header}" "${_moderngekko_xdg_code}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory
@@ -344,11 +362,29 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
                     "${MODERNGEKKO_IDLE_INHIBIT_XML}" "${_moderngekko_idle_inhibit_code}"
             DEPENDS "${MODERNGEKKO_IDLE_INHIBIT_XML}"
             VERBATIM)
+        add_custom_command(
+            OUTPUT "${_moderngekko_relative_pointer_header}" "${_moderngekko_relative_pointer_code}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${_moderngekko_wayland_generated}"
+            COMMAND "${MODERNGEKKO_WAYLAND_SCANNER}" client-header
+                    "${MODERNGEKKO_RELATIVE_POINTER_XML}" "${_moderngekko_relative_pointer_header}"
+            COMMAND "${MODERNGEKKO_WAYLAND_SCANNER}" private-code
+                    "${MODERNGEKKO_RELATIVE_POINTER_XML}" "${_moderngekko_relative_pointer_code}"
+            DEPENDS "${MODERNGEKKO_RELATIVE_POINTER_XML}" VERBATIM)
+        add_custom_command(
+            OUTPUT "${_moderngekko_pointer_constraints_header}" "${_moderngekko_pointer_constraints_code}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${_moderngekko_wayland_generated}"
+            COMMAND "${MODERNGEKKO_WAYLAND_SCANNER}" client-header
+                    "${MODERNGEKKO_POINTER_CONSTRAINTS_XML}" "${_moderngekko_pointer_constraints_header}"
+            COMMAND "${MODERNGEKKO_WAYLAND_SCANNER}" private-code
+                    "${MODERNGEKKO_POINTER_CONSTRAINTS_XML}" "${_moderngekko_pointer_constraints_code}"
+            DEPENDS "${MODERNGEKKO_POINTER_CONSTRAINTS_XML}" VERBATIM)
         target_sources(moderngekko PRIVATE
             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWayland.cpp
             "${_moderngekko_xdg_code}"
             "${_moderngekko_decoration_code}"
-            "${_moderngekko_idle_inhibit_code}")
+            "${_moderngekko_idle_inhibit_code}"
+            "${_moderngekko_relative_pointer_code}"
+            "${_moderngekko_pointer_constraints_code}")
         target_include_directories(moderngekko PRIVATE
             "${_moderngekko_wayland_generated}")
         if(MODERNGEKKO_FRONTEND_SDK)

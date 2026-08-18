@@ -18,6 +18,7 @@
 #include "DolphinNoGUI/Platform.h"
 #include "UICommon/UICommon.h"
 #include "VideoCommon/PerformanceMetrics.h"
+#include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/VideoConfig.h"
 #include "dolphin_runtime_internal.hpp"
 #include "moderngekko/cpu_state.h"
@@ -99,6 +100,8 @@ void Host_Message(HostMessageID id) {
 void Host_UpdateTitle(const std::string &) {
   if (!s_platform)
     return;
+
+  MohPcLayer::AdaptivePerformanceUpdate();
 
   std::string title = s_window_title;
   if (s_show_fps_in_title &&
@@ -272,6 +275,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   const WindowSystemInfo wsi = impl->platform->GetWindowSystemInfo();
   UICommon::InitControllers(wsi);
   impl->controllers_initialized = true;
+  MohPcLayer::Initialize();
   impl->platform->SetTitle(impl->title);
 
   Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
@@ -375,6 +379,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   Config::SetBase(Config::MAIN_AUDIO_BACKEND, impl->config.audio.backend);
   Config::SetBase(Config::MAIN_INPUT_BACKGROUND_INPUT,
                   impl->config.input.background_input);
+  // Apply persistent PC-port controls/graphics/audio after the normal runtime defaults.
+  MohPcLayer::ApplyDolphinSettings();
 
   auto &jit = Core::System::GetInstance().GetJitInterface();
   StaticRecompModuleSource recomp_source;
@@ -390,7 +396,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   // no external --mods directory is loaded.  Previously host_call was only
   // wired when ModManager was non-empty, so the game switched to fractional
   // delta while VIOverclockEnable stayed false (classic slow-motion).
-  const bool moh_control_calls = std::getenv("MOH_TIMING_PATCH") != nullptr;
+  // GMFE69 uses reserved host calls for gameplay state, mouse capture and live FPS toggles.
+  // Keep the callback wired even when FPS is enabled later from the in-game PC settings menu.
+  const bool moh_control_calls = true;
   if (!impl->mods->Empty() || moh_control_calls) {
     recomp_source.host_call = &ModManager::HostCall;
     recomp_source.host_call_user = impl->mods.get();
@@ -416,6 +424,7 @@ Runtime::~Runtime() {
     Core::Shutdown(Core::System::GetInstance());
   }
   m_impl->state_hook = {};
+  MohPcLayer::Shutdown();
   if (m_impl->controllers_initialized)
     UICommon::ShutdownControllers();
   if (m_impl->ui_initialized)

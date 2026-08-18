@@ -12,9 +12,9 @@
 #define MOH_NATIVE_ASPECT (4.0 / 3.0)
 #define MOH_PI 3.14159265358979323846264338327950288
 
-static int s_config_ready;
 static int s_camera_enabled;
 static int s_timing_enabled;
+static int s_ui_safe;
 static int s_gameplay_active;
 static int s_unlimited;
 static double s_aspect = MOH_NATIVE_ASPECT;
@@ -34,9 +34,15 @@ static double s_virtual_ticks_elapsed;
 static u32 s_integer_ticks = 1;
 static u32 s_game_frame_base;
 static u32 s_vsync_seed;
+static CPUState* s_gameplay_ctx;
+static double s_ui_applied_aspect = -1.0;
+static int s_ui_applied_safe = -1;
+static int s_ui_logged;
 
 #define MOH_HOSTCALL_VI_GAMEPLAY_ON  0xFFFFF100u
 #define MOH_HOSTCALL_VI_GAMEPLAY_OFF 0xFFFFF101u
+#define MOH_HOSTCALL_GAMEPLAY_ENTER   0xFFFFF110u
+#define MOH_HOSTCALL_GAMEPLAY_EXIT    0xFFFFF111u
 
 static int env_enabled(const char* name)
 {
@@ -59,16 +65,14 @@ static double env_double(const char* name, double fallback)
     return parsed;
 }
 
-static __attribute__((noinline, cold)) void load_config_slow(void)
+static void refresh_config(void)
 {
     const char* fps;
-
-    if (s_config_ready)
-        return;
-    s_config_ready = 1;
+    const int old_timing = s_timing_enabled;
 
     s_camera_enabled = env_enabled("MOH_CAMERA_PATCH");
     s_timing_enabled = env_enabled("MOH_TIMING_PATCH");
+    s_ui_safe = env_enabled("MOH_UI_SAFE");
     s_aspect = env_double("MOH_ASPECT_VALUE", MOH_NATIVE_ASPECT);
     s_fov_degrees = env_double("MOH_FOV_DEGREES", 0.0);
     s_weapon_fov_degrees = env_double("MOH_WEAPON_FOV_DEGREES", -1.0);
@@ -80,6 +84,7 @@ static __attribute__((noinline, cold)) void load_config_slow(void)
     if (!(s_weapon_fov_degrees >= 20.0 && s_weapon_fov_degrees < 179.0))
         s_weapon_fov_degrees = -1.0;
 
+    s_unlimited = 0;
     fps = getenv("MOH_FPS_TARGET");
     if (fps && strcmp(fps, "unlimited") == 0)
     {
@@ -92,22 +97,36 @@ static __attribute__((noinline, cold)) void load_config_slow(void)
         if (!(s_target_fps >= 1.0 && s_target_fps <= 1000.0))
             s_target_fps = 60.0;
     }
-}
 
-/* MOH_CONFIG_FASTPATH_BEGIN */
-/*
- * Hot-path wrapper: after the first configuration parse, repeated timing/camera
- * calls pay only one predictable load/branch instead of calling the large
- * getenv/strtod/strcmp parser function.
- */
-static inline __attribute__((always_inline)) void load_config(void)
-{
-    if (__builtin_expect(s_config_ready != 0, 1))
-        return;
-    load_config_slow();
+    /* Live settings menu can arm/disarm FPS while a level is already running. */
+    if (s_gameplay_active && s_gameplay_ctx && old_timing != s_timing_enabled)
+    {
+        if (s_timing_enabled)
+        {
+            if (s_gameplay_ctx->host_call &&
+                s_gameplay_ctx->host_call(s_gameplay_ctx, MOH_HOSTCALL_VI_GAMEPLAY_ON))
+            {
+                s_last_frame_ns = 0;
+                s_delta_ticks = 1.0;
+                s_integer_tick_remainder = 0.0;
+                s_integer_ticks = 0;
+            }
+            else
+            {
+                s_timing_enabled = 0;
+                s_delta_ticks = 1.0;
+            }
+        }
+        else
+        {
+            if (s_gameplay_ctx->host_call)
+                (void)s_gameplay_ctx->host_call(s_gameplay_ctx, MOH_HOSTCALL_VI_GAMEPLAY_OFF);
+            s_last_frame_ns = 0;
+            s_delta_ticks = 1.0;
+            s_integer_ticks = 1;
+        }
+    }
 }
-/* MOH_CONFIG_FASTPATH_END */
-
 
 static u64 monotonic_ns(void)
 {
@@ -124,6 +143,13 @@ static u32 f32_bits(f32 value)
     return bits;
 }
 
+static f32 f32_from_bits(u32 bits)
+{
+    f32 value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 int moh_camera_override(CPUState* ctx)
 {
     const u32 camera = ctx->gpr[3];
@@ -132,7 +158,7 @@ int moh_camera_override(CPUState* ctx)
     double tan_half_x;
     double tan_half_y;
 
-    load_config();
+    refresh_config();
     if (!s_camera_enabled)
         return 0;
 
@@ -180,7 +206,7 @@ int moh_weapon_projection_override(CPUState* ctx)
     double vertical_scale = 1.0;
     double requested_fov;
 
-    load_config();
+    refresh_config();
     if (!s_camera_enabled)
         return 0;
 
@@ -223,73 +249,116 @@ int moh_weapon_projection_override(CPUState* ctx)
     return 1;
 }
 
+void moh_ui_prepare(CPUState* ctx)
+{
+    const u32 screen = ctx->gpr[3];
+    refresh_config();
+    if (s_ui_applied_safe != s_ui_safe || fabs(s_ui_applied_aspect - s_aspect) > 0.000001)
+        mem_write8(ctx, screen + 160u, 0u);
+}
+
+void moh_ui_matrix_override(CPUState* ctx)
+{
+    const u32 screen = ctx->gpr[31];
+    const u32 matrix = screen + 96u;
+    double scale = 1.0;
+    unsigned offsets[3];
+    int i;
+
+    refresh_config();
+    if (s_ui_safe && fabs(s_aspect - MOH_NATIVE_ASPECT) > 0.000001)
+    {
+        if (s_aspect > MOH_NATIVE_ASPECT)
+        {
+            scale = MOH_NATIVE_ASPECT / s_aspect;
+            offsets[0] = 0u; offsets[1] = 4u; offsets[2] = 8u;
+        }
+        else
+        {
+            scale = s_aspect / MOH_NATIVE_ASPECT;
+            offsets[0] = 16u; offsets[1] = 20u; offsets[2] = 24u;
+        }
+        for (i = 0; i < 3; ++i)
+        {
+            const f32 old_value = f32_from_bits(mem_read32(ctx, matrix + offsets[i]));
+            mem_write32(ctx, matrix + offsets[i], f32_bits((f32)(old_value * scale)));
+        }
+        if (!s_ui_logged)
+        {
+            s_ui_logged = 1;
+            fprintf(stderr,
+                    "[moh-enh] aspect-correct 2D UI active: aspect=%.6f safe-scale=%.6f\n",
+                    s_aspect, scale);
+        }
+    }
+    s_ui_applied_aspect = s_aspect;
+    s_ui_applied_safe = s_ui_safe;
+}
+
 int moh_timing_enabled(void)
 {
-    load_config();
+    refresh_config();
     return s_timing_enabled && s_gameplay_active;
 }
 
 void moh_timing_set_gameplay(CPUState* ctx, int active)
 {
-    load_config();
-    if (!s_timing_enabled)
-        return;
-
+    refresh_config();
     active = active ? 1 : 0;
     if (active == s_gameplay_active)
         return;
 
     if (active)
     {
-        /* Never fractionate MOH's simulation clock unless ModernGekko has
-         * actually enabled the faster VI.  v6 could enter gameplay with a
-         * NULL host_call when no external mods were loaded, leaving VI at
-         * ~60 Hz but feeding e.g. 0.4167 ticks/frame for --fps 144. */
-        if (!ctx->host_call || !ctx->host_call(ctx, MOH_HOSTCALL_VI_GAMEPLAY_ON))
-        {
-            s_gameplay_active = 0;
-            s_delta_ticks = 1.0;
-            s_integer_ticks = 1;
-            fprintf(stderr,
-                    "[moh-enh] WARNING: gameplay VI control unavailable; "
-                    "keeping original 60-Hz timing (no slow-motion)\n");
-            return;
-        }
-
-        /* Seed all virtual clocks from the original game counters exactly at
-         * the gameplay boundary.  Shell/menu/loading therefore remain wholly
-         * untouched, and gameplay begins without a discontinuity. */
         s_gameplay_active = 1;
-        s_last_frame_ns = 0;
-        s_delta_ticks = (!s_unlimited && s_target_fps > 0.0) ? 60.0 / s_target_fps : 1.0;
-        s_integer_tick_remainder = 0.0;
-        s_integer_ticks = 0;
-        s_virtual_ticks_elapsed = 0.0;
+        s_gameplay_ctx = ctx;
+        if (ctx->host_call)
+            (void)ctx->host_call(ctx, MOH_HOSTCALL_GAMEPLAY_ENTER);
+
+        /* Seed clocks even if FPS unlock is currently off so it can be enabled
+         * later from the PC settings menu without reloading the level. */
         s_game_frame_base = mem_read32(ctx, ctx->gpr[13] + (u32)(s32)(-29372));
         s_vsync_seed = mem_read32(ctx, ctx->gpr[13] + (u32)(s32)(-29256));
         s_game_time_seconds = (double)s_game_frame_base / 60.0;
+        s_virtual_ticks_elapsed = 0.0;
+        s_integer_tick_remainder = 0.0;
+        s_integer_ticks = 1;
+        s_last_frame_ns = 0;
+        s_delta_ticks = 1.0;
 
-        fprintf(stderr,
-                "[moh-enh] gameplay timing ON: base_frame=%u base_vsync=%u\n",
-                s_game_frame_base, s_vsync_seed);
+        if (s_timing_enabled)
+        {
+            if (!ctx->host_call || !ctx->host_call(ctx, MOH_HOSTCALL_VI_GAMEPLAY_ON))
+            {
+                s_timing_enabled = 0;
+                fprintf(stderr,
+                        "[moh-enh] WARNING: gameplay VI control unavailable; keeping 60-Hz timing\n");
+            }
+            else
+            {
+                fprintf(stderr,
+                        "[moh-enh] gameplay timing ON: base_frame=%u base_vsync=%u\n",
+                        s_game_frame_base, s_vsync_seed);
+            }
+        }
     }
     else
     {
-        /* Collapse the high-rate render-frame counter back onto the virtual
-         * 60-Hz timeline before frontend/post-level code sees it.  All direct
-         * references to g_frameNum are confined to main/GameLoop and the two
-         * public time accessors, so this avoids a large menu-time jump. */
-        mem_write32(ctx, ctx->gpr[13] + (u32)(s32)(-29372), moh_timing_frame_count());
-
-        /* Disable the fast VBI before post-level statistics, shell code, DVD
-         * work or another LoadTheGame pass can observe it. */
+        if (s_timing_enabled)
+        {
+            mem_write32(ctx, ctx->gpr[13] + (u32)(s32)(-29372), moh_timing_frame_count());
+            if (ctx->host_call)
+                (void)ctx->host_call(ctx, MOH_HOSTCALL_VI_GAMEPLAY_OFF);
+        }
         if (ctx->host_call)
-            (void)ctx->host_call(ctx, MOH_HOSTCALL_VI_GAMEPLAY_OFF);
+            (void)ctx->host_call(ctx, MOH_HOSTCALL_GAMEPLAY_EXIT);
         s_gameplay_active = 0;
+        s_gameplay_ctx = NULL;
         s_last_frame_ns = 0;
         s_delta_ticks = 1.0;
         s_integer_ticks = 1;
-        fprintf(stderr, "[moh-enh] gameplay timing OFF: restored original VI/menu timing\n");
+        if (s_timing_enabled)
+            fprintf(stderr, "[moh-enh] gameplay timing OFF: restored original VI/menu timing\n");
     }
 }
 
@@ -297,7 +366,7 @@ void moh_timing_frame_advance(void)
 {
     u64 now;
 
-    load_config();
+    refresh_config();
     if (!s_timing_enabled || !s_gameplay_active)
         return;
 
@@ -380,7 +449,7 @@ u32 moh_timing_frame_count(void)
 u32 moh_timing_vsyncs(CPUState* ctx)
 {
     (void)ctx;
-    load_config();
+    refresh_config();
     if (!s_timing_enabled || !s_gameplay_active)
         return 0;
 

@@ -9,6 +9,8 @@ extern "C" {
 
 int moh_camera_override(CPUState* ctx);
 int moh_weapon_projection_override(CPUState* ctx);
+void moh_ui_prepare(CPUState* ctx);
+void moh_ui_matrix_override(CPUState* ctx);
 int moh_timing_enabled(void);
 void moh_timing_set_gameplay(CPUState* ctx, int active);
 void moh_timing_frame_advance(void);

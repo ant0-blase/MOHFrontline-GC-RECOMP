@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/OnScreenUI.h"
+#include "VideoCommon/MohPcLayer.h"
 
 #include "Common/CommonPaths.h"
 #include "Common/EnumMap.h"
@@ -420,6 +421,7 @@ void OnScreenUI::Finalize()
   auto& perf_metrics = Core::System::GetInstance().GetPerfMetrics();
   perf_metrics.DrawImGuiStats(m_backbuffer_scale);
   DrawDebugText();
+  MohPcLayer::DrawSettingsUI(m_backbuffer_scale);
   OSD::DrawMessages();
   DrawChallengesAndLeaderboards();
   ImGui::Render();

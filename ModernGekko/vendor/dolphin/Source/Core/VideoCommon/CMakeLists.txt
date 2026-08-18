@@ -125,6 +125,8 @@ add_library(videocommon
   OnScreenDisplay.h
   OnScreenUI.cpp
   OnScreenUI.h
+  MohPcLayer.cpp
+  MohPcLayer.h
   OnScreenUIKeyMap.h
   OpcodeDecoding.cpp
   OpcodeDecoding.h

@@ -23,6 +23,8 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "idle-inhibit-unstable-v1-client-protocol.h"
+#include "pointer-constraints-unstable-v1-client-protocol.h"
+#include "relative-pointer-unstable-v1-client-protocol.h"
 #include "xdg-decoration-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -32,6 +34,7 @@
 #include "Core/System.h"
 #include "UICommon/UICommon.h"
 #include "VideoCommon/Present.h"
+#include "VideoCommon/MohPcLayer.h"
 
 namespace
 {
@@ -72,9 +75,15 @@ public:
   static void PointerEnter(void* data, wl_pointer*, uint32_t serial, wl_surface* surface,
                            wl_fixed_t, wl_fixed_t);
   static void PointerLeave(void* data, wl_pointer*, uint32_t, wl_surface* surface);
-  static void PointerMotion(void*, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t) {}
-  static void PointerButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {}
-  static void PointerAxis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
+  static void PointerMotion(void* data, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y);
+  static void PointerButton(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button,
+                            uint32_t state);
+  static void PointerAxis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value);
+  static void RelativeMotion(void* data, zwp_relative_pointer_v1*, uint32_t, uint32_t,
+                             wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t dx_unaccel,
+                             wl_fixed_t dy_unaccel);
+  static void LockedPointerLocked(void*, zwp_locked_pointer_v1*) {}
+  static void LockedPointerUnlocked(void*, zwp_locked_pointer_v1*) {}
   static void PointerFrame(void*, wl_pointer*) {}
   static void PointerAxisSource(void*, wl_pointer*, uint32_t) {}
   static void PointerAxisStop(void*, wl_pointer*, uint32_t, uint32_t) {}
@@ -88,6 +97,7 @@ private:
   void HandleHotkey(xkb_keysym_t symbol);
   bool ModifierActive(const char* name) const;
   void UpdateCursor();
+  void UpdateRelativePointer();
   void DestroyKeyboard();
   void DestroyPointer();
 
@@ -101,6 +111,10 @@ private:
   xdg_wm_base* m_wm_base = nullptr;
   zxdg_decoration_manager_v1* m_decoration_manager = nullptr;
   zwp_idle_inhibit_manager_v1* m_idle_inhibit_manager = nullptr;
+  zwp_relative_pointer_manager_v1* m_relative_pointer_manager = nullptr;
+  zwp_pointer_constraints_v1* m_pointer_constraints = nullptr;
+  zwp_relative_pointer_v1* m_relative_pointer = nullptr;
+  zwp_locked_pointer_v1* m_locked_pointer = nullptr;
   zwp_idle_inhibitor_v1* m_idle_inhibitor = nullptr;
   wl_surface* m_surface = nullptr;
   xdg_surface* m_xdg_surface = nullptr;
@@ -154,6 +168,10 @@ constexpr wl_pointer_listener s_pointer_listener = {
     PlatformWayland::PointerAxisValue120,
     PlatformWayland::PointerAxisRelativeDirection,
 };
+constexpr zwp_relative_pointer_v1_listener s_relative_pointer_listener = {
+    PlatformWayland::RelativeMotion};
+constexpr zwp_locked_pointer_v1_listener s_locked_pointer_listener = {
+    PlatformWayland::LockedPointerLocked, PlatformWayland::LockedPointerUnlocked};
 
 PlatformWayland::~PlatformWayland()
 {
@@ -186,6 +204,10 @@ PlatformWayland::~PlatformWayland()
   }
   if (m_wm_base)
     xdg_wm_base_destroy(m_wm_base);
+  if (m_relative_pointer_manager)
+    zwp_relative_pointer_manager_v1_destroy(m_relative_pointer_manager);
+  if (m_pointer_constraints)
+    zwp_pointer_constraints_v1_destroy(m_pointer_constraints);
   if (m_idle_inhibit_manager)
     zwp_idle_inhibit_manager_v1_destroy(m_idle_inhibit_manager);
   if (m_decoration_manager)
@@ -319,6 +341,7 @@ void PlatformWayland::MainLoop()
     UpdateRunningFlag();
     Core::HostDispatchJobs(Core::System::GetInstance());
     ApplyPendingTitle();
+    UpdateRelativePointer();
     if (!DispatchEvents())
       break;
   }
@@ -424,6 +447,16 @@ void PlatformWayland::RegistryGlobal(void* data, wl_registry* registry, uint32_t
     platform->m_idle_inhibit_manager = static_cast<zwp_idle_inhibit_manager_v1*>(wl_registry_bind(
         registry, name, &zwp_idle_inhibit_manager_v1_interface, std::min(version, 1u)));
   }
+  else if (std::strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0)
+  {
+    platform->m_relative_pointer_manager = static_cast<zwp_relative_pointer_manager_v1*>(
+        wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, 1));
+  }
+  else if (std::strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0)
+  {
+    platform->m_pointer_constraints = static_cast<zwp_pointer_constraints_v1*>(
+        wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, 1));
+  }
 }
 
 void PlatformWayland::WmBasePing(void*, xdg_wm_base* wm_base, uint32_t serial)
@@ -468,6 +501,7 @@ void PlatformWayland::ToplevelConfigure(void* data, xdg_toplevel*, int32_t width
     platform->m_pending_width = width;
     platform->m_pending_height = height;
     platform->m_resize_pending = true;
+    MohPcLayer::SetWindowSize(width, height);
   }
 }
 
@@ -520,6 +554,16 @@ void PlatformWayland::DestroyKeyboard()
 
 void PlatformWayland::DestroyPointer()
 {
+  if (m_locked_pointer)
+  {
+    zwp_locked_pointer_v1_destroy(m_locked_pointer);
+    m_locked_pointer = nullptr;
+  }
+  if (m_relative_pointer)
+  {
+    zwp_relative_pointer_v1_destroy(m_relative_pointer);
+    m_relative_pointer = nullptr;
+  }
   if (m_pointer)
   {
     if (wl_pointer_get_version(m_pointer) >= WL_POINTER_RELEASE_SINCE_VERSION)
@@ -593,9 +637,23 @@ void PlatformWayland::KeyboardKey(void* data, wl_keyboard*, uint32_t, uint32_t, 
                                   uint32_t state)
 {
   auto* platform = static_cast<PlatformWayland*>(data);
-  if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !platform->m_xkb_state)
+  if (!platform->m_xkb_state)
     return;
-  platform->HandleHotkey(xkb_state_key_get_one_sym(platform->m_xkb_state, key + 8));
+  const xkb_keysym_t symbol = xkb_state_key_get_one_sym(platform->m_xkb_state, key + 8);
+  const bool down = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+  MohPcLayer::KeyEvent(static_cast<u32>(symbol), down);
+  if (!down)
+    return;
+
+  if ((symbol == XKB_KEY_F10 && platform->ModifierActive(XKB_MOD_NAME_CTRL)) ||
+      symbol == XKB_KEY_grave)
+  {
+    MohPcLayer::ToggleSettings();
+    platform->UpdateRelativePointer();
+    platform->UpdateCursor();
+    return;
+  }
+  platform->HandleHotkey(symbol);
 }
 
 void PlatformWayland::KeyboardModifiers(void* data, wl_keyboard*, uint32_t, uint32_t depressed,
@@ -677,7 +735,100 @@ void PlatformWayland::PointerLeave(void* data, wl_pointer*, uint32_t, wl_surface
 {
   auto* platform = static_cast<PlatformWayland*>(data);
   if (surface == platform->m_surface)
+  {
     platform->m_pointer_inside = false;
+    platform->UpdateRelativePointer();
+  }
+}
+
+void PlatformWayland::PointerMotion(void* data, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y)
+{
+  auto* platform = static_cast<PlatformWayland*>(data);
+  const double px = wl_fixed_to_double(x);
+  const double py = wl_fixed_to_double(y);
+  MohPcLayer::PointerAbsolute(px, py);
+  if (g_presenter)
+    g_presenter->SetMousePos(static_cast<float>(px), static_cast<float>(py));
+}
+
+void PlatformWayland::PointerButton(void* data, wl_pointer*, uint32_t, uint32_t,
+                                    uint32_t button, uint32_t state)
+{
+  (void)data;
+  unsigned mapped = 99;
+  if (button == 0x110) mapped = 0;       // BTN_LEFT
+  else if (button == 0x111) mapped = 1;  // BTN_RIGHT
+  else if (button == 0x112) mapped = 2;  // BTN_MIDDLE
+  if (mapped > 2)
+    return;
+  MohPcLayer::PointerButton(mapped, state == WL_POINTER_BUTTON_STATE_PRESSED);
+  if (g_presenter)
+  {
+    static u32 mask = 0;
+    const u32 bit = 1u << mapped;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) mask |= bit;
+    else mask &= ~bit;
+    g_presenter->SetMousePress(mask);
+  }
+}
+
+void PlatformWayland::PointerAxis(void* data, wl_pointer*, uint32_t, uint32_t axis,
+                                  wl_fixed_t value)
+{
+  (void)data;
+  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    MohPcLayer::PointerAxis(wl_fixed_to_double(value));
+}
+
+void PlatformWayland::RelativeMotion(void* data, zwp_relative_pointer_v1*, uint32_t, uint32_t,
+                                     wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t dx_unaccel,
+                                     wl_fixed_t dy_unaccel)
+{
+  (void)data;
+  const double rx = wl_fixed_to_double(dx_unaccel ? dx_unaccel : dx);
+  const double ry = wl_fixed_to_double(dy_unaccel ? dy_unaccel : dy);
+  MohPcLayer::RelativeMotion(rx, ry);
+}
+
+void PlatformWayland::UpdateRelativePointer()
+{
+  const bool had_lock = m_locked_pointer != nullptr;
+  const bool want = MohPcLayer::WantsRelativeMouse() && m_window_focus && m_pointer_inside &&
+                    m_pointer && m_surface && m_relative_pointer_manager && m_pointer_constraints;
+  if (want)
+  {
+    if (!m_relative_pointer)
+    {
+      m_relative_pointer =
+          zwp_relative_pointer_manager_v1_get_relative_pointer(m_relative_pointer_manager, m_pointer);
+      if (m_relative_pointer)
+        zwp_relative_pointer_v1_add_listener(m_relative_pointer, &s_relative_pointer_listener, this);
+    }
+    if (!m_locked_pointer)
+    {
+      m_locked_pointer = zwp_pointer_constraints_v1_lock_pointer(
+          m_pointer_constraints, m_surface, m_pointer, nullptr,
+          ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+      if (m_locked_pointer)
+        zwp_locked_pointer_v1_add_listener(m_locked_pointer, &s_locked_pointer_listener, this);
+    }
+  }
+  else
+  {
+    if (m_locked_pointer)
+    {
+      zwp_locked_pointer_v1_destroy(m_locked_pointer);
+      m_locked_pointer = nullptr;
+    }
+    if (m_relative_pointer)
+    {
+      zwp_relative_pointer_v1_destroy(m_relative_pointer);
+      m_relative_pointer = nullptr;
+    }
+  }
+
+  if (had_lock != (m_locked_pointer != nullptr))
+    UpdateCursor();
 }
 
 void PlatformWayland::UpdateCursor()
@@ -685,8 +836,8 @@ void PlatformWayland::UpdateCursor()
   if (!m_pointer || !m_pointer_inside)
     return;
 
-  const bool hide = m_window_focus &&
-                    Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
+  const bool hide = m_window_focus && MohPcLayer::WantsRelativeMouse() &&
+                    !MohPcLayer::IsSettingsOpen() &&
                     Core::GetState(Core::System::GetInstance()) != Core::State::Paused;
   if (hide || !m_cursor_surface || !m_default_cursor || m_default_cursor->image_count == 0)
   {

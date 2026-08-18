@@ -256,6 +256,14 @@ def apply_gmfe69_generated_enhancements(generated: Path):
         _inject_after_label(generated, weapon_proj_label, """    (void)moh_weapon_projection_override(ctx);
 """)
 
+    # The game's 2D shell/HUD transform is authored for 4:3.  Force a rebuild
+    # when the target aspect changes, then counter-scale the 2D matrix around
+    # its existing center translation so text/icons keep their proportions.
+    _inject_after_label(generated, "8001B690", """    moh_ui_prepare(ctx);
+""")
+    _inject_after_label(generated, "8001B7C8", """    moh_ui_matrix_override(ctx);
+""")
+
     # Arm high-rate VI only for actual in-level gameplay.  The shell/menu and
     # LoadTheGame paths must keep original GameCube timing because their state
     # machines and DVD/streaming waits are VBlank-sensitive.
