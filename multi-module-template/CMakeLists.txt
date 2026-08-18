@@ -50,6 +50,16 @@ set_target_properties(${MODULE_NAME} PROPERTIES
   C_VISIBILITY_PRESET hidden)
 
 target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_GAME_ID="${GAME_ID}")
+
+# MOH_GMFE69_GAMECUBE_MEM1_ONLY
+# GMFE69 is a retail GameCube title: MEM1 is fixed at 24 MiB and there is no
+# Wii MEM2. GXRuntime's get_ram_ptr() already has a dedicated compile-time
+# GameCube path which keeps non-MEM1 addresses on the existing external/MMIO
+# fallback while removing the unnecessary EXRAM/MEM2 check from every inline
+# memory access.
+if(GAME_ID STREQUAL "GMFE69")
+  target_compile_definitions(${MODULE_NAME} PRIVATE GXRUNTIME_GAMECUBE_MEM1_ONLY=1)
+endif()
 target_include_directories(${MODULE_NAME} PRIVATE
   "${GXRUNTIME_DIR}/include"
   "${CHASSIS_ABI_DIR}"

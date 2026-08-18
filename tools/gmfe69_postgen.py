@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+# MOH_GMFE69_FINAL_DEFINITIVE_OPTIMIZATIONS
+
 HOT_FP_CHUNKS = ("8007AE80", "800F2E80", "800F6E80", "8013EE80", "80142E80")
 
 FP_MARK = "MOH_FAST_FP_AVAILABILITY"
@@ -83,6 +85,30 @@ PARTICLE_FMADDS_TARGETS = (
 )
 
 # MOH_PARTICLE_STACK_LFS_PERMANENT_POSTGEN
+
+# MOH_PARTICLE_PSQ_PAIR_PERMANENT_POSTGEN
+PSQ_PAIR_SITE_MARK = "MOH_GMFE69_PSQ_PAIR_SITE"
+PSQ_PAIR_PROTO_MARK = "MOH_GMFE69_PSQ_PAIR_PROTO"
+
+PSQ_PAIR_PROTO = r"""
+/* MOH_GMFE69_PSQ_PAIR_PROTO */
+extern bool ppc_psq_load0_pair_gmfe69_fast(
+    CPUState* cpu, u8 frD, u32 ea, u32 cia);
+extern bool ppc_psq_store0_pair_gmfe69_fast(
+    CPUState* cpu, u8 frS, u32 ea, u32 cia);
+
+"""
+
+PSQ_PAIR_LOAD_RE = re.compile(
+    r'ppc_psq_load\(\s*ctx\s*,\s*(\d+)u\s*,\s*ea\s*,\s*'
+    r'false\s*,\s*0u\s*,\s*false\s*,\s*(0x[0-9A-Fa-f]+u)\s*\)'
+)
+
+PSQ_PAIR_STORE_RE = re.compile(
+    r'ppc_psq_store\(\s*ctx\s*,\s*(\d+)u\s*,\s*ea\s*,\s*'
+    r'false\s*,\s*0u\s*,\s*false\s*,\s*(0x[0-9A-Fa-f]+u)\s*\)'
+)
+
 STACK_LFS_MARK = "MOH_PARTICLE_STACK_LFS_FASTPATH"
 STACK_LFS_HELPER_MARK = "MOH_PARTICLE_STACK_LFS_HELPER"
 
@@ -209,6 +235,24 @@ def _find_chunk(chunks: Path, address: str) -> Path | None:
     return matches[0] if matches else None
 
 
+
+# MOH_GMFE69_SPLIT_AWARE_PARTICLE_POSTGEN
+def _find_chunk_for_pc(chunks: Path, pc: int) -> Path | None:
+    """Find the generated C chunk that actually contains a guest PC label."""
+    label = f"label_{pc:08X}:"
+    matches: list[Path] = []
+    for path in sorted(chunks.glob("*.c")):
+        if label in path.read_text(errors="ignore"):
+            matches.append(path)
+
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"{pc:08X}: expected exactly one generated chunk containing "
+            f"{label}, found {len(matches)}"
+        )
+    return matches[0] if matches else None
+
+
 def _patch_hot_fp(path: Path) -> bool:
     text = path.read_text()
     if FP_MARK in text or "MOH fast FP availability hot-chunk path" in text:
@@ -224,7 +268,7 @@ def _inject_particle_helper(text: str) -> str:
     if STACK_HELPER_MARK in text:
         return text
     fn = re.search(
-        r"(?m)^[A-Za-z_][A-Za-z0-9_ \t\*]*\bmg_img\d+_func_8007AE80\s*\(",
+        r"(?m)^[A-Za-z_][A-Za-z0-9_ \t\*]*\bmg_img\d+_func_[0-9A-Fa-f]{8}\s*\(",
         text,
     )
     if not fn:
@@ -325,27 +369,113 @@ def _patch_particle_rng(text: str) -> str:
 
 
 
-def _patch_particle_stack_lfs(text: str) -> str:
-    if STACK_LFS_HELPER_MARK not in text:
-        include_anchor = '#include "../generated.h"\n'
-        if include_anchor not in text:
-            raise RuntimeError("particle stack lfs: generated include anchor not found")
-        text = text.replace(
-            include_anchor,
-            include_anchor + "\n" + STACK_LFS_HELPER,
-            1,
+
+def _patch_particle_psq_pair(text: str) -> str:
+    site_count = text.count(PSQ_PAIR_SITE_MARK)
+    proto_count = text.count(PSQ_PAIR_PROTO_MARK)
+
+    # Idempotent path for an already-patched generated chunk.
+    if site_count == 94:
+        if proto_count != 1:
+            raise RuntimeError(
+                f"particle PSQ pair: already has 94 sites but "
+                f"prototype count is {proto_count}, expected 1"
+            )
+        return text
+
+    if site_count != 0:
+        raise RuntimeError(
+            f"particle PSQ pair: partial existing patch, "
+            f"site marker count={site_count}"
         )
 
+    load_matches = list(PSQ_PAIR_LOAD_RE.finditer(text))
+    store_matches = list(PSQ_PAIR_STORE_RE.finditer(text))
+
+    if len(load_matches) != 49 or len(store_matches) != 45:
+        raise RuntimeError(
+            "particle PSQ pair: expected 49 load + 45 store "
+            "W=0/GQR0/non-indexed sites, found "
+            f"{len(load_matches)} + {len(store_matches)}"
+        )
+
+    if proto_count == 0:
+        include_anchor = '#include "../generated.h"\n'
+        if include_anchor not in text:
+            raise RuntimeError(
+                "particle PSQ pair: generated include anchor not found"
+            )
+        text = text.replace(
+            include_anchor,
+            include_anchor + "\n" + PSQ_PAIR_PROTO,
+            1,
+        )
+    elif proto_count != 1:
+        raise RuntimeError(
+            f"particle PSQ pair: prototype marker count={proto_count}"
+        )
+
+    def repl_load(match):
+        return (
+            f"ppc_psq_load0_pair_gmfe69_fast("
+            f"ctx, {match.group(1)}u, ea, {match.group(2)}) "
+            f"/* {PSQ_PAIR_SITE_MARK} */"
+        )
+
+    def repl_store(match):
+        return (
+            f"ppc_psq_store0_pair_gmfe69_fast("
+            f"ctx, {match.group(1)}u, ea, {match.group(2)}) "
+            f"/* {PSQ_PAIR_SITE_MARK} */"
+        )
+
+    text, nload = PSQ_PAIR_LOAD_RE.subn(repl_load, text)
+    text, nstore = PSQ_PAIR_STORE_RE.subn(repl_store, text)
+
+    if nload != 49 or nstore != 45:
+        raise RuntimeError(
+            f"particle PSQ pair: replacement mismatch "
+            f"load={nload}, store={nstore}"
+        )
+
+    if text.count(PSQ_PAIR_SITE_MARK) != 94:
+        raise RuntimeError(
+            "particle PSQ pair: final site marker count != 94"
+        )
+    if text.count(PSQ_PAIR_PROTO_MARK) != 1:
+        raise RuntimeError(
+            "particle PSQ pair: final prototype marker count != 1"
+        )
+
+    return text
+
+
+
+def _patch_particle_stack_lfs(
+    text: str,
+    pc_min: int = 0x8007AE80,
+    pc_max: int = 0x8007EE80,
+) -> tuple[str, int]:
     comments = list(STACK_LFS_COMMENT_RE.finditer(text))
     targets = [
         (int(m.group(1), 16), int(m.group(2)), int(m.group(3)))
         for m in comments
+        if pc_min <= int(m.group(1), 16) < pc_max
     ]
 
-    if len(targets) != 144:
-        raise RuntimeError(
-            f"particle stack lfs: expected 144 r1-backed lfs sites, "
-            f"found {len(targets)}"
+    if not targets:
+        return text, 0
+
+    if STACK_LFS_HELPER_MARK not in text:
+        include_anchor = '#include "../generated.h"\n'
+        if include_anchor not in text:
+            raise RuntimeError(
+                "particle stack lfs: generated include anchor not found"
+            )
+        text = text.replace(
+            include_anchor,
+            include_anchor + "\n" + STACK_LFS_HELPER,
+            1,
         )
 
     for pc, fpr, off in sorted(targets, reverse=True):
@@ -384,7 +514,7 @@ def _patch_particle_stack_lfs(text: str) -> str:
         block = block[:bm.start()] + replacement + block[bm.end():]
         text = text[:start] + block + text[end:]
 
-    return text
+    return text, len(targets)
 
 
 def _patch_particle_fmadds(text: str) -> str:
@@ -403,7 +533,7 @@ def _patch_particle_fmadds(text: str) -> str:
 
     if FMADDS_PROTO_MARK not in text:
         fn = re.search(
-            r"(?m)^[A-Za-z_][A-Za-z0-9_ \t\*]*\bmg_img\d+_func_8007AE80\s*\(",
+            r"(?m)^[A-Za-z_][A-Za-z0-9_ \t\*]*\bmg_img\d+_func_[0-9A-Fa-f]{8}\s*\(",
             text,
         )
         if not fn:
@@ -449,33 +579,390 @@ def _patch_particle_fmadds(text: str) -> str:
     return text
 
 
+
+# MOH_GMFE69_GLOBAL_PSQ_PAIR_PERMANENT
+PSQ_PAIR_GLOBAL_MARK = "MOH_GMFE69_PSQ_PAIR_GLOBAL_SITE"
+
+
+def _patch_global_psq_pair_generated(generated: Path) -> tuple[int, int]:
+    """Patch every exact W=0/GQR0/non-indexed PSQ pair site in one image."""
+    chunks = Path(generated) / "chunks"
+    if not chunks.is_dir():
+        raise RuntimeError(
+            f"GMFE69 global PSQ postgen: missing chunks directory: {chunks}"
+        )
+
+    total_load = 0
+    total_store = 0
+    include_anchor = '#include "../generated.h"\n'
+
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text()
+        original = text
+
+        load_matches = list(PSQ_PAIR_LOAD_RE.finditer(text))
+        store_matches = list(PSQ_PAIR_STORE_RE.finditer(text))
+
+        if not load_matches and not store_matches:
+            continue
+
+        if PSQ_PAIR_PROTO_MARK not in text:
+            if include_anchor not in text:
+                raise RuntimeError(
+                    f"GMFE69 global PSQ postgen: "
+                    f"{path.name}: generated include anchor not found"
+                )
+            text = text.replace(
+                include_anchor,
+                include_anchor + "\n" + PSQ_PAIR_PROTO,
+                1,
+            )
+
+        def repl_load(match):
+            return (
+                f"ppc_psq_load0_pair_gmfe69_fast("
+                f"ctx, {match.group(1)}u, ea, {match.group(2)}) "
+                f"/* {PSQ_PAIR_SITE_MARK} {PSQ_PAIR_GLOBAL_MARK} */"
+            )
+
+        def repl_store(match):
+            return (
+                f"ppc_psq_store0_pair_gmfe69_fast("
+                f"ctx, {match.group(1)}u, ea, {match.group(2)}) "
+                f"/* {PSQ_PAIR_SITE_MARK} {PSQ_PAIR_GLOBAL_MARK} */"
+            )
+
+        text, nload = PSQ_PAIR_LOAD_RE.subn(repl_load, text)
+        text, nstore = PSQ_PAIR_STORE_RE.subn(repl_store, text)
+
+        if nload != len(load_matches) or nstore != len(store_matches):
+            raise RuntimeError(
+                f"GMFE69 global PSQ postgen: {path.name}: "
+                f"replacement mismatch "
+                f"{nload}/{len(load_matches)} loads, "
+                f"{nstore}/{len(store_matches)} stores"
+            )
+
+        if text != original:
+            path.write_text(text)
+
+        total_load += nload
+        total_store += nstore
+
+    # Exact candidate form must be fully eliminated for this image.
+    remaining_load = 0
+    remaining_store = 0
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text()
+        remaining_load += len(PSQ_PAIR_LOAD_RE.findall(text))
+        remaining_store += len(PSQ_PAIR_STORE_RE.findall(text))
+
+    if remaining_load or remaining_store:
+        raise RuntimeError(
+            "GMFE69 global PSQ postgen: exact generic pair sites remain: "
+            f"{remaining_load} loads + {remaining_store} stores"
+        )
+
+    if total_load or total_store:
+        print(
+            "  GMFE69 global PSQ pair fastpath: "
+            f"{total_load} loads + {total_store} stores"
+        )
+
+    return total_load, total_store
+
+
+
+# MOH_GMFE69_GLOBAL_FP_PERMANENT_POSTGEN
+FP_CALL_RE = re.compile(r"\bppc_fp_available\s*\(\s*ctx\s*,")
+
+
+def _patch_global_fp_available(generated: Path) -> tuple[int, int]:
+    """Apply the validated MSR[FP] fast wrapper to every generated FP chunk."""
+    chunks = Path(generated) / "chunks"
+    if not chunks.is_dir():
+        raise RuntimeError(
+            f"GMFE69 global FP postgen: missing chunks directory: {chunks}"
+        )
+
+    total_sites = 0
+    patched_files = 0
+
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text()
+        sites = len(FP_CALL_RE.findall(text))
+        if not sites:
+            continue
+
+        total_sites += sites
+
+        if FP_MARK not in text:
+            if not _patch_hot_fp(path):
+                raise RuntimeError(
+                    f"GMFE69 global FP postgen: {path.name}: "
+                    "failed to install FP wrapper"
+                )
+            patched_files += 1
+
+    remaining = 0
+    covered_files = 0
+
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text()
+        sites = len(FP_CALL_RE.findall(text))
+        if not sites:
+            continue
+        if FP_MARK in text:
+            covered_files += 1
+        else:
+            remaining += sites
+
+    if remaining:
+        raise RuntimeError(
+            f"GMFE69 global FP postgen: {remaining} generated "
+            "ppc_fp_available call sites remain unwrapped"
+        )
+
+    if total_sites:
+        print(
+            "  GMFE69 global FP availability fastpath: "
+            f"{total_sites} call sites across {covered_files} chunks "
+            f"({patched_files} newly patched)"
+        )
+
+    return total_sites, patched_files
+
+
+
+# MOH_GMFE69_SPLIT_CROSSCHUNK_RETURNS
+RETURN_DISPATCH_GOTO_RE = re.compile(
+    r"\bgoto\s+return_dispatch_([0-9A-Fa-f]{8})\s*;"
+)
+RETURN_DISPATCH_LABEL_RE = re.compile(
+    r"(?m)^\s*return_dispatch_([0-9A-Fa-f]{8})\s*:"
+)
+
+
+def _patch_split_crosschunk_returns(generated: Path) -> tuple[int, int]:
+    """Route only impossible cross-C-file local returns back to the dispatcher.
+
+    DolRecomp's C local-return optimization emits:
+        ctx->pc = target;
+        goto return_dispatch_XXXXXXXX;
+
+    With smaller C chunks, a PPC function/call-return region can cross a C-file
+    boundary.  If the target local-dispatch label is not present in this same
+    generated C file, a C goto is impossible.  `ctx->pc` is already exact, so
+    returning from the chunk preserves semantics and lets the chassis/native
+    dispatcher continue at that PC.
+    """
+    chunks = Path(generated) / "chunks"
+    if not chunks.is_dir():
+        raise RuntimeError(
+            f"GMFE69 split-return postgen: missing chunks directory: {chunks}"
+        )
+
+    patched_gotos = 0
+    patched_files = 0
+
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text()
+        gotos = list(RETURN_DISPATCH_GOTO_RE.finditer(text))
+        if not gotos:
+            continue
+
+        labels = {
+            m.group(1).upper()
+            for m in RETURN_DISPATCH_LABEL_RE.finditer(text)
+        }
+
+        changed = 0
+
+        def repl(match):
+            nonlocal changed
+            target = match.group(1).upper()
+            if target in labels:
+                return match.group(0)
+
+            changed += 1
+            return (
+                "return; "
+                f"/* MOH_GMFE69_SPLIT_CROSSCHUNK_RETURN "
+                f"return_dispatch_{target} */"
+            )
+
+        new_text = RETURN_DISPATCH_GOTO_RE.sub(repl, text)
+        if changed:
+            path.write_text(new_text)
+            patched_files += 1
+            patched_gotos += changed
+
+    # Verify that every remaining goto resolves to a label in the same C file.
+    unresolved = []
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text(errors="ignore")
+        labels = {
+            m.group(1).upper()
+            for m in RETURN_DISPATCH_LABEL_RE.finditer(text)
+        }
+        for m in RETURN_DISPATCH_GOTO_RE.finditer(text):
+            target = m.group(1).upper()
+            if target not in labels:
+                unresolved.append((path.name, target))
+
+    if unresolved:
+        sample = ", ".join(
+            f"{name}->return_dispatch_{target}"
+            for name, target in unresolved[:8]
+        )
+        raise RuntimeError(
+            "GMFE69 split-return postgen: unresolved generated gotos remain: "
+            + sample
+        )
+
+    if patched_gotos:
+        print(
+            "  GMFE69 split cross-chunk returns: "
+            f"{patched_gotos} goto(s) in {patched_files} chunk(s) "
+            "routed through dispatcher"
+        )
+
+    return patched_gotos, patched_files
+
+
+
+# MOH_GMFE69_FCTIWZ_PERMANENT_POSTGEN
+FCTIWZ_SITE_MARK = "MOH_GMFE69_FCTIWZ_SITE"
+FCTIWZ_PROTO_MARK = "MOH_GMFE69_FCTIWZ_PROTO"
+FCTIWZ_CALL_RE = re.compile(
+    r"ppc_fctiw\(\s*ctx\s*,\s*(?P<value>[^,\n]+?)\s*,\s*"
+    r"true\s*,\s*&result\s*\)"
+)
+FCTIWZ_PROTO = r"""
+/* MOH_GMFE69_FCTIWZ_PROTO */
+extern bool ppc_fctiwz_gmfe69_fast(
+    CPUState* cpu, f64 value, u64* output);
+"""
+
+
+def _patch_global_fctiwz_generated(generated: Path) -> tuple[int, int]:
+    chunks = Path(generated) / "chunks"
+    if not chunks.is_dir():
+        raise RuntimeError(
+            f"GMFE69 fctiwz postgen: missing chunks directory: {chunks}"
+        )
+
+    total = 0
+    files = 0
+    include_anchor = '#include "../generated.h"\n'
+
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text()
+        matches = list(FCTIWZ_CALL_RE.finditer(text))
+        if not matches:
+            continue
+
+        if FCTIWZ_PROTO_MARK not in text:
+            if include_anchor not in text:
+                raise RuntimeError(
+                    f"{path}: generated include anchor missing for fctiwz"
+                )
+            text = text.replace(
+                include_anchor,
+                include_anchor + "\n" + FCTIWZ_PROTO + "\n",
+                1,
+            )
+
+        def repl(match):
+            return (
+                "ppc_fctiwz_gmfe69_fast("
+                f"ctx, {match.group('value')}, &result) "
+                f"/* {FCTIWZ_SITE_MARK} */"
+            )
+
+        text, count = FCTIWZ_CALL_RE.subn(repl, text)
+        path.write_text(text)
+        total += count
+        files += 1
+
+    remaining = 0
+    for path in sorted(chunks.glob("*.c")):
+        remaining += len(FCTIWZ_CALL_RE.findall(path.read_text(errors="ignore")))
+
+    if remaining:
+        raise RuntimeError(
+            f"GMFE69 fctiwz postgen: {remaining} generic fctiwz sites remain"
+        )
+
+    if total:
+        print(
+            f"  GMFE69 FCTIWZ fastpath: {total} sites across {files} chunks"
+        )
+
+    return total, files
+
+
 def apply_gmfe69_generated_postgen(generated: Path) -> None:
     generated = Path(generated)
     chunks = generated / "chunks"
     if not chunks.is_dir():
         raise RuntimeError(f"GMFE69 postgen: missing chunks directory: {chunks}")
 
-    for address in HOT_FP_CHUNKS:
-        path = _find_chunk(chunks, address)
-        if path:
-            _patch_hot_fp(path)
+    _patch_split_crosschunk_returns(generated)
 
-    particle = _find_chunk(chunks, "8007AE80")
+    # Validated globally: inline the overwhelmingly-common MSR[FP] enabled case
+    # in every generated chunk, preserving ppc_fp_available() as the exact slow path.
+    _patch_global_fp_available(generated)
+
+    _patch_global_psq_pair_generated(generated)
+
+
+    # Particle-specific PCs survive DolRecomp chunk-size changes.
+    _patch_global_fctiwz_generated(generated)
+
+    particle = _find_chunk_for_pc(chunks, 0x8007E198)
     if not particle:
         return
 
+    for path in sorted(chunks.glob("*.c")):
+        t = path.read_text(errors="ignore")
+        if "MOH_PARTICLE_DEAD_STACK_STORE" in t:
+            raise RuntimeError(
+                "GMFE69 postgen: obsolete dead-stack-store experiment is "
+                f"present in {path.name}; regenerate clean output first"
+            )
+
     text = particle.read_text()
-    if "MOH_PARTICLE_DEAD_STACK_STORE" in text:
-        raise RuntimeError(
-            "GMFE69 postgen: obsolete dead-stack-store experiment is present; "
-            "regenerate this chunk from clean DolRecomp output first"
-        )
     text = _patch_particle_lfd(text)
     text = _patch_particle_stack(text)
     text = _patch_particle_rng(text)
     text = _patch_particle_fmadds(text)
-    text = _patch_particle_stack_lfs(text)
     particle.write_text(text)
+
+    stack_lfs_total = 0
+    stack_lfs_files = 0
+    for path in sorted(chunks.glob("*.c")):
+        t = path.read_text()
+        patched, count = _patch_particle_stack_lfs(
+            t, 0x8007AE80, 0x8007EE80
+        )
+        if count:
+            stack_lfs_total += count
+            stack_lfs_files += 1
+            if patched != t:
+                path.write_text(patched)
+
+    if stack_lfs_total != 144:
+        raise RuntimeError(
+            "GMFE69 postgen: expected 144 particle-region stack LFS sites "
+            f"across split chunks, found {stack_lfs_total}"
+        )
+
+    generated_texts = [
+        path.read_text(errors="ignore")
+        for path in sorted(chunks.glob("*.c"))
+    ]
+    final = "\n".join(generated_texts)
 
     checks = {
         LFD_MARK: 11,
@@ -484,18 +971,141 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
         FMADDS_MARK: 39,
         FMADDS_PROTO_MARK: 1,
         STACK_LFS_MARK: 144,
-        STACK_LFS_HELPER_MARK: 1,
         STACK_HELPER_MARK: 1,
         MEM1_MARK: 1,
         RESERVE_MARK: 1,
     }
-    final = particle.read_text()
     for marker, expected in checks.items():
         count = final.count(marker)
         if count != expected:
             raise RuntimeError(
-                f"GMFE69 postgen: {particle.name}: marker {marker} count={count}, expected={expected}"
+                f"GMFE69 postgen: marker {marker} count={count}, "
+                f"expected={expected}"
             )
+
+    helper_files = 0
+    for text_part in generated_texts:
+        if STACK_LFS_MARK in text_part:
+            if STACK_LFS_HELPER_MARK not in text_part:
+                raise RuntimeError(
+                    "GMFE69 postgen: stack-LFS site exists without local helper"
+                )
+            helper_files += 1
+
+    if helper_files != stack_lfs_files:
+        raise RuntimeError(
+            "GMFE69 postgen: stack-LFS helper/file accounting mismatch: "
+            f"helpers={helper_files}, patched-files={stack_lfs_files}"
+        )
+
+    print(
+        "  GMFE69 particle split-aware postgen: "
+        f"hot={particle.name}, stack-lfs={stack_lfs_total} "
+        f"across {stack_lfs_files} chunk(s)"
+    )
+
+
+
+
+# MOH_GMFE69_BURST_FINAL_FASTPATHS
+def _patch_final_burst_fastpaths(text: str) -> str:
+    if "MOH_GMFE69_BURST_ADJACENT_CHUNK_FASTPATH" in text:
+        return text
+
+    old = """    int cached_chunk = -1;
+    u32 cached_chunk_start = 0u;
+    u32 cached_chunk_end = 0u;
+    ctx->pc = address;
+    while (blocks < 64u && total_cycles < cycle_budget) {
+        const u32 pc = ctx->pc;
+        int chunk = cached_chunk;
+        if (chunk < 0 || pc < cached_chunk_start || pc >= cached_chunk_end) {
+            chunk = multi_chunk_index(pc);
+            if (chunk < 0) break;
+            cached_chunk = chunk;
+            cached_chunk_start = s_chunk_ranges[(u32)chunk].start;
+            cached_chunk_end = s_chunk_ranges[(u32)chunk].end;
+        }
+        if ((u32)chunk >= chain_state_count || chain_state[(u32)chunk] == 0u) break;
+        const u32 begin = s_variant_offsets[(u32)chunk];
+        const u32 end = s_variant_offsets[(u32)chunk + 1u];
+        /* Never burst through an address range shared by executable images. */
+        if (end - begin != 1u) break;
+        const u32 image = s_active_image[(u32)chunk];
+        if (image == MULTI_INVALID_IMAGE) break;
+        ctx->downcount = 0;
+"""
+
+    new = """    int cached_chunk = -1;
+    u32 cached_chunk_start = 0u;
+    u32 cached_chunk_end = 0u;
+    u32 cached_image = MULTI_INVALID_IMAGE;
+    ctx->pc = address;
+    while (blocks < 64u && total_cycles < cycle_budget) {
+        const u32 pc = ctx->pc;
+        int chunk = cached_chunk;
+        if (chunk < 0 || pc < cached_chunk_start || pc >= cached_chunk_end) {
+            int resolved_chunk = -1;
+
+            /* MOH_GMFE69_BURST_ADJACENT_CHUNK_FASTPATH */
+            if (chunk >= 0) {
+                const u32 next = (u32)chunk + 1u;
+                if (next < chain_state_count &&
+                    pc >= s_chunk_ranges[next].start &&
+                    pc < s_chunk_ranges[next].end) {
+                    resolved_chunk = (int)next;
+                } else if (chunk > 0) {
+                    const u32 prev = (u32)chunk - 1u;
+                    if (pc >= s_chunk_ranges[prev].start &&
+                        pc < s_chunk_ranges[prev].end) {
+                        resolved_chunk = (int)prev;
+                    }
+                }
+            }
+
+            if (resolved_chunk < 0)
+                resolved_chunk = multi_chunk_index(pc);
+
+            chunk = resolved_chunk;
+            if (chunk < 0) break;
+
+            cached_chunk = chunk;
+            cached_chunk_start = s_chunk_ranges[(u32)chunk].start;
+            cached_chunk_end = s_chunk_ranges[(u32)chunk].end;
+
+            /* MOH_GMFE69_BURST_GUARD_HOIST */
+            if ((u32)chunk >= chain_state_count ||
+                chain_state[(u32)chunk] == 0u)
+                break;
+
+            const u32 begin = s_variant_offsets[(u32)chunk];
+            const u32 end = s_variant_offsets[(u32)chunk + 1u];
+            if (end - begin != 1u)
+                break;
+
+            cached_image = s_active_image[(u32)chunk];
+            if (cached_image == MULTI_INVALID_IMAGE)
+                break;
+        }
+
+        const u32 image = cached_image;
+        ctx->downcount = 0;
+"""
+
+    count = text.count(old)
+    if count != 1:
+        if "MOH_GMFE69_BURST_GUARD_HOIST" in text:
+            if "MOH_GMFE69_BURST_ADJACENT_CHUNK_FASTPATH" not in text:
+                raise RuntimeError(
+                    "GMFE69 burst postgen: guard-hoist exists but adjacent "
+                    "fastpath is absent"
+                )
+            return text
+        raise RuntimeError(
+            f"GMFE69 burst postgen: expected one base burst body, found {count}"
+        )
+
+    return text.replace(old, new, 1)
 
 
 def _image_dispatch_cases(text: str) -> list[tuple[int, str]]:
@@ -642,6 +1252,7 @@ def apply_gmfe69_export_postgen(path: Path) -> None:
         + match.group(2)
         + text[match.end():]
     )
+    text = _patch_final_burst_fastpaths(text)
     path.write_text(text)
 
     final = path.read_text()

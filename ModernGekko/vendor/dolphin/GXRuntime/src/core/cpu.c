@@ -373,6 +373,90 @@ bool ppc_psq_store(
     return true;
 }
 
+
+/* MOH_GMFE69_PSQ_PAIR_FASTPATH
+ *
+ * Specialized common path for GMFE69's hot psq_l/psq_st W=0,I=0 sites.
+ * GQR0 is still checked at runtime: if its format is not raw float, if LSQE
+ * is disabled, or if the 8-byte pair is not directly backed by GC RAM, fall
+ * back to the exact generic helper.
+ */
+bool ppc_psq_load0_pair_gmfe69_fast(
+    CPUState* cpu, u8 frD, u32 ea, u32 cia)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(
+            (cpu->hid2 & PPC_HID2_LSQE) == 0 ||
+            ((cpu->gqr[0] >> 16) & 7u) != 0,
+            0))
+#else
+    if ((cpu->hid2 & PPC_HID2_LSQE) == 0 ||
+        ((cpu->gqr[0] >> 16) & 7u) != 0)
+#endif
+        return ppc_psq_load(cpu, frD, ea, false, 0u, false, cia);
+
+    u8* ptr = get_ram_ptr(cpu, ea, 8u, NULL);
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(ptr != NULL, 1))
+#else
+    if (ptr != NULL)
+#endif
+    {
+        cpu->fpr[frD] =
+            f64_value(convert_to_double(read_be32(ptr)));
+        cpu->ps1[frD] =
+            f64_value(convert_to_double(read_be32(ptr + 4u)));
+        return true;
+    }
+
+    return ppc_psq_load(cpu, frD, ea, false, 0u, false, cia);
+}
+
+bool ppc_psq_store0_pair_gmfe69_fast(
+    CPUState* cpu, u8 frS, u32 ea, u32 cia)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(
+            (cpu->hid2 & PPC_HID2_LSQE) == 0 ||
+            (cpu->gqr[0] & 7u) != 0,
+            0))
+#else
+    if ((cpu->hid2 & PPC_HID2_LSQE) == 0 ||
+        (cpu->gqr[0] & 7u) != 0)
+#endif
+        return ppc_psq_store(cpu, frS, ea, false, 0u, false, cia);
+
+    u32 offset;
+    u8* ptr = get_ram_ptr(cpu, ea, 8u, &offset);
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(ptr != NULL, 1))
+#else
+    if (ptr != NULL)
+#endif
+    {
+        const u32 ps0 =
+            convert_to_single_ftz(f64_bits(cpu->fpr[frS]));
+        const u32 ps1 =
+            convert_to_single_ftz(f64_bits(cpu->ps1[frS]));
+
+        /* Preserve mem_write32 ordering and side effects lane-by-lane. */
+        clear_matching_reservation(cpu, ea);
+        if (g_mem_write_journal && offset != (u32)-1)
+            g_mem_write_journal(offset, 4u, g_mem_write_journal_user);
+        write_be32(ptr, ps0);
+
+        clear_matching_reservation(cpu, ea + 4u);
+        if (g_mem_write_journal && offset != (u32)-1)
+            g_mem_write_journal(offset + 4u, 4u, g_mem_write_journal_user);
+        write_be32(ptr + 4u, ps1);
+
+        return true;
+    }
+
+    return ppc_psq_store(cpu, frS, ea, false, 0u, false, cia);
+}
+
+
 void ppc_rfi(CPUState* cpu, u32 cia) {
     if (cpu->msr & PPC_MSR_PR) {
         ppc_program_exception(cpu, PPC_PROGRAM_PRIV, cia);

@@ -811,6 +811,54 @@ void ppc_frsqrte_op(CPUState* cpu, u8 d, u8 b) {
     set_fprf(cpu, classify_f64(result));
 }
 
+
+/* MOH_GMFE69_FCTIWZ_FASTPATH
+ *
+ * GMFE69's generated native code uses ppc_fctiw() exclusively as fctiwz
+ * (toward_zero=true).  Fast-path the normal finite int32 case and retain the
+ * exact generic helper for NaN/Inf/out-of-range values.
+ */
+bool ppc_fctiwz_gmfe69_fast(CPUState* cpu, f64 value, u64* output)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(
+            value >= -2147483648.0 && value < 2147483648.0, 1))
+#else
+    if (value >= -2147483648.0 && value < 2147483648.0)
+#endif
+    {
+        /* C floating->integer conversion truncates toward zero.  The range
+         * guard makes the conversion defined and exactly matches fctiwz. */
+        const s32 signed_result = (s32)value;
+        const u32 result = (u32)signed_result;
+        const f64 rounded = (f64)signed_result;
+
+        /* Generic ppc_fctiw() clears FI/FR unconditionally before applying
+         * the inexact result state.  For truncation FR can never become set. */
+        clear_fifr(cpu);
+
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_expect(rounded != value, 0))
+#else
+        if (rounded != value)
+#endif
+        {
+            set_fp_exception(cpu, FPSCR_XX_BIT);
+            cpu->fpscr |= FPSCR_FI_BIT;
+        }
+
+        *output = 0xFFF8000000000000ull |
+                  (u64)result |
+                  ((result == 0u && signbit(value))
+                       ? 0x100000000ull
+                       : 0ull);
+        return true;
+    }
+
+    return ppc_fctiw(cpu, value, true, output);
+}
+
+
 void ppc_fctiw_op(CPUState* cpu, u8 d, u8 b, bool toward_zero) {
     u64 result;
     if (ppc_fctiw(cpu, cpu->fpr[b], toward_zero, &result))
