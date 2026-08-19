@@ -301,13 +301,25 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
       const int width = std::atoi(aspect_num);
       const int height = std::atoi(aspect_den);
       if (width > 0 && height > 0) {
-        Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::Custom);
-        Config::SetBase(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, width);
-        Config::SetBase(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, height);
+        const bool auto_fill = std::getenv("MOH_ASPECT_AUTO") != nullptr;
+        if (auto_fill) {
+          // Auto means exactly what a native PC game normally means: fill the
+          // current backbuffer.  Presenter::AspectMode::Stretch is the only
+          // mode that bypasses VI-relative aspect correction and XFB snapping.
+          Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::Stretch);
+        } else {
+          // Custom is VI-relative in Dolphin; CustomStretch forces the literal
+          // target ratio (16:10, 16:9, ultrawide, custom...) with no tiny bars.
+          Config::SetBase(Config::GFX_ASPECT_RATIO, AspectMode::CustomStretch);
+          Config::SetBase(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, width);
+          Config::SetBase(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, height);
+        }
         Config::SetBase(Config::GFX_CROP_TO_ASPECT_RATIO, false);
         Config::SetBase(Config::GFX_WIDESCREEN_HACK, false);
         std::fprintf(stderr,
-                     "[moh-enh] output aspect: VI-relative custom %d:%d (no raw stretch)\n",
+                     auto_fill ?
+                         "[moh-enh] output aspect: auto fill-window %d:%d (no borders)\n" :
+                         "[moh-enh] output aspect: exact custom %d:%d (no VI-relative bars)\n",
                      width, height);
       }
     }

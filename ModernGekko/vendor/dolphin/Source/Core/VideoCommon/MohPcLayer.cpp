@@ -494,9 +494,25 @@ void ApplyAspect(int mode)
   SetEnv("MOH_UI_SAFE", s.ui_safe.load() ? "1" : "0");
   SetEnv("MOH_HUD_SCALE", std::to_string(s.hud_scale.load()));
   SetEnv("MOH_HUD_SAFE_WIDTH", std::to_string(s.hud_safe_width.load()));
-  Config::SetCurrent(Config::GFX_ASPECT_RATIO, AspectMode::Custom);
-  Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, num);
-  Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, den);
+  // Dolphin's Custom mode is VI-relative: it multiplies the native VI aspect by
+  // target/(4:3).  MOH's VI aspect is not exactly 4:3, which leaves small
+  // pillar/letterbox borders even when the target matches the window (for
+  // example ~1814x1160 inside a 1920x1200 backbuffer).
+  //
+  // Auto is explicitly a fill-window mode for this native PC layer.  Explicit
+  // ratios use CustomStretch so the requested ratio is exact rather than
+  // VI-relative.  The guest still receives MOH_ASPECT_VALUE, so camera/HUD
+  // correction remains native Hor+ instead of being a blind image stretch.
+  if (mode == 1)
+  {
+    Config::SetCurrent(Config::GFX_ASPECT_RATIO, AspectMode::Stretch);
+  }
+  else
+  {
+    Config::SetCurrent(Config::GFX_ASPECT_RATIO, AspectMode::CustomStretch);
+    Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, num);
+    Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, den);
+  }
   Config::SetCurrent(Config::GFX_CROP_TO_ASPECT_RATIO, false);
   Config::SetCurrent(Config::GFX_WIDESCREEN_HACK, false);
 }
@@ -1370,7 +1386,7 @@ void DrawSettingsUI(float backbuffer_scale)
           ApplyFov();
         }
 
-        const char* aspect_items[] = {"Original 4:3", "Auto (window)", "16:10", "16:9", "21:9", "32:9", "Custom"};
+        const char* aspect_items[] = {"Original 4:3", "Auto (fill window)", "16:10", "16:9", "21:9", "32:9", "Custom"};
         int aspect = s.aspect_mode.load();
         if (ImGui::Combo("Aspect ratio", &aspect, aspect_items, 7))
         {
