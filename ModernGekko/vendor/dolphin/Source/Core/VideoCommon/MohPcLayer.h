@@ -29,6 +29,7 @@ void UpdateFrame();
 
 void SetGameplayActive(bool active);
 bool IsGameplayActive();
+void SetMovieActive(bool active);
 bool IsSettingsOpen();
 bool IsDebugOpen();
 bool WantsRelativeMouse();

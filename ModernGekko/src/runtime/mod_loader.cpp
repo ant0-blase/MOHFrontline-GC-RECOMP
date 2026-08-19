@@ -33,6 +33,8 @@ constexpr std::uint32_t MOH_HOSTCALL_MOUSE_LOOK = 0xFFFFF120u;
 constexpr std::uint32_t MOH_HOSTCALL_ADS_VIEWMODEL = 0xFFFFF130u;
 constexpr std::uint32_t MOH_HOSTCALL_ADS_STATE = 0xFFFFF131u;
 constexpr std::uint32_t MOH_HOSTCALL_ADS_CROSSHAIR = 0xFFFFF132u;
+constexpr std::uint32_t MOH_HOSTCALL_VP6_MOVIE_ON = 0xFFFFF140u;
+constexpr std::uint32_t MOH_HOSTCALL_VP6_MOVIE_OFF = 0xFFFFF141u;
 
 std::uint32_t ReadGuestU32(CPUState* state, std::uint32_t address)
 {
@@ -807,6 +809,10 @@ bool ModManager::HostCall(CPUState *state, std::uint32_t address,
                    mode, player, x_addr - player, y_addr - player, fov,
                    yaw_delta, pitch_delta);
     }
+    return true;
+  }
+  if (address == MOH_HOSTCALL_VP6_MOVIE_ON || address == MOH_HOSTCALL_VP6_MOVIE_OFF) {
+    MohPcLayer::SetMovieActive(address == MOH_HOSTCALL_VP6_MOVIE_ON);
     return true;
   }
   if (address == MOH_HOSTCALL_ADS_STATE) {

@@ -167,6 +167,7 @@ struct State
   std::atomic<float> gfx_vignette_strength{0.12f};
   std::atomic<bool> gfx_film_grain{false};
   std::atomic<float> gfx_film_grain_strength{0.015f};
+  std::atomic<bool> movie_active{false};
   std::atomic<float> hud_scale{1.0f};
   std::atomic<float> hud_safe_width{1.0f};
   std::atomic<float> gamepad_sensitivity{1.0f};
@@ -191,6 +192,7 @@ struct State
   std::string platform_name{"desktop"};
   std::string original_post_shader;
   std::string applied_post_shader;
+  bool original_fast_texture_sampling = true;
   std::chrono::steady_clock::time_point ads_last_update{};
   double smooth_x = 0.0;
   double smooth_y = 0.0;
@@ -971,6 +973,7 @@ void Initialize()
   s.requested_fps = -1;
   s.original_post_shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
   s.applied_post_shader = s.original_post_shader;
+  s.original_fast_texture_sampling = Config::Get(Config::GFX_HACK_FAST_TEXTURE_SAMPLING);
   LoadSettings();
   SyncFromEnvironment();
   auto* config = Pad::GetConfig();
@@ -1029,6 +1032,49 @@ void SetGameplayActive(bool active)
     s.mobile_actions = 0;
     s.gamepad_aim = false;
     s.ads_blend = 0.0f;
+  }
+}
+
+void SetMovieActive(bool active)
+{
+  const bool previous = s.movie_active.exchange(active);
+  if (previous == active)
+    return;
+
+  if (active)
+  {
+    // EA VP6 uses planar/indirect texture accesses that are sensitive to the
+    // host sampler's rounding/filtering behaviour. Keep the expensive precise
+    // path scoped to synchronous RCMP_PlayMovie only; gameplay keeps the fast
+    // sampler used by v10.2. Forced filtering/AF are also disabled while the
+    // decoder owns the frame so the guest's original sampler state wins.
+    Config::SetCurrent(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING,
+                       TextureFilteringMode::Default);
+    Config::SetCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY,
+                       AnisotropicFilteringMode::Default);
+    Config::SetCurrent(Config::GFX_HACK_FAST_TEXTURE_SAMPLING, false);
+
+    // The source movies are authored 4:3. Present them at exactly 4:3 even
+    // when gameplay is Auto fill-window / 16:10 / 16:9 / ultrawide.
+    Config::SetCurrent(Config::GFX_ASPECT_RATIO, AspectMode::CustomStretch);
+    Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, 4);
+    Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, 3);
+    Config::SetCurrent(Config::GFX_CROP_TO_ASPECT_RATIO, false);
+
+    std::fprintf(stderr,
+                 "[moh-vp6] movie ON: precise sampler + guest filtering + 4:3\n");
+  }
+  else
+  {
+    Config::SetCurrent(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING,
+                       TextureMode(s.texture_filter.load()));
+    Config::SetCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY,
+                       AnisotropyMode(s.anisotropy.load()));
+    Config::SetCurrent(Config::GFX_HACK_FAST_TEXTURE_SAMPLING,
+                       s.original_fast_texture_sampling);
+    ApplyAspect(s.aspect_mode.load());
+    std::fprintf(stderr,
+                 "[moh-vp6] movie OFF: restored v10.2 graphics/aspect\n");
   }
 }
 
