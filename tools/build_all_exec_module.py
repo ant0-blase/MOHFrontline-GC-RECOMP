@@ -256,6 +256,13 @@ def apply_gmfe69_generated_enhancements(generated: Path):
         _inject_after_label(generated, weapon_proj_label, """    (void)moh_weapon_projection_override(ctx);
 """)
 
+    # Native PC mouse look.  Inject before BeginUpdate's epilogue, while r31
+    # still contains the live CPlayerObject* (mr r31,r3 at function entry).
+    # 0x800A4CE8 is too late: lmw at 0x800A4CD8 has already restored r31.
+    _inject_after_label(generated, "800A4CB4", """    if (ctx->host_call)
+        (void)ctx->host_call(ctx, 0xFFFFF120u);
+""")
+
     # The game's 2D shell/HUD transform is authored for 4:3.  Force a rebuild
     # when the target aspect changes, then counter-scale the 2D matrix around
     # its existing center translation so text/icons keep their proportions.

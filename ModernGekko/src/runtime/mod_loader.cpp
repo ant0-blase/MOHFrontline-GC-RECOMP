@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <limits>
@@ -25,6 +26,38 @@ constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_ON = 0xFFFFF100u;
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_OFF = 0xFFFFF101u;
 constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_ENTER = 0xFFFFF110u;
 constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_EXIT = 0xFFFFF111u;
+constexpr std::uint32_t MOH_HOSTCALL_MOUSE_LOOK = 0xFFFFF120u;
+
+std::uint32_t ReadGuestU32(CPUState* state, std::uint32_t address)
+{
+  if (!state || !state->external_read)
+    return 0u;
+  return static_cast<std::uint32_t>(state->external_read(state, address, 4));
+}
+
+bool IsMem1Address(std::uint32_t address)
+{
+  return address >= 0x80000000u && address < 0x81800000u;
+}
+
+float ReadGuestF32(CPUState* state, std::uint32_t address)
+{
+  if (!state || !state->external_read)
+    return 0.0f;
+  const std::uint32_t bits = static_cast<std::uint32_t>(state->external_read(state, address, 4));
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+void WriteGuestF32(CPUState* state, std::uint32_t address, float value)
+{
+  if (!state || !state->external_write)
+    return;
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  state->external_write(state, address, bits, 4);
+}
 
 struct Version {
   std::array<std::uint32_t, 3> parts{};
@@ -663,6 +696,102 @@ bool ModManager::HostCall(CPUState *state, std::uint32_t address,
   if (address == MOH_HOSTCALL_GAMEPLAY_ENTER || address == MOH_HOSTCALL_GAMEPLAY_EXIT) {
     const bool active = address == MOH_HOSTCALL_GAMEPLAY_ENTER;
     MohPcLayer::SetGameplayActive(active);
+    return true;
+  }
+  if (address == MOH_HOSTCALL_MOUSE_LOOK) {
+    // Port Carnivorous' Dolphin Mouse Injector camera offsets/behaviour directly
+    // into ModernGekko.  The active CPlayerObject* comes from BeginUpdate's
+    // live r31 rather than the external injector's version-specific global.
+    constexpr std::uint32_t CAM_X = 0x29Cu;
+    constexpr std::uint32_t CAM_Y = 0x2A0u;
+    constexpr std::uint32_t FOV = 0x42Cu;
+    constexpr std::uint32_t SENTRY_X = 0x41Cu;
+    constexpr std::uint32_t SENTRY_Y = 0x420u;
+    constexpr std::uint32_t SENTRY_Y_LIMIT = 0x418u;
+    constexpr std::uint32_t SENTRY_FLAG = 0x6CCu;
+    constexpr float TAU = 6.2831853f;
+    constexpr float CROSSHAIR_Y = 1.450000048f;
+
+    // This host-call is emitted from inside CPlayerObject::BeginUpdate at
+    // 0x800A4CB4, before the function epilogue restores callee-saved registers.
+    // r31 is the live CPlayerObject* (mr r31,r3 at 0x800A2838), so using it is
+    // substantially more robust than Carnivorous' static g_pPlayers address.
+    const std::uint32_t player = state ? state->gpr[31] : 0u;
+    if (!IsMem1Address(player)) {
+      static bool bad_player_logged = false;
+      if (!bad_player_logged) {
+        bad_player_logged = true;
+        std::fprintf(stderr,
+                     "[moh-pc] mouse delta received but player pointer is invalid: %08x\n",
+                     player);
+      }
+      return true;
+    }
+
+    const float fov = ReadGuestF32(state, player + FOV);
+    float yaw_delta = 0.0f;
+    float pitch_delta = 0.0f;
+    if (!MohPcLayer::ConsumeMouseLook(fov, &yaw_delta, &pitch_delta))
+      return true;
+
+    const std::uint32_t sentry_flag = ReadGuestU32(state, player + SENTRY_FLAG);
+    const char* mode = nullptr;
+    std::uint32_t x_addr = 0;
+    std::uint32_t y_addr = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float y_limit = CROSSHAIR_Y;
+
+    if (sentry_flag == 1u) {
+      mode = "player";
+      x_addr = player + CAM_X;
+      y_addr = player + CAM_Y;
+      x = ReadGuestF32(state, x_addr);
+      y = ReadGuestF32(state, y_addr);
+    } else if (sentry_flag == 21u) {
+      mode = "sentry";
+      x_addr = player + SENTRY_X;
+      y_addr = player + SENTRY_Y;
+      x = ReadGuestF32(state, x_addr);
+      y = ReadGuestF32(state, y_addr);
+      y_limit = ReadGuestF32(state, player + SENTRY_Y_LIMIT);
+      if (!std::isfinite(y_limit) || y_limit <= 0.0f || y_limit > TAU)
+        y_limit = CROSSHAIR_Y;
+    } else {
+      static std::uint32_t last_unknown_flag = 0xffffffffu;
+      if (sentry_flag != last_unknown_flag) {
+        last_unknown_flag = sentry_flag;
+        std::fprintf(stderr,
+                     "[moh-pc] mouse look waiting for supported player state: sentryflag=%u\n",
+                     sentry_flag);
+      }
+      return true;
+    }
+
+    if (!std::isfinite(x) || !std::isfinite(y) || x < -TAU || x > TAU ||
+        y < -y_limit || y > y_limit)
+      return true;
+
+    x += yaw_delta;
+    y += pitch_delta;
+    while (x <= -TAU)
+      x += TAU;
+    while (x >= TAU)
+      x -= TAU;
+    y = std::clamp(y, -y_limit, y_limit);
+
+    WriteGuestF32(state, x_addr, x);
+    WriteGuestF32(state, y_addr, y);
+
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      std::fprintf(stderr,
+                   "[moh-pc] native mouse injector active: mode=%s player=%08x "
+                   "cam=(+%03x,+%03x) fov=%.2f first_delta=(%+.5f,%+.5f) rad\n",
+                   mode, player, x_addr - player, y_addr - player, fov,
+                   yaw_delta, pitch_delta);
+    }
     return true;
   }
   // Reserved GMFE69 control tokens emitted directly by the native game module.

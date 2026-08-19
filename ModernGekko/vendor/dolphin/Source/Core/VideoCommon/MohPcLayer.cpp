@@ -419,38 +419,15 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
   }
   else if (group == GCPad::C_STICK_GROUP)
   {
+    // Mouse look is applied directly to MOH's camera-angle accumulators from
+    // CPlayerObject::BeginUpdate.  Do not turn mouse deltas into one-frame
+    // C-stick velocities here: that made mouse response tiny and frame-rate
+    // dependent.  A physical gamepad still uses the original C-stick path.
     if (block_game)
-      return 0.0;
-    if (!s.gameplay.load())
-    {
-      if (keep_pad)
-        return std::nullopt;
       return static_cast<ControlState>(0.0);
-    }
-    const double fps_factor = std::max<double>(1.0, Config::Get(Config::MAIN_VI_OVERCLOCK));
-    const double gain = 0.018 * s.sensitivity.load() * fps_factor;
-    if (control == ControllerEmu::ReshapableInput::X_INPUT_OVERRIDE)
-    {
-      const double dx = s.rel_x.exchange(0.0);
-      if (dx != 0.0)
-        return static_cast<ControlState>(std::clamp(dx * gain, -1.0, 1.0));
-      if (keep_pad)
-        return std::nullopt;
-      return static_cast<ControlState>(0.0);
-    }
-    if (control == ControllerEmu::ReshapableInput::Y_INPUT_OVERRIDE)
-    {
-      const double dy = s.rel_y.exchange(0.0);
-      if (dy != 0.0)
-      {
-        double value = -dy * gain;
-        if (s.invert_y.load()) value = -value;
-        return static_cast<ControlState>(std::clamp(value, -1.0, 1.0));
-      }
-      if (keep_pad)
-        return std::nullopt;
-      return static_cast<ControlState>(0.0);
-    }
+    if (keep_pad)
+      return std::nullopt;
+    return static_cast<ControlState>(0.0);
   }
   else if (group == GCPad::BUTTONS_GROUP)
   {
@@ -696,8 +673,60 @@ void RelativeMotion(double dx, double dy)
 {
   if (!WantsRelativeMouse())
     return;
-  s.rel_x.store(s.rel_x.load(std::memory_order_relaxed) + dx, std::memory_order_relaxed);
-  s.rel_y.store(s.rel_y.load(std::memory_order_relaxed) + dy, std::memory_order_relaxed);
+
+  s.rel_x.fetch_add(dx, std::memory_order_relaxed);
+  s.rel_y.fetch_add(dy, std::memory_order_relaxed);
+
+  static bool logged = false;
+  if (!logged && (dx != 0.0 || dy != 0.0))
+  {
+    logged = true;
+    std::fprintf(stderr,
+                 "[moh-pc] Wayland relative mouse events active: first dx=%+.3f dy=%+.3f\n",
+                 dx, dy);
+  }
+}
+
+bool ConsumeMouseLook(float fov_degrees, float* yaw_delta, float* pitch_delta)
+{
+  if (!yaw_delta || !pitch_delta)
+    return false;
+  *yaw_delta = 0.0f;
+  *pitch_delta = 0.0f;
+
+  if (!WantsRelativeMouse())
+    return false;
+
+  const double dx = s.rel_x.exchange(0.0, std::memory_order_relaxed);
+  const double dy = s.rel_y.exchange(0.0, std::memory_order_relaxed);
+  if (dx == 0.0 && dy == 0.0)
+    return false;
+
+  // Match Carnivorous' Medal of Honor: Frontline Mouse Injector math.  Its
+  // user sensitivity is divided by 40; our UI exposes a multiplier directly,
+  // therefore 1.0 here corresponds to the injector's normal/default gain.
+  constexpr double tau = 6.2831853;
+  constexpr double crosshair_y = 1.450000048;
+  const double sensitivity = std::clamp<double>(s.sensitivity.load(), 0.01, 20.0);
+  const double live_fov = s.fov_override.load() ? static_cast<double>(s.fov.load())
+                                                : static_cast<double>(fov_degrees);
+  const double fov = std::clamp<double>(
+      std::isfinite(live_fov) && live_fov > 1.0 ? live_fov : 35.0, 1.0, 179.0);
+  const double fov_scale = fov / 35.0;
+
+  double yaw = -(dx / 10.0) * sensitivity / (360.0 / tau) * fov_scale;
+  double pitch = (dy / 10.0) * sensitivity / (90.0 / crosshair_y) * fov_scale;
+  if (s.invert_y.load())
+    pitch = -pitch;
+
+  // Compositor/focus transitions may queue a very large delta.  Keep a generous
+  // one-frame safety bound while preserving normal raw-mouse response.
+  yaw = std::clamp(yaw, -1.0, 1.0);
+  pitch = std::clamp(pitch, -1.0, 1.0);
+
+  *yaw_delta = static_cast<float>(yaw);
+  *pitch_delta = static_cast<float>(pitch);
+  return true;
 }
 
 void AdaptivePerformanceUpdate()
