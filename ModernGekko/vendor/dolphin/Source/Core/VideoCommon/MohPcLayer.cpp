@@ -6,6 +6,7 @@
 #include "Common/Config/Config.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/Core.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/GCPadEmu.h"
 #include "Core/System.h"
@@ -27,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <imgui.h>
 
@@ -79,11 +81,22 @@ struct State
   std::atomic<bool> settings_open{false};
   std::atomic<bool> input_enabled{true};
   std::atomic<bool> gamepad_enabled{true};
+  std::atomic<bool> invert_x{false};
   std::atomic<bool> invert_y{false};
   std::atomic<bool> ui_safe{true};
   std::atomic<bool> adaptive_fps{true};
+  std::atomic<int> adaptive_profile{2}; // 0 off, 1 conservative, 2 balanced, 3 aggressive
   std::atomic<bool> raw_mouse{true};
   std::atomic<float> sensitivity{1.0f};
+  std::atomic<float> sensitivity_x{1.0f};
+  std::atomic<float> sensitivity_y{1.0f};
+  std::atomic<float> ads_sensitivity{0.80f};
+  std::atomic<float> mouse_smoothing{0.0f};
+  std::atomic<float> mouse_acceleration{0.0f};
+  std::atomic<bool> toggle_aim{false};
+  std::atomic<bool> toggle_crouch{false};
+  std::atomic<bool> aim_latched{false};
+  std::atomic<bool> crouch_latched{false};
   std::array<std::atomic<u32>, static_cast<size_t>(Action::Count)> keys{};
   std::array<std::atomic<bool>, 512> ascii_keys{};
   std::atomic<bool> ctrl_down{false};
@@ -104,6 +117,15 @@ struct State
   std::atomic<int> fire_button{0};
   std::atomic<int> aim_button{1};
   std::atomic<int> internal_resolution{3};
+  std::atomic<int> anisotropy{16};
+  std::atomic<int> msaa{1};
+  std::atomic<int> texture_filter{0}; // 0 default, 1 nearest, 2 linear
+  std::atomic<bool> true_color{true};
+  std::atomic<bool> disable_copy_filter{false};
+  std::atomic<float> hud_scale{1.0f};
+  std::atomic<float> hud_safe_width{1.0f};
+  std::atomic<float> gamepad_sensitivity{1.0f};
+  std::atomic<float> gamepad_deadzone{0.10f};
   std::atomic<int> audio_buffer_ms{120};
   std::atomic<int> audio_volume{100};
   std::atomic<bool> fill_audio_gaps{true};
@@ -116,7 +138,16 @@ struct State
   std::atomic<int> aspect_mode{0}; // 0 original,1 auto,2 16:10,3 16:9,4 21:9,5 32:9,6 custom
   std::atomic<int> aspect_num{16};
   std::atomic<int> aspect_den{9};
+  std::atomic<bool> debug_open{false};
+  std::atomic<float> mobile_move_x{0.0f};
+  std::atomic<float> mobile_move_y{0.0f};
+  std::atomic<u32> mobile_actions{0};
   std::string settings_path;
+  std::string platform_name{"desktop"};
+  double smooth_x = 0.0;
+  double smooth_y = 0.0;
+  double adaptive_ema = 1.0;
+  int adaptive_recovery_samples = 0;
 };
 
 State s;
@@ -141,12 +172,20 @@ double EnvDouble(const char* name, double fallback)
 
 void SetEnv(const char* name, const std::string& value)
 {
+#ifdef _WIN32
+  _putenv_s(name, value.c_str());
+#else
   setenv(name, value.c_str(), 1);
+#endif
 }
 
 void UnsetEnv(const char* name)
 {
+#ifdef _WIN32
+  _putenv_s(name, "");
+#else
   unsetenv(name);
+#endif
 }
 
 bool KeyDown(u32 sym)
@@ -178,6 +217,53 @@ bool ConsumePulse(std::atomic<int>& pulse)
       return true;
   }
   return false;
+}
+
+
+bool MobileDown(MobileAction action)
+{
+  const u32 bit = 1u << static_cast<u32>(action);
+  return (s.mobile_actions.load(std::memory_order_relaxed) & bit) != 0;
+}
+
+bool AimActive()
+{
+  if (s.toggle_aim.load(std::memory_order_relaxed))
+    return s.aim_latched.load(std::memory_order_relaxed) || MobileDown(MobileAction::Aim);
+  const u32 bit = 1u << static_cast<u32>(std::clamp(s.aim_button.load(), 0, 2));
+  return (s.mouse_buttons.load(std::memory_order_relaxed) & bit) != 0 || MobileDown(MobileAction::Aim);
+}
+
+double ApplyDeadzone(double value, double deadzone, double sensitivity)
+{
+  const double a = std::fabs(value);
+  if (a <= deadzone)
+    return 0.0;
+  const double normalized = (a - deadzone) / std::max(1.0 - deadzone, 0.001);
+  return std::copysign(std::clamp(normalized * sensitivity, 0.0, 1.0), value);
+}
+
+AnisotropicFilteringMode AnisotropyMode(int value)
+{
+  switch (value)
+  {
+  case 1: return AnisotropicFilteringMode::Force1x;
+  case 2: return AnisotropicFilteringMode::Force2x;
+  case 4: return AnisotropicFilteringMode::Force4x;
+  case 8: return AnisotropicFilteringMode::Force8x;
+  case 16: return AnisotropicFilteringMode::Force16x;
+  default: return AnisotropicFilteringMode::Default;
+  }
+}
+
+TextureFilteringMode TextureMode(int value)
+{
+  switch (value)
+  {
+  case 1: return TextureFilteringMode::Nearest;
+  case 2: return TextureFilteringMode::Linear;
+  default: return TextureFilteringMode::Default;
+  }
 }
 
 std::string KeyName(u32 key)
@@ -240,6 +326,8 @@ void ApplyAspect(int mode)
   SetEnv("MOH_ASPECT_DEN", std::to_string(den));
   SetEnv("MOH_ASPECT_VALUE", std::to_string(static_cast<double>(num) / den));
   SetEnv("MOH_UI_SAFE", s.ui_safe.load() ? "1" : "0");
+  SetEnv("MOH_HUD_SCALE", std::to_string(s.hud_scale.load()));
+  SetEnv("MOH_HUD_SAFE_WIDTH", std::to_string(s.hud_safe_width.load()));
   Config::SetCurrent(Config::GFX_ASPECT_RATIO, AspectMode::Custom);
   Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, num);
   Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, den);
@@ -297,13 +385,31 @@ void SaveSettings()
   if (!f)
     return;
   f << "sensitivity=" << s.sensitivity.load() << '\n';
+  f << "sensitivity_x=" << s.sensitivity_x.load() << '\n';
+  f << "sensitivity_y=" << s.sensitivity_y.load() << '\n';
+  f << "ads_sensitivity=" << s.ads_sensitivity.load() << '\n';
+  f << "mouse_smoothing=" << s.mouse_smoothing.load() << '\n';
+  f << "mouse_acceleration=" << s.mouse_acceleration.load() << '\n';
+  f << "invert_x=" << s.invert_x.load() << '\n';
   f << "invert_y=" << s.invert_y.load() << '\n';
+  f << "toggle_aim=" << s.toggle_aim.load() << '\n';
+  f << "toggle_crouch=" << s.toggle_crouch.load() << '\n';
   f << "gamepad=" << s.gamepad_enabled.load() << '\n';
   f << "adaptive_fps=" << s.adaptive_fps.load() << '\n';
+  f << "adaptive_profile=" << s.adaptive_profile.load() << '\n';
   f << "ui_safe=" << s.ui_safe.load() << '\n';
+  f << "hud_scale=" << s.hud_scale.load() << '\n';
+  f << "hud_safe_width=" << s.hud_safe_width.load() << '\n';
   f << "fire_button=" << s.fire_button.load() << '\n';
   f << "aim_button=" << s.aim_button.load() << '\n';
   f << "internal_resolution=" << s.internal_resolution.load() << '\n';
+  f << "anisotropy=" << s.anisotropy.load() << '\n';
+  f << "msaa=" << s.msaa.load() << '\n';
+  f << "texture_filter=" << s.texture_filter.load() << '\n';
+  f << "true_color=" << s.true_color.load() << '\n';
+  f << "disable_copy_filter=" << s.disable_copy_filter.load() << '\n';
+  f << "gamepad_sensitivity=" << s.gamepad_sensitivity.load() << '\n';
+  f << "gamepad_deadzone=" << s.gamepad_deadzone.load() << '\n';
   f << "audio_buffer=" << s.audio_buffer_ms.load() << '\n';
   f << "audio_volume=" << s.audio_volume.load() << '\n';
   f << "fill_audio_gaps=" << s.fill_audio_gaps.load() << '\n';
@@ -342,13 +448,31 @@ void LoadSettings()
     auto as_i = [&] { return std::atoi(value.c_str()); };
     auto as_f = [&] { return static_cast<float>(std::atof(value.c_str())); };
     if (key == "sensitivity") s.sensitivity = std::clamp(as_f(), 0.05f, 10.0f);
+    else if (key == "sensitivity_x") s.sensitivity_x = std::clamp(as_f(), 0.10f, 4.0f);
+    else if (key == "sensitivity_y") s.sensitivity_y = std::clamp(as_f(), 0.10f, 4.0f);
+    else if (key == "ads_sensitivity") s.ads_sensitivity = std::clamp(as_f(), 0.10f, 2.0f);
+    else if (key == "mouse_smoothing") s.mouse_smoothing = std::clamp(as_f(), 0.0f, 0.95f);
+    else if (key == "mouse_acceleration") s.mouse_acceleration = std::clamp(as_f(), 0.0f, 2.0f);
+    else if (key == "invert_x") s.invert_x = as_i() != 0;
     else if (key == "invert_y") s.invert_y = as_i() != 0;
+    else if (key == "toggle_aim") s.toggle_aim = as_i() != 0;
+    else if (key == "toggle_crouch") s.toggle_crouch = as_i() != 0;
     else if (key == "gamepad") s.gamepad_enabled = as_i() != 0;
     else if (key == "adaptive_fps") s.adaptive_fps = as_i() != 0;
+    else if (key == "adaptive_profile") s.adaptive_profile = std::clamp(as_i(), 0, 3);
     else if (key == "ui_safe") s.ui_safe = as_i() != 0;
+    else if (key == "hud_scale") s.hud_scale = std::clamp(as_f(), 0.50f, 1.50f);
+    else if (key == "hud_safe_width") s.hud_safe_width = std::clamp(as_f(), 0.70f, 1.00f);
     else if (key == "fire_button") s.fire_button = std::clamp(as_i(), 0, 2);
     else if (key == "aim_button") s.aim_button = std::clamp(as_i(), 0, 2);
     else if (key == "internal_resolution") s.internal_resolution = std::clamp(as_i(), 1, 8);
+    else if (key == "anisotropy") s.anisotropy = as_i();
+    else if (key == "msaa") s.msaa = std::clamp(as_i(), 1, 8);
+    else if (key == "texture_filter") s.texture_filter = std::clamp(as_i(), 0, 2);
+    else if (key == "true_color") s.true_color = as_i() != 0;
+    else if (key == "disable_copy_filter") s.disable_copy_filter = as_i() != 0;
+    else if (key == "gamepad_sensitivity") s.gamepad_sensitivity = std::clamp(as_f(), 0.25f, 2.0f);
+    else if (key == "gamepad_deadzone") s.gamepad_deadzone = std::clamp(as_f(), 0.0f, 0.50f);
     else if (key == "audio_buffer") s.audio_buffer_ms = std::clamp(as_i(), 16, 512);
     else if (key == "audio_volume") s.audio_volume = std::clamp(as_i(), 0, 100);
     else if (key == "fill_audio_gaps") s.fill_audio_gaps = as_i() != 0;
@@ -397,6 +521,10 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
                       (s.keys[static_cast<size_t>(Action::Left)].load() == 'a' && KeyDown('q'));
     double x = (ActionDown(Action::Right) ? 1.0 : 0.0) - (left ? 1.0 : 0.0);
     double y = (forward ? 1.0 : 0.0) - (ActionDown(Action::Back) ? 1.0 : 0.0);
+    const double mobile_x = std::clamp<double>(s.mobile_move_x.load(), -1.0, 1.0);
+    const double mobile_y = std::clamp<double>(s.mobile_move_y.load(), -1.0, 1.0);
+    if (std::fabs(mobile_x) > std::fabs(x)) x = mobile_x;
+    if (std::fabs(mobile_y) > std::fabs(y)) y = mobile_y;
     if (!s.gameplay.load())
     {
       if (ConsumePulse(s.menu_up)) y = 1.0;
@@ -408,13 +536,13 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
     {
       if (x != 0.0 || !keep_pad)
         return static_cast<ControlState>(x);
-      return std::nullopt;
+      return static_cast<ControlState>(ApplyDeadzone(original, s.gamepad_deadzone.load(), 1.0));
     }
     if (control == ControllerEmu::ReshapableInput::Y_INPUT_OVERRIDE)
     {
       if (y != 0.0 || !keep_pad)
         return static_cast<ControlState>(y);
-      return std::nullopt;
+      return static_cast<ControlState>(ApplyDeadzone(original, s.gamepad_deadzone.load(), 1.0));
     }
   }
   else if (group == GCPad::C_STICK_GROUP)
@@ -426,7 +554,8 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
     if (block_game)
       return static_cast<ControlState>(0.0);
     if (keep_pad)
-      return std::nullopt;
+      return static_cast<ControlState>(ApplyDeadzone(original, s.gamepad_deadzone.load(),
+                                                     s.gamepad_sensitivity.load()));
     return static_cast<ControlState>(0.0);
   }
   else if (group == GCPad::BUTTONS_GROUP)
@@ -434,21 +563,24 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
     double pc = 0.0;
     const u32 buttons = s.mouse_buttons.load();
     if (control == GCPad::A_BUTTON)
-      pc = ActionDown(Action::Use) || (!s.gameplay.load() && (buttons & 1u));
+      pc = ActionDown(Action::Use) || MobileDown(MobileAction::Use) || (!s.gameplay.load() && (buttons & 1u));
     else if (control == GCPad::B_BUTTON)
-      pc = ActionDown(Action::Melee) || (!s.gameplay.load() && (buttons & 2u));
-    else if (control == GCPad::X_BUTTON) pc = ActionDown(Action::Crouch) || KeyDown(KEY_CTRL_L) || KeyDown(KEY_CTRL_R);
-    else if (control == GCPad::Y_BUTTON) pc = ActionDown(Action::Jump);
-    else if (control == GCPad::Z_BUTTON) pc = ActionDown(Action::Reload);
-    else if (control == GCPad::START_BUTTON) pc = ActionDown(Action::Pause);
+      pc = ActionDown(Action::Melee) || MobileDown(MobileAction::Melee) || (!s.gameplay.load() && (buttons & 2u));
+    else if (control == GCPad::X_BUTTON)
+      pc = (s.toggle_crouch.load() ? s.crouch_latched.load() :
+            (ActionDown(Action::Crouch) || KeyDown(KEY_CTRL_L) || KeyDown(KEY_CTRL_R))) ||
+           MobileDown(MobileAction::Crouch);
+    else if (control == GCPad::Y_BUTTON) pc = ActionDown(Action::Jump) || MobileDown(MobileAction::Jump);
+    else if (control == GCPad::Z_BUTTON) pc = ActionDown(Action::Reload) || MobileDown(MobileAction::Reload);
+    else if (control == GCPad::START_BUTTON) pc = ActionDown(Action::Pause) || MobileDown(MobileAction::Pause);
     else return std::nullopt;
     return combine(pc);
   }
   else if (group == GCPad::TRIGGERS_GROUP)
   {
     const u32 buttons = s.mouse_buttons.load();
-    const bool fire = (buttons & (1u << s.fire_button.load())) != 0;
-    const bool aim = (buttons & (1u << s.aim_button.load())) != 0;
+    const bool fire = (buttons & (1u << s.fire_button.load())) != 0 || MobileDown(MobileAction::Fire);
+    const bool aim = AimActive();
     if (control == GCPad::L_DIGITAL || control == GCPad::L_ANALOG)
       return combine(aim ? 1.0 : 0.0);
     if (control == GCPad::R_DIGITAL || control == GCPad::R_ANALOG)
@@ -458,13 +590,13 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
   {
     double pc = 0.0;
     if (control == DIRECTION_UP)
-      pc = ActionDown(Action::NextWeapon) || ConsumePulse(s.wheel_up);
+      pc = ActionDown(Action::NextWeapon) || MobileDown(MobileAction::NextWeapon) || ConsumePulse(s.wheel_up);
     else if (control == DIRECTION_DOWN)
-      pc = ActionDown(Action::PreviousWeapon) || ConsumePulse(s.wheel_down);
+      pc = ActionDown(Action::PreviousWeapon) || MobileDown(MobileAction::PreviousWeapon) || ConsumePulse(s.wheel_down);
     else if (control == DIRECTION_LEFT)
       pc = ActionDown(Action::CenterView) || ((s.mouse_buttons.load() & 4u) != 0);
     else if (control == DIRECTION_RIGHT)
-      pc = ActionDown(Action::CallHQ);
+      pc = ActionDown(Action::CallHQ) || MobileDown(MobileAction::CallHQ);
     else return std::nullopt;
     return combine(pc);
   }
@@ -475,13 +607,33 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
 void ResetDefaults()
 {
   s.sensitivity = 1.0f;
+  s.sensitivity_x = 1.0f;
+  s.sensitivity_y = 1.0f;
+  s.ads_sensitivity = 0.80f;
+  s.mouse_smoothing = 0.0f;
+  s.mouse_acceleration = 0.0f;
+  s.invert_x = false;
   s.invert_y = false;
+  s.toggle_aim = false;
+  s.toggle_crouch = false;
+  s.aim_latched = false;
+  s.crouch_latched = false;
   s.gamepad_enabled = true;
+  s.gamepad_sensitivity = 1.0f;
+  s.gamepad_deadzone = 0.10f;
   s.adaptive_fps = true;
+  s.adaptive_profile = 2;
   s.ui_safe = true;
+  s.hud_scale = 1.0f;
+  s.hud_safe_width = 1.0f;
   s.fire_button = 0;
   s.aim_button = 1;
   s.internal_resolution = 3;
+  s.anisotropy = 16;
+  s.msaa = 1;
+  s.texture_filter = 0;
+  s.true_color = true;
+  s.disable_copy_filter = false;
   s.audio_buffer_ms = 120;
   s.audio_volume = 100;
   s.fill_audio_gaps = true;
@@ -494,8 +646,22 @@ void SyncFromEnvironment()
 {
   s.input_enabled = EnvTrue("MOH_PC_INPUT", true);
   s.sensitivity = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_SENSITIVITY", s.sensitivity.load()), 0.05, 10.0));
+  s.sensitivity_x = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_SENSITIVITY_X", s.sensitivity_x.load()), 0.10, 4.0));
+  s.sensitivity_y = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_SENSITIVITY_Y", s.sensitivity_y.load()), 0.10, 4.0));
+  s.ads_sensitivity = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_ADS_SENSITIVITY", s.ads_sensitivity.load()), 0.10, 2.0));
+  s.invert_x = EnvTrue("MOH_MOUSE_INVERT_X", s.invert_x.load());
   s.invert_y = EnvTrue("MOH_MOUSE_INVERT_Y", s.invert_y.load());
   s.ui_safe = EnvTrue("MOH_UI_SAFE", s.ui_safe.load());
+  s.hud_scale = static_cast<float>(std::clamp(EnvDouble("MOH_HUD_SCALE", s.hud_scale.load()), 0.50, 1.50));
+  s.hud_safe_width = static_cast<float>(std::clamp(EnvDouble("MOH_HUD_SAFE_WIDTH", s.hud_safe_width.load()), 0.70, 1.0));
+  if (const char* profile = std::getenv("MOH_ADAPTIVE_PROFILE"))
+  {
+    const std::string_view v(profile);
+    if (v == "off") { s.adaptive_profile = 0; s.adaptive_fps = false; }
+    else if (v == "conservative") { s.adaptive_profile = 1; s.adaptive_fps = true; }
+    else if (v == "balanced") { s.adaptive_profile = 2; s.adaptive_fps = true; }
+    else if (v == "aggressive") { s.adaptive_profile = 3; s.adaptive_fps = true; }
+  }
 
   if (const char* fps = std::getenv("MOH_FPS_TARGET"))
   {
@@ -557,6 +723,11 @@ void Shutdown()
 void ApplyDolphinSettings()
 {
   Config::SetBase(Config::GFX_EFB_SCALE, s.internal_resolution.load());
+  Config::SetBase(Config::GFX_ENHANCE_MAX_ANISOTROPY, AnisotropyMode(s.anisotropy.load()));
+  Config::SetBase(Config::GFX_MSAA, static_cast<u32>(s.msaa.load()));
+  Config::SetBase(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING, TextureMode(s.texture_filter.load()));
+  Config::SetBase(Config::GFX_ENHANCE_FORCE_TRUE_COLOR, s.true_color.load());
+  Config::SetBase(Config::GFX_ENHANCE_DISABLE_COPY_FILTER, s.disable_copy_filter.load());
   Config::SetBase(Config::MAIN_AUDIO_BUFFER_SIZE, s.audio_buffer_ms.load());
   Config::SetBase(Config::MAIN_AUDIO_FILL_GAPS, s.fill_audio_gaps.load());
   Config::SetBase(Config::MAIN_AUDIO_PRESERVE_PITCH, s.preserve_audio_pitch.load());
@@ -575,10 +746,21 @@ void SetGameplayActive(bool active)
   s.rel_y = 0.0;
   s.last_abs_x = -1.0;
   s.last_abs_y = -1.0;
+  s.smooth_x = 0.0;
+  s.smooth_y = 0.0;
+  if (!active)
+  {
+    s.aim_latched = false;
+    s.crouch_latched = false;
+    s.mobile_move_x = 0.0f;
+    s.mobile_move_y = 0.0f;
+    s.mobile_actions = 0;
+  }
 }
 
 bool IsGameplayActive() { return s.gameplay.load(); }
 bool IsSettingsOpen() { return s.settings_open.load(); }
+bool IsDebugOpen() { return s.debug_open.load(); }
 bool WantsRelativeMouse()
 {
   return s.input_enabled.load() && s.gameplay.load() && !s.settings_open.load();
@@ -593,6 +775,17 @@ void ToggleSettings()
   if (!open)
     SaveSettings();
   std::fprintf(stderr, "[moh-pc] settings menu %s\n", open ? "OPEN" : "CLOSED");
+}
+
+void ToggleDebug()
+{
+  s.debug_open = !s.debug_open.load();
+}
+
+void SetPlatformName(const char* platform)
+{
+  if (platform && *platform)
+    s.platform_name = platform;
 }
 
 void SetWindowSize(int width, int height)
@@ -612,6 +805,11 @@ void KeyEvent(u32 keysym, bool down)
 
   if (down)
   {
+    const u32 crouch_key = s.keys[static_cast<size_t>(Action::Crouch)].load();
+    if (s.toggle_crouch.load() &&
+        (keysym == crouch_key || keysym == KEY_CTRL_L || keysym == KEY_CTRL_R))
+      s.crouch_latched = !s.crouch_latched.load();
+
     const int capture = s.capture_action.exchange(-1);
     if (capture >= 0 && capture < static_cast<int>(Action::Count))
     {
@@ -651,6 +849,8 @@ void PointerButton(unsigned button, bool down)
 {
   if (button > 2)
     return;
+  if (down && s.toggle_aim.load() && static_cast<int>(button) == s.aim_button.load())
+    s.aim_latched = !s.aim_latched.load();
   u32 mask = s.mouse_buttons.load();
   const u32 bit = 1u << button;
   do
@@ -682,7 +882,7 @@ void RelativeMotion(double dx, double dy)
   {
     logged = true;
     std::fprintf(stderr,
-                 "[moh-pc] Wayland relative mouse events active: first dx=%+.3f dy=%+.3f\n",
+                 "[moh-pc] native relative mouse events active: first dx=%+.3f dy=%+.3f\n",
                  dx, dy);
   }
 }
@@ -714,8 +914,33 @@ bool ConsumeMouseLook(float fov_degrees, float* yaw_delta, float* pitch_delta)
       std::isfinite(live_fov) && live_fov > 1.0 ? live_fov : 35.0, 1.0, 179.0);
   const double fov_scale = fov / 35.0;
 
-  double yaw = -(dx / 10.0) * sensitivity / (360.0 / tau) * fov_scale;
-  double pitch = (dy / 10.0) * sensitivity / (90.0 / crosshair_y) * fov_scale;
+  double mx = dx;
+  double my = dy;
+  const double smoothing = std::clamp<double>(s.mouse_smoothing.load(), 0.0, 0.95);
+  if (smoothing > 0.0)
+  {
+    s.smooth_x = s.smooth_x * smoothing + mx * (1.0 - smoothing);
+    s.smooth_y = s.smooth_y * smoothing + my * (1.0 - smoothing);
+    mx = s.smooth_x;
+    my = s.smooth_y;
+  }
+  else
+  {
+    s.smooth_x = mx;
+    s.smooth_y = my;
+  }
+
+  const double speed = std::hypot(mx, my);
+  const double acceleration = std::clamp<double>(s.mouse_acceleration.load(), 0.0, 2.0);
+  const double accel_gain = 1.0 + acceleration * std::min(speed / 40.0, 3.0);
+  const double ads_gain = AimActive() ? std::clamp<double>(s.ads_sensitivity.load(), 0.10, 2.0) : 1.0;
+  const double gain_x = sensitivity * s.sensitivity_x.load() * ads_gain * accel_gain;
+  const double gain_y = sensitivity * s.sensitivity_y.load() * ads_gain * accel_gain;
+
+  double yaw = -(mx / 10.0) * gain_x / (360.0 / tau) * fov_scale;
+  double pitch = (my / 10.0) * gain_y / (90.0 / crosshair_y) * fov_scale;
+  if (s.invert_x.load())
+    yaw = -yaw;
   if (s.invert_y.load())
     pitch = -pitch;
 
@@ -729,31 +954,77 @@ bool ConsumeMouseLook(float fov_degrees, float* yaw_delta, float* pitch_delta)
   return true;
 }
 
+void SetMobileMove(float x, float y)
+{
+  s.mobile_move_x = std::clamp(x, -1.0f, 1.0f);
+  s.mobile_move_y = std::clamp(y, -1.0f, 1.0f);
+}
+
+void SetMobileAction(MobileAction action, bool down)
+{
+  const u32 index = static_cast<u32>(action);
+  if (index >= static_cast<u32>(MobileAction::Count))
+    return;
+  const u32 bit = 1u << index;
+  u32 mask = s.mobile_actions.load();
+  do
+  {
+    const u32 next = down ? (mask | bit) : (mask & ~bit);
+    if (s.mobile_actions.compare_exchange_weak(mask, next))
+      break;
+  } while (true);
+}
+
 void AdaptivePerformanceUpdate()
 {
   if (!s.initialized.load() || !s.gameplay.load() || !s.adaptive_fps.load() ||
-      !std::getenv("MOH_TIMING_PATCH") || !Config::Get(Config::MAIN_VI_OVERCLOCK_ENABLE))
+      s.adaptive_profile.load() == 0 || !std::getenv("MOH_TIMING_PATCH") ||
+      !Config::Get(Config::MAIN_VI_OVERCLOCK_ENABLE))
     return;
 
   const int fps = s.requested_fps.load();
   const double target_fps = fps == 0 ? 1000.0 : (fps > 0 ? fps : NATIVE_VPS);
-  const double target_factor = target_fps / NATIVE_VPS;
+  const double target_factor = std::max(1.0, target_fps / NATIVE_VPS);
   const double current = Config::Get(Config::MAIN_VI_OVERCLOCK);
   const double max_speed = Core::System::GetInstance().GetPerfMetrics().GetMaxSpeed();
   if (!std::isfinite(max_speed) || max_speed <= 0.0)
     return;
 
+  const int profile = std::clamp(s.adaptive_profile.load(), 1, 3);
+  const double alpha = profile == 1 ? 0.12 : (profile == 2 ? 0.20 : 0.30);
+  const double low = profile == 1 ? 0.99 : (profile == 2 ? 0.985 : 0.975);
+  const double high = profile == 1 ? 1.12 : (profile == 2 ? 1.09 : 1.06);
+  const double recovery_step = profile == 1 ? 0.020 : (profile == 2 ? 0.035 : 0.055);
+  s.adaptive_ema = s.adaptive_ema * (1.0 - alpha) + max_speed * alpha;
+
   double next = current;
-  if (max_speed < 0.985)
-    next = std::max(1.0, current * max_speed * 0.96);
-  else if (max_speed > 1.10 && current < target_factor)
-    next = std::min(target_factor, current * std::min(1.08, max_speed * 0.97));
-  if (std::fabs(next - current) > 0.015)
+  if (s.adaptive_ema < low)
+  {
+    s.adaptive_recovery_samples = 0;
+    const double pressure = std::clamp(s.adaptive_ema * 0.985, 0.82, 0.995);
+    next = std::max(1.0, current * pressure);
+  }
+  else if (s.adaptive_ema > high && current < target_factor)
+  {
+    ++s.adaptive_recovery_samples;
+    if (s.adaptive_recovery_samples >= (profile == 3 ? 2 : 3))
+    {
+      next = std::min(target_factor, current + recovery_step);
+      s.adaptive_recovery_samples = 0;
+    }
+  }
+  else
+  {
+    s.adaptive_recovery_samples = 0;
+  }
+
+  if (std::fabs(next - current) > 0.010)
   {
     Config::SetCurrent(Config::MAIN_VI_OVERCLOCK, static_cast<float>(next));
     std::fprintf(stderr,
-                 "[moh-pc] adaptive FPS/audio: VI factor %.3f -> %.3f (max-speed %.0f%%, ~%.1f FPS)\n",
-                 current, next, max_speed * 100.0, next * NATIVE_VPS);
+                 "[moh-pc] adaptive FPS/audio: VI %.3f -> %.3f (EMA %.1f%%, instant %.1f%%, ~%.1f FPS)\\n",
+                 current, next, s.adaptive_ema * 100.0, max_speed * 100.0,
+                 next * NATIVE_VPS);
   }
 }
 
@@ -788,6 +1059,13 @@ void DrawSettingsUI(float backbuffer_scale)
         bool adaptive = s.adaptive_fps.load();
         if (ImGui::Checkbox("Adaptive FPS to protect audio / full-speed emulation", &adaptive))
           s.adaptive_fps = adaptive;
+        int adaptive_profile = s.adaptive_profile.load();
+        const char* adaptive_items[] = {"Off", "Conservative", "Balanced", "Aggressive"};
+        if (ImGui::Combo("Adaptive profile", &adaptive_profile, adaptive_items, 4))
+        {
+          s.adaptive_profile = adaptive_profile;
+          s.adaptive_fps = adaptive_profile != 0;
+        }
 
         bool fov_on = s.fov_override.load();
         if (ImGui::Checkbox("Custom world FOV", &fov_on))
@@ -843,6 +1121,44 @@ void DrawSettingsUI(float backbuffer_scale)
           s.internal_resolution = ir;
           Config::SetCurrent(Config::GFX_EFB_SCALE, ir);
         }
+        int aniso = s.anisotropy.load();
+        const char* aniso_items[] = {"Default", "1x", "2x", "4x", "8x", "16x"};
+        const int aniso_values[] = {0, 1, 2, 4, 8, 16};
+        int aniso_idx = 0;
+        for (int i = 0; i < 6; ++i) if (aniso_values[i] == aniso) aniso_idx = i;
+        if (ImGui::Combo("Anisotropic filtering", &aniso_idx, aniso_items, 6))
+        {
+          s.anisotropy = aniso_values[aniso_idx];
+          Config::SetCurrent(Config::GFX_ENHANCE_MAX_ANISOTROPY, AnisotropyMode(s.anisotropy.load()));
+        }
+        const char* msaa_items[] = {"Off", "2x", "4x", "8x"};
+        const int msaa_values[] = {1, 2, 4, 8};
+        int msaa_idx = 0;
+        for (int i = 0; i < 4; ++i) if (msaa_values[i] == s.msaa.load()) msaa_idx = i;
+        if (ImGui::Combo("MSAA", &msaa_idx, msaa_items, 4))
+        {
+          s.msaa = msaa_values[msaa_idx];
+          Config::SetCurrent(Config::GFX_MSAA, static_cast<u32>(s.msaa.load()));
+        }
+        const char* filter_items[] = {"Game default", "Nearest", "Linear"};
+        int filtering = s.texture_filter.load();
+        if (ImGui::Combo("Texture filtering", &filtering, filter_items, 3))
+        {
+          s.texture_filter = filtering;
+          Config::SetCurrent(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING, TextureMode(filtering));
+        }
+        bool true_color = s.true_color.load();
+        if (ImGui::Checkbox("Force true color", &true_color))
+        {
+          s.true_color = true_color;
+          Config::SetCurrent(Config::GFX_ENHANCE_FORCE_TRUE_COLOR, true_color);
+        }
+        bool no_copy_filter = s.disable_copy_filter.load();
+        if (ImGui::Checkbox("Disable GameCube copy filter", &no_copy_filter))
+        {
+          s.disable_copy_filter = no_copy_filter;
+          Config::SetCurrent(Config::GFX_ENHANCE_DISABLE_COPY_FILTER, no_copy_filter);
+        }
         bool vsync = Config::Get(Config::GFX_VSYNC);
         if (ImGui::Checkbox("VSync", &vsync)) Config::SetCurrent(Config::GFX_VSYNC, vsync);
         ImGui::Text("Actual: %.1f FPS | VI %.1f Hz | Max speed %.0f%%",
@@ -860,8 +1176,26 @@ void DrawSettingsUI(float backbuffer_scale)
         if (ImGui::Checkbox("Allow gamepad at the same time", &pad)) s.gamepad_enabled = pad;
         float sens = s.sensitivity.load();
         if (ImGui::SliderFloat("Mouse sensitivity", &sens, 0.10f, 5.0f, "%.2f")) s.sensitivity = sens;
-        bool invert = s.invert_y.load();
-        if (ImGui::Checkbox("Invert mouse Y", &invert)) s.invert_y = invert;
+        float sens_x = s.sensitivity_x.load();
+        float sens_y = s.sensitivity_y.load();
+        float ads = s.ads_sensitivity.load();
+        if (ImGui::SliderFloat("Mouse X multiplier", &sens_x, 0.25f, 2.0f, "%.2f")) s.sensitivity_x = sens_x;
+        if (ImGui::SliderFloat("Mouse Y multiplier", &sens_y, 0.25f, 2.0f, "%.2f")) s.sensitivity_y = sens_y;
+        if (ImGui::SliderFloat("ADS sensitivity", &ads, 0.20f, 1.50f, "%.2f")) s.ads_sensitivity = ads;
+        float smoothing = s.mouse_smoothing.load();
+        float acceleration = s.mouse_acceleration.load();
+        if (ImGui::SliderFloat("Mouse smoothing", &smoothing, 0.0f, 0.90f, "%.2f")) s.mouse_smoothing = smoothing;
+        if (ImGui::SliderFloat("Mouse acceleration", &acceleration, 0.0f, 2.0f, "%.2f")) s.mouse_acceleration = acceleration;
+        bool invert_x = s.invert_x.load();
+        bool invert_y = s.invert_y.load();
+        if (ImGui::Checkbox("Invert mouse X", &invert_x)) s.invert_x = invert_x;
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Invert mouse Y", &invert_y)) s.invert_y = invert_y;
+        bool toggle_aim = s.toggle_aim.load();
+        bool toggle_crouch = s.toggle_crouch.load();
+        if (ImGui::Checkbox("Toggle aim", &toggle_aim)) { s.toggle_aim = toggle_aim; s.aim_latched = false; }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Toggle crouch", &toggle_crouch)) { s.toggle_crouch = toggle_crouch; s.crouch_latched = false; }
         ImGui::TextDisabled("Default: WASD, LMB fire, RMB aim, E use, R reload, F melee,");
         ImGui::TextDisabled("Space jump, C/Ctrl crouch, wheel/1/2 weapons, Esc pause.");
         ImGui::SeparatorText("Bindings");
@@ -889,8 +1223,36 @@ void DrawSettingsUI(float backbuffer_scale)
         bool pad = s.gamepad_enabled.load();
         if (ImGui::Checkbox("Enable physical gamepad alongside keyboard/mouse", &pad))
           s.gamepad_enabled = pad;
+        float pad_sens = s.gamepad_sensitivity.load();
+        float deadzone = s.gamepad_deadzone.load();
+        if (ImGui::SliderFloat("Stick sensitivity", &pad_sens, 0.50f, 2.0f, "%.2f")) s.gamepad_sensitivity = pad_sens;
+        if (ImGui::SliderFloat("Stick deadzone", &deadzone, 0.0f, 0.40f, "%.2f")) s.gamepad_deadzone = deadzone;
         ImGui::TextWrapped("The original GameCube pad remains fully supported. Keyboard/mouse is merged on top only when enabled, so you can switch devices at any time.");
         ImGui::TextDisabled("GameCube layout remains authoritative for gamepad prompts and rumble.");
+        ImGui::EndTabItem();
+      }
+
+      if (ImGui::BeginTabItem("HUD / Accessibility"))
+      {
+        bool safe = s.ui_safe.load();
+        if (ImGui::Checkbox("Aspect-correct HUD/menu safe area", &safe))
+        {
+          s.ui_safe = safe;
+          SetEnv("MOH_UI_SAFE", safe ? "1" : "0");
+        }
+        float hud_scale = s.hud_scale.load();
+        float safe_width = s.hud_safe_width.load();
+        if (ImGui::SliderFloat("HUD scale", &hud_scale, 0.50f, 1.50f, "%.2fx"))
+        {
+          s.hud_scale = hud_scale;
+          SetEnv("MOH_HUD_SCALE", std::to_string(hud_scale));
+        }
+        if (ImGui::SliderFloat("HUD safe width", &safe_width, 0.70f, 1.00f, "%.2f"))
+        {
+          s.hud_safe_width = safe_width;
+          SetEnv("MOH_HUD_SAFE_WIDTH", std::to_string(safe_width));
+        }
+        ImGui::TextWrapped("3D stays Hor+, while the 2D transform keeps HUD/menu geometry proportional on widescreen and ultrawide outputs.");
         ImGui::EndTabItem();
       }
 
@@ -927,7 +1289,11 @@ void DrawSettingsUI(float backbuffer_scale)
       if (ImGui::BeginTabItem("System"))
       {
         ImGui::Text("Renderer: Vulkan / ModernGekko StaticRecomp");
+        ImGui::Text("Platform input: %s", s.platform_name.c_str());
         ImGui::Text("Settings file: %s", s.settings_path.empty() ? "(not configured)" : s.settings_path.c_str());
+        bool debug = s.debug_open.load();
+        if (ImGui::Checkbox("Developer overlay (Ctrl+F8)", &debug)) s.debug_open = debug;
+        if (ImGui::Button("Screenshot")) Core::SaveScreenShot();
         if (ImGui::Button("Save settings")) SaveSettings();
         ImGui::SameLine();
         if (ImGui::Button("Reset PC controls")) ResetDefaults();
@@ -942,6 +1308,31 @@ void DrawSettingsUI(float backbuffer_scale)
     s.settings_open = false;
     SaveSettings();
   }
+ }
+
+void DrawDebugUI(float backbuffer_scale)
+{
+  if (!s.debug_open.load())
+    return;
+  ImGui::SetNextWindowBgAlpha(0.78f);
+  ImGui::SetNextWindowPos(ImVec2(12.0f * backbuffer_scale, 12.0f * backbuffer_scale), ImGuiCond_FirstUseEver);
+  if (ImGui::Begin("MOHF Recomp Diagnostics", nullptr,
+                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse))
+  {
+    const auto& perf = Core::System::GetInstance().GetPerfMetrics();
+    ImGui::Text("FPS             %7.2f", perf.GetFPS());
+    ImGui::Text("Emulation max   %7.1f %%", perf.GetMaxSpeed() * 100.0);
+    ImGui::Text("Adaptive EMA    %7.1f %%", s.adaptive_ema * 100.0);
+    ImGui::Text("VI              %7.2f Hz", Config::Get(Config::MAIN_VI_OVERCLOCK) * NATIVE_VPS);
+    ImGui::Text("Gameplay        %s", s.gameplay.load() ? "yes" : "no");
+    ImGui::Text("Mouse capture   %s", WantsRelativeMouse() ? "yes" : "no");
+    ImGui::Text("Input platform  %s", s.platform_name.c_str());
+    ImGui::Text("FOV             %.1f", s.fov_override.load() ? s.fov.load() : 0.0f);
+    ImGui::Text("Aspect          %d:%d", s.aspect_num.load(), s.aspect_den.load());
+    ImGui::Text("Internal res    %dx", s.internal_resolution.load());
+    ImGui::Text("Audio buffer    %d ms", s.audio_buffer_ms.load());
+  }
+  ImGui::End();
 }
 
 } // namespace MohPcLayer

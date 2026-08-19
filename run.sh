@@ -14,6 +14,12 @@ ASPECT="default"
 FPS="default"
 HUD_MODE="safe"
 MOUSE_SENS="default"
+MOUSE_SENS_X="default"
+MOUSE_SENS_Y="default"
+ADS_SENS="default"
+HUD_SCALE="default"
+HUD_SAFE_WIDTH="default"
+ADAPTIVE_PROFILE="default"
 PC_INPUT=1
 PASS_ARGS=()
 
@@ -32,12 +38,18 @@ MOH Frontline PC enhancements:
                               any 1-1000 value, or unlimited
   --hud <safe|stretch>        Aspect-correct 4:3 HUD/menu safe area (default: safe)
   --mouse-sensitivity <value> Native mouse sensitivity, 0.05-10.0
+  --mouse-x <value>           Horizontal sensitivity multiplier, 0.1-4.0
+  --mouse-y <value>           Vertical sensitivity multiplier, 0.1-4.0
+  --ads-sensitivity <value>   ADS mouse multiplier, 0.1-2.0
+  --hud-scale <value>         HUD scale, 0.5-1.5
+  --hud-safe-width <value>    HUD horizontal safe width, 0.7-1.0
+  --adaptive-fps <profile>    off, conservative, balanced, aggressive
   --no-pc-input               Disable the keyboard/mouse FPS layer
   --moh-help                  Show this help and exit
 
 PC controls (default): WASD move, mouse look, LMB fire, RMB aim, E use,
 R reload, F melee, Space jump, C/Ctrl crouch, wheel/1/2 weapons, Esc pause.
-Ctrl+F10 or ` opens the in-game PC settings menu.
+Ctrl+F10 or ` opens the in-game PC settings menu. Ctrl+F8 toggles diagnostics.
 
 Examples:
   ./run.sh
@@ -90,6 +102,36 @@ while (($#)); do
       MOUSE_SENS="$2"
       shift 2
       ;;
+    --mouse-x)
+      need_value "$1" "${2:-}"
+      MOUSE_SENS_X="$2"
+      shift 2
+      ;;
+    --mouse-y)
+      need_value "$1" "${2:-}"
+      MOUSE_SENS_Y="$2"
+      shift 2
+      ;;
+    --ads-sensitivity)
+      need_value "$1" "${2:-}"
+      ADS_SENS="$2"
+      shift 2
+      ;;
+    --hud-scale)
+      need_value "$1" "${2:-}"
+      HUD_SCALE="$2"
+      shift 2
+      ;;
+    --hud-safe-width)
+      need_value "$1" "${2:-}"
+      HUD_SAFE_WIDTH="$2"
+      shift 2
+      ;;
+    --adaptive-fps)
+      need_value "$1" "${2:-}"
+      ADAPTIVE_PROFILE="${2,,}"
+      shift 2
+      ;;
     --no-pc-input)
       PC_INPUT=0
       shift
@@ -135,7 +177,9 @@ export MOH_PC_INPUT="$PC_INPUT"
 
 unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_WEAPON_FOV_DEGREES \
       MOH_ASPECT_VALUE MOH_ASPECT_NUM MOH_ASPECT_DEN MOH_ASPECT_AUTO MOH_FPS_TARGET \
-      MOH_UI_SAFE MOH_MOUSE_SENSITIVITY 2>/dev/null || true
+      MOH_UI_SAFE MOH_MOUSE_SENSITIVITY MOH_MOUSE_SENSITIVITY_X MOH_MOUSE_SENSITIVITY_Y \
+      MOH_MOUSE_ADS_SENSITIVITY MOH_HUD_SCALE MOH_HUD_SAFE_WIDTH MOH_ADAPTIVE_PROFILE \
+      2>/dev/null || true
 
 # FOV: an explicit value is the final horizontal FOV on the selected aspect.
 case "${FOV,,}" in
@@ -228,6 +272,24 @@ if [[ "$MOUSE_SENS" != "default" ]]; then
   export MOH_MOUSE_SENSITIVITY="$MOUSE_SENS"
 fi
 
+validate_float_range() {
+  local opt="$1" value="$2" min="$3" max="$4"
+  if ! awk -v v="$value" -v lo="$min" -v hi="$max" 'BEGIN { exit !(v+0==v && v>=lo && v<=hi) }'; then
+    echo "error: $opt must be from $min to $max" >&2
+    exit 2
+  fi
+}
+if [[ "$MOUSE_SENS_X" != "default" ]]; then validate_float_range --mouse-x "$MOUSE_SENS_X" 0.1 4.0; export MOH_MOUSE_SENSITIVITY_X="$MOUSE_SENS_X"; fi
+if [[ "$MOUSE_SENS_Y" != "default" ]]; then validate_float_range --mouse-y "$MOUSE_SENS_Y" 0.1 4.0; export MOH_MOUSE_SENSITIVITY_Y="$MOUSE_SENS_Y"; fi
+if [[ "$ADS_SENS" != "default" ]]; then validate_float_range --ads-sensitivity "$ADS_SENS" 0.1 2.0; export MOH_MOUSE_ADS_SENSITIVITY="$ADS_SENS"; fi
+if [[ "$HUD_SCALE" != "default" ]]; then validate_float_range --hud-scale "$HUD_SCALE" 0.5 1.5; export MOH_HUD_SCALE="$HUD_SCALE"; fi
+if [[ "$HUD_SAFE_WIDTH" != "default" ]]; then validate_float_range --hud-safe-width "$HUD_SAFE_WIDTH" 0.7 1.0; export MOH_HUD_SAFE_WIDTH="$HUD_SAFE_WIDTH"; fi
+case "$ADAPTIVE_PROFILE" in
+  default) ;;
+  off|conservative|balanced|aggressive) export MOH_ADAPTIVE_PROFILE="$ADAPTIVE_PROFILE" ;;
+  *) echo "error: --adaptive-fps must be off, conservative, balanced, or aggressive" >&2; exit 2 ;;
+esac
+
 case "${FPS,,}" in
   default|original)
     ;;
@@ -250,10 +312,19 @@ if [[ -n "${MOH_CAMERA_PATCH:-}" || -n "${MOH_TIMING_PATCH:-}" ]]; then
   echo "MOH native enhancements: aspect=${ASPECT} fov=${FOV} weapon-fov=${WEAPON_FOV} fps=${FPS}"
 fi
 
+PLATFORM_ARGS=()
+if [[ "$(uname -s)" == "Linux" ]]; then
+  if [[ -n "${WAYLAND_DISPLAY:-}" && "${XDG_SESSION_TYPE:-}" != "x11" ]]; then
+    PLATFORM_ARGS+=(--wayland)
+  elif [[ -n "${DISPLAY:-}" ]]; then
+    PLATFORM_ARGS+=(--x11)
+  fi
+fi
+
 exec "$RUNTIME" \
   --game "$GAME" \
   --module "$MODULE" \
   --user-dir "$USER_DIR" \
   --graphics Vulkan \
-  --wayland \
+  "${PLATFORM_ARGS[@]}" \
   "${PASS_ARGS[@]}"

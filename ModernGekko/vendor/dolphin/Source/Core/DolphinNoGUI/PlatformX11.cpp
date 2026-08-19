@@ -17,6 +17,7 @@ static constexpr auto X_None = None;
 #include "Core/State.h"
 #include "Core/System.h"
 
+#include <algorithm>
 #include <cstring>
 #include <thread>
 
@@ -27,6 +28,7 @@ static constexpr auto X_None = None;
 #include "UICommon/UICommon.h"
 #include "UICommon/X11Utils.h"
 #include "VideoCommon/Present.h"
+#include "VideoCommon/MohPcLayer.h"
 
 #ifndef HOST_NAME_MAX
 #define HOST_NAME_MAX _POSIX_HOST_NAME_MAX
@@ -48,11 +50,13 @@ public:
 private:
   void CloseDisplay();
   void UpdateWindowPosition();
+  void UpdatePcMouseCapture();
   void ProcessEvents();
 
   Display* m_display = nullptr;
   Window m_window = {};
   Cursor m_blank_cursor = X_None;
+  bool m_pc_mouse_captured = false;
 #ifdef HAVE_XRANDR
   X11Utils::XRRConfiguration* m_xrr_config = nullptr;
 #endif
@@ -70,7 +74,7 @@ PlatformX11::~PlatformX11()
 
   if (m_display)
   {
-    if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+    if (m_blank_cursor != X_None)
       XFreeCursor(m_display, m_blank_cursor);
 
     XCloseDisplay(m_display);
@@ -80,6 +84,7 @@ PlatformX11::~PlatformX11()
 bool PlatformX11::Init()
 {
   XInitThreads();
+  MohPcLayer::SetPlatformName("Linux/X11");
   m_display = XOpenDisplay(nullptr);
   if (!m_display)
   {
@@ -89,7 +94,9 @@ bool PlatformX11::Init()
 
   m_window = XCreateSimpleWindow(m_display, DefaultRootWindow(m_display), m_window_x, m_window_y,
                                  m_window_width, m_window_height, 0, 0, BlackPixel(m_display, 0));
-  XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | FocusChangeMask);
+  XSelectInput(m_display, m_window, StructureNotifyMask | KeyPressMask | KeyReleaseMask |
+                                      FocusChangeMask | PointerMotionMask | ButtonPressMask |
+                                      ButtonReleaseMask);
   Atom wmProtocols[1];
   wmProtocols[0] = XInternAtom(m_display, "WM_DELETE_WINDOW", True);
   XSetWMProtocols(m_display, m_window, wmProtocols, 1);
@@ -115,16 +122,17 @@ bool PlatformX11::Init()
   m_xrr_config = new X11Utils::XRRConfiguration(m_display, m_window);
 #endif
 
-  if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+  // Create a blank cursor once.  The PC mouse layer uses it while relative
+  // capture is active; the original ShowCursor setting still works as before.
   {
-    // make a blank cursor
-    Pixmap Blank;
-    XColor DummyColor;
-    char ZeroData[1] = {0};
-    Blank = XCreateBitmapFromData(m_display, m_window, ZeroData, 1, 1);
-    m_blank_cursor = XCreatePixmapCursor(m_display, Blank, Blank, &DummyColor, &DummyColor, 0, 0);
-    XFreePixmap(m_display, Blank);
-    XDefineCursor(m_display, m_window, m_blank_cursor);
+    Pixmap blank;
+    XColor dummy{};
+    char zero_data[1] = {0};
+    blank = XCreateBitmapFromData(m_display, m_window, zero_data, 1, 1);
+    m_blank_cursor = XCreatePixmapCursor(m_display, blank, blank, &dummy, &dummy, 0, 0);
+    XFreePixmap(m_display, blank);
+    if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
+      XDefineCursor(m_display, m_window, m_blank_cursor);
   }
 
   // Enter fullscreen if enabled.
@@ -154,6 +162,7 @@ void PlatformX11::MainLoop()
     Core::HostDispatchJobs(Core::System::GetInstance());
     ProcessEvents();
     UpdateWindowPosition();
+    UpdatePcMouseCapture();
 
     // TODO: Is this sleep appropriate?
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -172,13 +181,37 @@ WindowSystemInfo PlatformX11::GetWindowSystemInfo() const
 
 void PlatformX11::UpdateWindowPosition()
 {
-  if (m_window_fullscreen)
-    return;
-
   Window winDummy;
   unsigned int borderDummy, depthDummy;
   XGetGeometry(m_display, m_window, &winDummy, &m_window_x, &m_window_y, &m_window_width,
                &m_window_height, &borderDummy, &depthDummy);
+  MohPcLayer::SetWindowSize(static_cast<int>(std::max(m_window_width, 1u)),
+                            static_cast<int>(std::max(m_window_height, 1u)));
+}
+
+void PlatformX11::UpdatePcMouseCapture()
+{
+  const bool want = m_window_focus && MohPcLayer::WantsRelativeMouse();
+  if (want == m_pc_mouse_captured)
+    return;
+  m_pc_mouse_captured = want;
+  if (want)
+  {
+    XGrabPointer(m_display, m_window, True, PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
+                 GrabModeAsync, GrabModeAsync, m_window, X_None, CurrentTime);
+    if (m_blank_cursor != X_None)
+      XDefineCursor(m_display, m_window, m_blank_cursor);
+    const int cx = static_cast<int>(m_window_width / 2);
+    const int cy = static_cast<int>(m_window_height / 2);
+    XWarpPointer(m_display, X_None, m_window, 0, 0, 0, 0, cx, cy);
+  }
+  else
+  {
+    XUngrabPointer(m_display, CurrentTime);
+    if (Config::Get(Config::MAIN_SHOW_CURSOR) != Config::ShowCursor::Never)
+      XUndefineCursor(m_display, m_window);
+  }
+  XFlush(m_display);
 }
 
 void PlatformX11::ProcessEvents()
@@ -190,26 +223,32 @@ void PlatformX11::ProcessEvents()
     XNextEvent(m_display, &event);
     switch (event.type)
     {
+    case KeyRelease:
+      key = XLookupKeysym((XKeyEvent*)&event, 0);
+      MohPcLayer::KeyEvent(static_cast<u32>(key), false);
+      break;
     case KeyPress:
       key = XLookupKeysym((XKeyEvent*)&event, 0);
+      MohPcLayer::KeyEvent(static_cast<u32>(key), true);
       if (key == XK_Escape && (event.xkey.state & ControlMask))
       {
         RequestShutdown();
       }
+      else if ((key == XK_F10 && (event.xkey.state & ControlMask)) || key == XK_grave)
+      {
+        MohPcLayer::ToggleSettings();
+        UpdatePcMouseCapture();
+      }
+      else if (key == XK_F8 && (event.xkey.state & ControlMask))
+      {
+        MohPcLayer::ToggleDebug();
+      }
       else if (key == XK_F10)
       {
         if (Core::GetState(Core::System::GetInstance()) == Core::State::Running)
-        {
-          if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
-            XUndefineCursor(m_display, m_window);
           Core::SetState(Core::System::GetInstance(), Core::State::Paused);
-        }
         else
-        {
-          if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
-            XDefineCursor(m_display, m_window, m_blank_cursor);
           Core::SetState(Core::System::GetInstance(), Core::State::Running);
-        }
       }
       else if ((key == XK_Return) && (event.xkey.state & Mod1Mask))
       {
@@ -243,18 +282,45 @@ void PlatformX11::ProcessEvents()
     case FocusIn:
     {
       m_window_focus = true;
-      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never &&
-          Core::GetState(Core::System::GetInstance()) != Core::State::Paused)
-      {
-        XDefineCursor(m_display, m_window, m_blank_cursor);
-      }
+      UpdatePcMouseCapture();
     }
     break;
     case FocusOut:
     {
       m_window_focus = false;
-      if (Config::Get(Config::MAIN_SHOW_CURSOR) == Config::ShowCursor::Never)
-        XUndefineCursor(m_display, m_window);
+      UpdatePcMouseCapture();
+    }
+    break;
+    case MotionNotify:
+    {
+      if (MohPcLayer::WantsRelativeMouse())
+      {
+        const int cx = static_cast<int>(m_window_width / 2);
+        const int cy = static_cast<int>(m_window_height / 2);
+        const int dx = event.xmotion.x - cx;
+        const int dy = event.xmotion.y - cy;
+        if (dx != 0 || dy != 0)
+        {
+          MohPcLayer::RelativeMotion(dx, dy);
+          XWarpPointer(m_display, X_None, m_window, 0, 0, 0, 0, cx, cy);
+          XFlush(m_display);
+        }
+      }
+      else
+      {
+        MohPcLayer::PointerAbsolute(event.xmotion.x, event.xmotion.y);
+      }
+    }
+    break;
+    case ButtonPress:
+    case ButtonRelease:
+    {
+      const bool down = event.type == ButtonPress;
+      if (event.xbutton.button == Button1) MohPcLayer::PointerButton(0, down);
+      else if (event.xbutton.button == Button3) MohPcLayer::PointerButton(1, down);
+      else if (event.xbutton.button == Button2) MohPcLayer::PointerButton(2, down);
+      else if (down && event.xbutton.button == Button4) MohPcLayer::PointerAxis(-1.0);
+      else if (down && event.xbutton.button == Button5) MohPcLayer::PointerAxis(1.0);
     }
     break;
     case ClientMessage:

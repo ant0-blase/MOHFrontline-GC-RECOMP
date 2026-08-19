@@ -7,7 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <time.h>
+#endif
 
 #define MOH_NATIVE_ASPECT (4.0 / 3.0)
 #define MOH_PI 3.14159265358979323846264338327950288
@@ -15,6 +19,8 @@
 static int s_camera_enabled;
 static int s_timing_enabled;
 static int s_ui_safe;
+static double s_hud_scale = 1.0;
+static double s_hud_safe_width = 1.0;
 static int s_gameplay_active;
 static int s_unlimited;
 static double s_aspect = MOH_NATIVE_ASPECT;
@@ -36,6 +42,8 @@ static u32 s_game_frame_base;
 static u32 s_vsync_seed;
 static CPUState* s_gameplay_ctx;
 static double s_ui_applied_aspect = -1.0;
+static double s_ui_applied_hud_scale = -1.0;
+static double s_ui_applied_safe_width = -1.0;
 static int s_ui_applied_safe = -1;
 static int s_ui_logged;
 
@@ -73,12 +81,18 @@ static void refresh_config(void)
     s_camera_enabled = env_enabled("MOH_CAMERA_PATCH");
     s_timing_enabled = env_enabled("MOH_TIMING_PATCH");
     s_ui_safe = env_enabled("MOH_UI_SAFE");
+    s_hud_scale = env_double("MOH_HUD_SCALE", 1.0);
+    s_hud_safe_width = env_double("MOH_HUD_SAFE_WIDTH", 1.0);
     s_aspect = env_double("MOH_ASPECT_VALUE", MOH_NATIVE_ASPECT);
     s_fov_degrees = env_double("MOH_FOV_DEGREES", 0.0);
     s_weapon_fov_degrees = env_double("MOH_WEAPON_FOV_DEGREES", -1.0);
 
     if (!(s_aspect > 0.5 && s_aspect < 10.0))
         s_aspect = MOH_NATIVE_ASPECT;
+    if (!(s_hud_scale >= 0.50 && s_hud_scale <= 1.50))
+        s_hud_scale = 1.0;
+    if (!(s_hud_safe_width >= 0.70 && s_hud_safe_width <= 1.00))
+        s_hud_safe_width = 1.0;
     if (!(s_fov_degrees >= 0.0 && s_fov_degrees < 179.0))
         s_fov_degrees = 0.0;
     if (!(s_weapon_fov_degrees >= 20.0 && s_weapon_fov_degrees < 179.0))
@@ -130,10 +144,24 @@ static void refresh_config(void)
 
 static u64 monotonic_ns(void)
 {
+#ifdef _WIN32
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    u64 whole;
+    u64 remainder;
+    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&counter) ||
+        frequency.QuadPart <= 0 || counter.QuadPart < 0)
+        return 0;
+    whole = (u64)counter.QuadPart / (u64)frequency.QuadPart;
+    remainder = (u64)counter.QuadPart % (u64)frequency.QuadPart;
+    return whole * 1000000000ull +
+           (remainder * 1000000000ull) / (u64)frequency.QuadPart;
+#else
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
         return 0;
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+#endif
 }
 
 static u32 f32_bits(f32 value)
@@ -253,7 +281,10 @@ void moh_ui_prepare(CPUState* ctx)
 {
     const u32 screen = ctx->gpr[3];
     refresh_config();
-    if (s_ui_applied_safe != s_ui_safe || fabs(s_ui_applied_aspect - s_aspect) > 0.000001)
+    if (s_ui_applied_safe != s_ui_safe ||
+        fabs(s_ui_applied_aspect - s_aspect) > 0.000001 ||
+        fabs(s_ui_applied_hud_scale - s_hud_scale) > 0.000001 ||
+        fabs(s_ui_applied_safe_width - s_hud_safe_width) > 0.000001)
         mem_write8(ctx, screen + 160u, 0u);
 }
 
@@ -261,38 +292,53 @@ void moh_ui_matrix_override(CPUState* ctx)
 {
     const u32 screen = ctx->gpr[31];
     const u32 matrix = screen + 96u;
-    double scale = 1.0;
-    unsigned offsets[3];
+    double x_scale;
+    double y_scale;
+    unsigned x_offsets[3] = {0u, 4u, 8u};
+    unsigned y_offsets[3] = {16u, 20u, 24u};
     int i;
 
     refresh_config();
+    x_scale = s_hud_scale * s_hud_safe_width;
+    y_scale = s_hud_scale;
+
     if (s_ui_safe && fabs(s_aspect - MOH_NATIVE_ASPECT) > 0.000001)
     {
         if (s_aspect > MOH_NATIVE_ASPECT)
-        {
-            scale = MOH_NATIVE_ASPECT / s_aspect;
-            offsets[0] = 0u; offsets[1] = 4u; offsets[2] = 8u;
-        }
+            x_scale *= MOH_NATIVE_ASPECT / s_aspect;
         else
-        {
-            scale = s_aspect / MOH_NATIVE_ASPECT;
-            offsets[0] = 16u; offsets[1] = 20u; offsets[2] = 24u;
-        }
+            y_scale *= s_aspect / MOH_NATIVE_ASPECT;
+    }
+
+    if (fabs(x_scale - 1.0) > 0.000001)
+    {
         for (i = 0; i < 3; ++i)
         {
-            const f32 old_value = f32_from_bits(mem_read32(ctx, matrix + offsets[i]));
-            mem_write32(ctx, matrix + offsets[i], f32_bits((f32)(old_value * scale)));
-        }
-        if (!s_ui_logged)
-        {
-            s_ui_logged = 1;
-            fprintf(stderr,
-                    "[moh-enh] aspect-correct 2D UI active: aspect=%.6f safe-scale=%.6f\n",
-                    s_aspect, scale);
+            const f32 old_value = f32_from_bits(mem_read32(ctx, matrix + x_offsets[i]));
+            mem_write32(ctx, matrix + x_offsets[i], f32_bits((f32)(old_value * x_scale)));
         }
     }
+    if (fabs(y_scale - 1.0) > 0.000001)
+    {
+        for (i = 0; i < 3; ++i)
+        {
+            const f32 old_value = f32_from_bits(mem_read32(ctx, matrix + y_offsets[i]));
+            mem_write32(ctx, matrix + y_offsets[i], f32_bits((f32)(old_value * y_scale)));
+        }
+    }
+
+    if (!s_ui_logged && (fabs(x_scale - 1.0) > 0.000001 || fabs(y_scale - 1.0) > 0.000001))
+    {
+        s_ui_logged = 1;
+        fprintf(stderr,
+                "[moh-enh] aspect-correct 2D UI active: aspect=%.6f x-scale=%.6f y-scale=%.6f\n",
+                s_aspect, x_scale, y_scale);
+    }
+
     s_ui_applied_aspect = s_aspect;
     s_ui_applied_safe = s_ui_safe;
+    s_ui_applied_hud_scale = s_hud_scale;
+    s_ui_applied_safe_width = s_hud_safe_width;
 }
 
 int moh_timing_enabled(void)

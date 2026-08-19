@@ -1,7 +1,9 @@
 #include "moderngekko/mod_loader.hpp"
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
 #include "VideoCommon/MohPcLayer.h"
+#endif
 
 #if defined(MODERNGEKKO_ENABLE_DYNAMIC_MODULES)
 #include "Common/DynamicLibrary.h"
@@ -22,6 +24,7 @@
 namespace moderngekko {
 namespace {
 constexpr std::uint32_t MAX_ITEMS = 1u << 20;
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_ON = 0xFFFFF100u;
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_OFF = 0xFFFFF101u;
 constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_ENTER = 0xFFFFF110u;
@@ -58,6 +61,7 @@ void WriteGuestF32(CPUState* state, std::uint32_t address, float value)
   std::memcpy(&bits, &value, sizeof(bits));
   state->external_write(state, address, bits, 4);
 }
+#endif
 
 struct Version {
   std::array<std::uint32_t, 3> parts{};
@@ -693,6 +697,7 @@ bool ModManager::Empty() const { return m_impl->mods.empty(); }
 
 bool ModManager::HostCall(CPUState *state, std::uint32_t address,
                           void *user_data) {
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
   if (address == MOH_HOSTCALL_GAMEPLAY_ENTER || address == MOH_HOSTCALL_GAMEPLAY_EXIT) {
     const bool active = address == MOH_HOSTCALL_GAMEPLAY_ENTER;
     MohPcLayer::SetGameplayActive(active);
@@ -808,6 +813,7 @@ bool ModManager::HostCall(CPUState *state, std::uint32_t address,
     return true;
   }
 
+#endif
   return user_data &&
          static_cast<ModManager *>(user_data)->Dispatch(state, address);
 }

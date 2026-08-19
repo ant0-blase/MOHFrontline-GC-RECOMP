@@ -11,6 +11,11 @@ set(MULTI_MANIFEST "" CACHE FILEPATH "Generated multi-image CMake manifest")
 set(GXRUNTIME_DIR "" CACHE PATH "GXRuntime checkout")
 set(CHASSIS_ABI_DIR "" CACHE PATH "StaticRecomp ABI directory")
 set(RECOMPCORE_MODULE_OPT_LEVEL "3" CACHE STRING "Optimization level 0..3")
+set(RECOMP_MODULE_TYPE "SHARED" CACHE STRING "Recompiled module library type: SHARED or STATIC")
+set_property(CACHE RECOMP_MODULE_TYPE PROPERTY STRINGS SHARED STATIC)
+if(NOT RECOMP_MODULE_TYPE STREQUAL "SHARED" AND NOT RECOMP_MODULE_TYPE STREQUAL "STATIC")
+  message(FATAL_ERROR "RECOMP_MODULE_TYPE must be SHARED or STATIC")
+endif()
 
 if(NOT GAME_ID OR NOT MULTI_MANIFEST OR NOT EXISTS "${MULTI_MANIFEST}")
   message(FATAL_ERROR "GAME_ID and an existing MULTI_MANIFEST are required")
@@ -31,7 +36,7 @@ if(NOT MULTI_CHUNK_INPUTS OR NOT MULTI_ADAPTER_INPUTS)
 endif()
 
 set(MODULE_NAME "g${GAME_ID}_recomp")
-add_library(${MODULE_NAME} SHARED
+add_library(${MODULE_NAME} ${RECOMP_MODULE_TYPE}
   "${MULTI_EXPORT_SOURCE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/moh_frontline_enhancements.c"
   ${MULTI_ADAPTER_INPUTS}
@@ -69,7 +74,7 @@ target_include_directories(${MODULE_NAME} PRIVATE
 if(NOT WIN32)
   target_link_libraries(${MODULE_NAME} PRIVATE m)
 endif()
-if(UNIX AND NOT APPLE)
+if(RECOMP_MODULE_TYPE STREQUAL "SHARED" AND UNIX AND NOT APPLE)
   target_link_options(${MODULE_NAME} PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/module.exports")
   set_property(TARGET ${MODULE_NAME} APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module.exports")
 endif()

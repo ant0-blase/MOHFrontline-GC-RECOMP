@@ -24,6 +24,8 @@ option(MODERNGEKKO_ENABLE_DOLPHIN_TESTS
        "Build the imported Dolphin unit-test targets" OFF)
 option(MODERNGEKKO_ENABLE_DISC_TOOL
        "Build Dolphin's disc conversion and verification tool" OFF)
+option(MODERNGEKKO_ENABLE_MOH_MOBILE_BRIDGE
+       "Build the MOH Frontline logical touch/controller bridge" OFF)
 set(MODERNGEKKO_FRONTEND_NAME "ModernGekko" CACHE STRING
     "Branded frontend display name")
 set(MODERNGEKKO_LAUNCHER_OUTPUT_NAME "ModernGekko" CACHE STRING
@@ -188,6 +190,23 @@ add_library(moderngekko STATIC
     src/runtime/game.cpp
 )
 add_library(ModernGekko::Runtime ALIAS moderngekko)
+if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+    target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_MOH_PC_LAYER=1)
+endif()
+
+if(MODERNGEKKO_ENABLE_MOH_MOBILE_BRIDGE)
+    if(NOT TARGET videocommon)
+        message(FATAL_ERROR "MOH mobile bridge currently requires the Dolphin runtime/video core")
+    endif()
+    add_library(moderngekko_moh_mobile_bridge STATIC
+        src/mobile/MohMobileBridge.cpp)
+    add_library(ModernGekko::MohMobileBridge ALIAS moderngekko_moh_mobile_bridge)
+    target_link_libraries(moderngekko_moh_mobile_bridge PUBLIC moderngekko_abi videocommon)
+    target_include_directories(moderngekko_moh_mobile_bridge PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Source/Core")
+    set_target_properties(moderngekko_moh_mobile_bridge PROPERTIES
+        CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+endif()
 
 add_library(moderngekko_dolphin_video STATIC
     src/gpu/dolphin_video_host.cpp

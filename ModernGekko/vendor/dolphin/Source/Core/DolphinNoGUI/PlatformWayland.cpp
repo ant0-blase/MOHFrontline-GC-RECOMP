@@ -228,6 +228,7 @@ PlatformWayland::~PlatformWayland()
 bool PlatformWayland::Init()
 {
   m_owner_thread = std::this_thread::get_id();
+  MohPcLayer::SetPlatformName("Linux/Wayland");
   m_xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
   m_display = wl_display_connect(nullptr);
   if (!m_display)
@@ -651,6 +652,11 @@ void PlatformWayland::KeyboardKey(void* data, wl_keyboard*, uint32_t, uint32_t, 
     MohPcLayer::ToggleSettings();
     platform->UpdateRelativePointer();
     platform->UpdateCursor();
+    return;
+  }
+  if (symbol == XKB_KEY_F8 && platform->ModifierActive(XKB_MOD_NAME_CTRL))
+  {
+    MohPcLayer::ToggleDebug();
     return;
   }
   platform->HandleHotkey(symbol);

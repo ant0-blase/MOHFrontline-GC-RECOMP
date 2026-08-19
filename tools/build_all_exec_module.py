@@ -625,6 +625,12 @@ def main() -> int:
     ap.add_argument("--backend", default="c")
     ap.add_argument("--compiler", default="clang")
     ap.add_argument("--opt-level", default="0")
+    ap.add_argument("--cmake-toolchain", type=Path,
+                    help="Optional CMake toolchain file for cross compilation")
+    ap.add_argument("--module-type", choices=("SHARED", "STATIC"), default="SHARED",
+                    help="Build the recompiled game image as a shared or static library")
+    ap.add_argument("--cmake-define", action="append", default=[], metavar="KEY=VALUE",
+                    help="Extra -D definition forwarded to the module CMake configure step")
     args = ap.parse_args()
 
     if args.backend != "c":
@@ -835,21 +841,42 @@ def main() -> int:
     gxruntime = root / "ModernGekko" / "vendor" / "dolphin" / "GXRuntime"
     abi = root / "ModernGekko" / "vendor" / "dolphin" / "Source" / "Core" / "Core" / "PowerPC" / "StaticRecomp"
     compiler = shutil.which(args.compiler) or args.compiler
-    run([
+    cmake_command = [
         "cmake", "-S", template, "-B", module_build, "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
-        f"-DCMAKE_C_COMPILER={compiler}",
         f"-DGAME_ID={args.game_id}",
         f"-DMULTI_MANIFEST={manifest}",
         f"-DGXRUNTIME_DIR={gxruntime}",
         f"-DCHASSIS_ABI_DIR={abi}",
         f"-DRECOMPCORE_MODULE_OPT_LEVEL={args.opt_level}",
-    ])
+        f"-DRECOMP_MODULE_TYPE={args.module_type}",
+    ]
+    if args.cmake_toolchain:
+        cmake_command.append(f"-DCMAKE_TOOLCHAIN_FILE={args.cmake_toolchain.resolve()}")
+    else:
+        cmake_command.append(f"-DCMAKE_C_COMPILER={compiler}")
+    for definition in args.cmake_define:
+        if "=" not in definition or definition.startswith("="):
+            raise SystemExit(f"invalid --cmake-define {definition!r}; expected KEY=VALUE")
+        cmake_command.append(f"-D{definition}")
+    run(cmake_command)
     run(["cmake", "--build", module_build, "-j", str(args.jobs)])
 
-    built = module_build / f"g{args.game_id}_recomp.so"
-    if not built.is_file():
-        raise SystemExit(f"module build did not produce {built}")
+    module_stem = f"g{args.game_id}_recomp"
+    candidates = []
+    for suffix in (".so", ".dll", ".dylib", ".a", ".lib"):
+        candidates.extend(module_build.rglob(module_stem + suffix))
+    candidates = [path for path in candidates if path.is_file()]
+    if not candidates:
+        raise SystemExit(
+            f"module build did not produce {module_stem} with a supported library suffix")
+    # Prefer the artifact matching the requested module type when a platform
+    # generator emits import libraries next to a DLL.
+    if args.module_type == "STATIC":
+        preferred = [p for p in candidates if p.suffix.lower() in (".a", ".lib")]
+    else:
+        preferred = [p for p in candidates if p.suffix.lower() in (".so", ".dll", ".dylib")]
+    built = (preferred or candidates)[0]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(built, args.output)
     print(f"multi-image module: {args.output}")
