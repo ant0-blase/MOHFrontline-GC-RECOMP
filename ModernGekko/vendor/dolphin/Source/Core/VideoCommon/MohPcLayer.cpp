@@ -15,12 +15,15 @@
 #include "InputCommon/ControllerEmu/StickGate.h"
 #include "InputCommon/InputConfig.h"
 #include "VideoCommon/PerformanceMetrics.h"
+#include "VideoCommon/PostProcessing.h"
+#include "VideoCommon/Present.h"
 #include "VideoCommon/VideoConfig.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -91,6 +94,21 @@ struct State
   std::atomic<float> sensitivity_x{1.0f};
   std::atomic<float> sensitivity_y{1.0f};
   std::atomic<float> ads_sensitivity{0.80f};
+
+  // Optional modern FPS aim-down-sights. Original MOHF aiming remains the
+  // gameplay authority; this layer only modernizes camera/viewmodel presentation.
+  std::atomic<bool> fps_ads_enabled{false};
+  std::atomic<float> ads_world_fov{72.0f};
+  std::atomic<float> ads_weapon_fov{68.0f};
+  std::atomic<float> ads_transition_ms{180.0f};
+  std::atomic<bool> ads_hide_crosshair{true};
+  std::atomic<float> ads_center_strength{1.0f};
+  std::atomic<float> ads_target_x{0.0f};
+  std::atomic<float> ads_target_y{0.0f};
+  std::atomic<float> ads_z_offset{0.0f};
+  std::atomic<float> ads_blend{0.0f};
+  std::atomic<bool> gamepad_aim{false};
+  std::atomic<int> current_weapon_type{-1};
   std::atomic<float> mouse_smoothing{0.0f};
   std::atomic<float> mouse_acceleration{0.0f};
   std::atomic<bool> toggle_aim{false};
@@ -122,6 +140,33 @@ struct State
   std::atomic<int> texture_filter{0}; // 0 default, 1 nearest, 2 linear
   std::atomic<bool> true_color{true};
   std::atomic<bool> disable_copy_filter{false};
+
+  // Reversible post-processing stack.  Off means Dolphin receives the exact
+  // same post-process selection that was active before the MOHF PC layer.
+  std::atomic<bool> enhanced_graphics{false};
+  std::atomic<int> enhanced_preset{1}; // 0 custom/original, 1 enhanced, 2 remastered
+  std::atomic<bool> gfx_bloom{true};
+  std::atomic<float> gfx_bloom_intensity{0.55f};
+  std::atomic<float> gfx_bloom_threshold{0.72f};
+  std::atomic<bool> gfx_tonemap{true};
+  std::atomic<float> gfx_exposure{1.0f};
+  std::atomic<float> gfx_contrast{1.04f};
+  std::atomic<float> gfx_saturation{1.03f};
+  std::atomic<bool> gfx_sharpen{true};
+  std::atomic<float> gfx_sharpen_strength{0.22f};
+  std::atomic<bool> gfx_dof{false};
+  std::atomic<bool> gfx_dof_ads_only{true};
+  std::atomic<float> gfx_dof_strength{0.30f};
+  std::atomic<bool> gfx_enhanced_lighting{true};
+  std::atomic<float> gfx_lighting_strength{0.28f};
+  std::atomic<bool> gfx_ssao{true};
+  std::atomic<float> gfx_ssao_strength{0.22f};
+  std::atomic<bool> gfx_contact_shadows{true};
+  std::atomic<float> gfx_contact_shadow_strength{0.18f};
+  std::atomic<bool> gfx_vignette{false};
+  std::atomic<float> gfx_vignette_strength{0.12f};
+  std::atomic<bool> gfx_film_grain{false};
+  std::atomic<float> gfx_film_grain_strength{0.015f};
   std::atomic<float> hud_scale{1.0f};
   std::atomic<float> hud_safe_width{1.0f};
   std::atomic<float> gamepad_sensitivity{1.0f};
@@ -144,6 +189,9 @@ struct State
   std::atomic<u32> mobile_actions{0};
   std::string settings_path;
   std::string platform_name{"desktop"};
+  std::string original_post_shader;
+  std::string applied_post_shader;
+  std::chrono::steady_clock::time_point ads_last_update{};
   double smooth_x = 0.0;
   double smooth_y = 0.0;
   double adaptive_ema = 1.0;
@@ -228,10 +276,12 @@ bool MobileDown(MobileAction action)
 
 bool AimActive()
 {
+  const bool pad = s.gamepad_aim.load(std::memory_order_relaxed);
   if (s.toggle_aim.load(std::memory_order_relaxed))
-    return s.aim_latched.load(std::memory_order_relaxed) || MobileDown(MobileAction::Aim);
+    return s.aim_latched.load(std::memory_order_relaxed) || MobileDown(MobileAction::Aim) || pad;
   const u32 bit = 1u << static_cast<u32>(std::clamp(s.aim_button.load(), 0, 2));
-  return (s.mouse_buttons.load(std::memory_order_relaxed) & bit) != 0 || MobileDown(MobileAction::Aim);
+  return (s.mouse_buttons.load(std::memory_order_relaxed) & bit) != 0 ||
+         MobileDown(MobileAction::Aim) || pad;
 }
 
 double ApplyDeadzone(double value, double deadzone, double sensitivity)
@@ -284,6 +334,122 @@ std::string KeyName(u32 key)
   case KEY_HOME: return "Home";
   default: return "Key 0x" + std::to_string(key);
   }
+}
+
+void ApplyAdsEnvironment()
+{
+  if (s.fps_ads_enabled.load())
+    SetEnv("MOH_CAMERA_PATCH", "1");
+  SetEnv("MOH_FPS_ADS", s.fps_ads_enabled.load() ? "1" : "0");
+  SetEnv("MOH_ADS_WORLD_FOV", std::to_string(s.ads_world_fov.load()));
+  SetEnv("MOH_ADS_WEAPON_FOV", std::to_string(s.ads_weapon_fov.load()));
+}
+
+void SetPostOptionBool(VideoCommon::PostProcessingConfiguration* config, const char* name, bool value)
+{
+  if (config && config->GetOptions().contains(name))
+    config->SetOptionb(name, value);
+}
+
+void SetPostOptionFloat(VideoCommon::PostProcessingConfiguration* config, const char* name, float value)
+{
+  if (config && config->GetOptions().contains(name))
+    config->SetOptionf(name, 0, value);
+}
+
+void ApplyEnhancedPreset(int preset)
+{
+  if (preset == 1) // Enhanced: restrained preservation-friendly defaults.
+  {
+    s.gfx_bloom = true; s.gfx_bloom_intensity = 0.55f; s.gfx_bloom_threshold = 0.72f;
+    s.gfx_tonemap = true; s.gfx_exposure = 1.0f; s.gfx_contrast = 1.04f; s.gfx_saturation = 1.03f;
+    s.gfx_sharpen = true; s.gfx_sharpen_strength = 0.22f;
+    s.gfx_dof = false; s.gfx_dof_strength = 0.25f;
+    s.gfx_enhanced_lighting = true; s.gfx_lighting_strength = 0.28f;
+    s.gfx_ssao = true; s.gfx_ssao_strength = 0.22f;
+    s.gfx_contact_shadows = true; s.gfx_contact_shadow_strength = 0.18f;
+    s.gfx_vignette = false; s.gfx_film_grain = false;
+  }
+  else if (preset == 2) // Remastered: intentionally stronger, still reversible.
+  {
+    s.gfx_bloom = true; s.gfx_bloom_intensity = 0.78f; s.gfx_bloom_threshold = 0.62f;
+    s.gfx_tonemap = true; s.gfx_exposure = 1.04f; s.gfx_contrast = 1.08f; s.gfx_saturation = 1.06f;
+    s.gfx_sharpen = true; s.gfx_sharpen_strength = 0.32f;
+    s.gfx_dof = true; s.gfx_dof_strength = 0.34f;
+    s.gfx_enhanced_lighting = true; s.gfx_lighting_strength = 0.42f;
+    s.gfx_ssao = true; s.gfx_ssao_strength = 0.34f;
+    s.gfx_contact_shadows = true; s.gfx_contact_shadow_strength = 0.28f;
+    s.gfx_vignette = true; s.gfx_vignette_strength = 0.10f;
+    s.gfx_film_grain = false;
+  }
+}
+
+void UpdateAdsAnimation()
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (s.ads_last_update.time_since_epoch().count() == 0)
+  {
+    s.ads_last_update = now;
+    return;
+  }
+  const float dt = static_cast<float>(std::clamp(
+      std::chrono::duration<double>(now - s.ads_last_update).count(), 0.0, 0.05));
+  s.ads_last_update = now;
+  const bool active = s.fps_ads_enabled.load() && s.gameplay.load() && AimActive() &&
+                      !s.settings_open.load();
+  const float target = active ? 1.0f : 0.0f;
+  const float duration = std::max(s.ads_transition_ms.load() * 0.001f, 0.025f);
+  float blend = s.ads_blend.load();
+  const float step = std::clamp(dt / duration, 0.0f, 1.0f);
+  blend += (target - blend) * step;
+  if (std::fabs(target - blend) < 0.001f)
+    blend = target;
+  s.ads_blend = std::clamp(blend, 0.0f, 1.0f);
+}
+
+void UpdateEnhancedPostProcess()
+{
+  const bool enabled = s.enhanced_graphics.load();
+  const std::string desired = enabled ? "MOHFrontlineEnhanced" : s.original_post_shader;
+  if (s.applied_post_shader != desired)
+  {
+    Config::SetCurrent(Config::GFX_ENHANCE_POST_SHADER, desired);
+    s.applied_post_shader = desired;
+    std::fprintf(stderr, "[moh-gfx] enhanced graphics %s (shader=%s)\n",
+                 enabled ? "ON" : "OFF", desired.empty() ? "original" : desired.c_str());
+  }
+
+  if (!enabled || !g_presenter || !g_presenter->GetPostProcessor())
+    return;
+  auto* config = g_presenter->GetPostProcessor()->GetConfig();
+  if (!config || config->GetShader() != "MOHFrontlineEnhanced")
+    return;
+
+  SetPostOptionBool(config, "MASTER_ENABLE", true);
+  SetPostOptionBool(config, "BLOOM_ENABLE", s.gfx_bloom.load());
+  SetPostOptionFloat(config, "BLOOM_INTENSITY", s.gfx_bloom_intensity.load());
+  SetPostOptionFloat(config, "BLOOM_THRESHOLD", s.gfx_bloom_threshold.load());
+  SetPostOptionBool(config, "TONEMAP_ENABLE", s.gfx_tonemap.load());
+  SetPostOptionFloat(config, "EXPOSURE", s.gfx_exposure.load());
+  SetPostOptionFloat(config, "CONTRAST", s.gfx_contrast.load());
+  SetPostOptionFloat(config, "SATURATION", s.gfx_saturation.load());
+  SetPostOptionBool(config, "SHARPEN_ENABLE", s.gfx_sharpen.load());
+  SetPostOptionFloat(config, "SHARPEN_STRENGTH", s.gfx_sharpen_strength.load());
+  SetPostOptionBool(config, "DOF_ENABLE", s.gfx_dof.load());
+  const float dof = s.gfx_dof_ads_only.load() ?
+                        s.gfx_dof_strength.load() * s.ads_blend.load() :
+                        s.gfx_dof_strength.load();
+  SetPostOptionFloat(config, "DOF_STRENGTH", dof);
+  SetPostOptionBool(config, "LIGHTING_ENABLE", s.gfx_enhanced_lighting.load());
+  SetPostOptionFloat(config, "LIGHTING_STRENGTH", s.gfx_lighting_strength.load());
+  SetPostOptionBool(config, "SSAO_ENABLE", s.gfx_ssao.load());
+  SetPostOptionFloat(config, "SSAO_STRENGTH", s.gfx_ssao_strength.load());
+  SetPostOptionBool(config, "CONTACT_SHADOW_ENABLE", s.gfx_contact_shadows.load());
+  SetPostOptionFloat(config, "CONTACT_SHADOW_STRENGTH", s.gfx_contact_shadow_strength.load());
+  SetPostOptionBool(config, "VIGNETTE_ENABLE", s.gfx_vignette.load());
+  SetPostOptionFloat(config, "VIGNETTE_STRENGTH", s.gfx_vignette_strength.load());
+  SetPostOptionBool(config, "FILM_GRAIN_ENABLE", s.gfx_film_grain.load());
+  SetPostOptionFloat(config, "FILM_GRAIN_STRENGTH", s.gfx_film_grain_strength.load());
 }
 
 void ApplyAspect(int mode)
@@ -388,6 +554,15 @@ void SaveSettings()
   f << "sensitivity_x=" << s.sensitivity_x.load() << '\n';
   f << "sensitivity_y=" << s.sensitivity_y.load() << '\n';
   f << "ads_sensitivity=" << s.ads_sensitivity.load() << '\n';
+  f << "fps_ads=" << s.fps_ads_enabled.load() << '\n';
+  f << "ads_world_fov=" << s.ads_world_fov.load() << '\n';
+  f << "ads_weapon_fov=" << s.ads_weapon_fov.load() << '\n';
+  f << "ads_transition_ms=" << s.ads_transition_ms.load() << '\n';
+  f << "ads_hide_crosshair=" << s.ads_hide_crosshair.load() << '\n';
+  f << "ads_center_strength=" << s.ads_center_strength.load() << '\n';
+  f << "ads_target_x=" << s.ads_target_x.load() << '\n';
+  f << "ads_target_y=" << s.ads_target_y.load() << '\n';
+  f << "ads_z_offset=" << s.ads_z_offset.load() << '\n';
   f << "mouse_smoothing=" << s.mouse_smoothing.load() << '\n';
   f << "mouse_acceleration=" << s.mouse_acceleration.load() << '\n';
   f << "invert_x=" << s.invert_x.load() << '\n';
@@ -408,6 +583,30 @@ void SaveSettings()
   f << "texture_filter=" << s.texture_filter.load() << '\n';
   f << "true_color=" << s.true_color.load() << '\n';
   f << "disable_copy_filter=" << s.disable_copy_filter.load() << '\n';
+  f << "enhanced_graphics=" << s.enhanced_graphics.load() << '\n';
+  f << "enhanced_preset=" << s.enhanced_preset.load() << '\n';
+  f << "gfx_bloom=" << s.gfx_bloom.load() << '\n';
+  f << "gfx_bloom_intensity=" << s.gfx_bloom_intensity.load() << '\n';
+  f << "gfx_bloom_threshold=" << s.gfx_bloom_threshold.load() << '\n';
+  f << "gfx_tonemap=" << s.gfx_tonemap.load() << '\n';
+  f << "gfx_exposure=" << s.gfx_exposure.load() << '\n';
+  f << "gfx_contrast=" << s.gfx_contrast.load() << '\n';
+  f << "gfx_saturation=" << s.gfx_saturation.load() << '\n';
+  f << "gfx_sharpen=" << s.gfx_sharpen.load() << '\n';
+  f << "gfx_sharpen_strength=" << s.gfx_sharpen_strength.load() << '\n';
+  f << "gfx_dof=" << s.gfx_dof.load() << '\n';
+  f << "gfx_dof_ads_only=" << s.gfx_dof_ads_only.load() << '\n';
+  f << "gfx_dof_strength=" << s.gfx_dof_strength.load() << '\n';
+  f << "gfx_lighting=" << s.gfx_enhanced_lighting.load() << '\n';
+  f << "gfx_lighting_strength=" << s.gfx_lighting_strength.load() << '\n';
+  f << "gfx_ssao=" << s.gfx_ssao.load() << '\n';
+  f << "gfx_ssao_strength=" << s.gfx_ssao_strength.load() << '\n';
+  f << "gfx_contact_shadows=" << s.gfx_contact_shadows.load() << '\n';
+  f << "gfx_contact_shadow_strength=" << s.gfx_contact_shadow_strength.load() << '\n';
+  f << "gfx_vignette=" << s.gfx_vignette.load() << '\n';
+  f << "gfx_vignette_strength=" << s.gfx_vignette_strength.load() << '\n';
+  f << "gfx_film_grain=" << s.gfx_film_grain.load() << '\n';
+  f << "gfx_film_grain_strength=" << s.gfx_film_grain_strength.load() << '\n';
   f << "gamepad_sensitivity=" << s.gamepad_sensitivity.load() << '\n';
   f << "gamepad_deadzone=" << s.gamepad_deadzone.load() << '\n';
   f << "audio_buffer=" << s.audio_buffer_ms.load() << '\n';
@@ -451,6 +650,15 @@ void LoadSettings()
     else if (key == "sensitivity_x") s.sensitivity_x = std::clamp(as_f(), 0.10f, 4.0f);
     else if (key == "sensitivity_y") s.sensitivity_y = std::clamp(as_f(), 0.10f, 4.0f);
     else if (key == "ads_sensitivity") s.ads_sensitivity = std::clamp(as_f(), 0.10f, 2.0f);
+    else if (key == "fps_ads") s.fps_ads_enabled = as_i() != 0;
+    else if (key == "ads_world_fov") s.ads_world_fov = std::clamp(as_f(), 35.0f, 120.0f);
+    else if (key == "ads_weapon_fov") s.ads_weapon_fov = std::clamp(as_f(), 35.0f, 120.0f);
+    else if (key == "ads_transition_ms") s.ads_transition_ms = std::clamp(as_f(), 40.0f, 600.0f);
+    else if (key == "ads_hide_crosshair") s.ads_hide_crosshair = as_i() != 0;
+    else if (key == "ads_center_strength") s.ads_center_strength = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "ads_target_x") s.ads_target_x = std::clamp(as_f(), -2.0f, 2.0f);
+    else if (key == "ads_target_y") s.ads_target_y = std::clamp(as_f(), -2.0f, 2.0f);
+    else if (key == "ads_z_offset") s.ads_z_offset = std::clamp(as_f(), -2.0f, 2.0f);
     else if (key == "mouse_smoothing") s.mouse_smoothing = std::clamp(as_f(), 0.0f, 0.95f);
     else if (key == "mouse_acceleration") s.mouse_acceleration = std::clamp(as_f(), 0.0f, 2.0f);
     else if (key == "invert_x") s.invert_x = as_i() != 0;
@@ -471,6 +679,30 @@ void LoadSettings()
     else if (key == "texture_filter") s.texture_filter = std::clamp(as_i(), 0, 2);
     else if (key == "true_color") s.true_color = as_i() != 0;
     else if (key == "disable_copy_filter") s.disable_copy_filter = as_i() != 0;
+    else if (key == "enhanced_graphics") s.enhanced_graphics = as_i() != 0;
+    else if (key == "enhanced_preset") s.enhanced_preset = std::clamp(as_i(), 0, 2);
+    else if (key == "gfx_bloom") s.gfx_bloom = as_i() != 0;
+    else if (key == "gfx_bloom_intensity") s.gfx_bloom_intensity = std::clamp(as_f(), 0.0f, 1.5f);
+    else if (key == "gfx_bloom_threshold") s.gfx_bloom_threshold = std::clamp(as_f(), 0.2f, 1.5f);
+    else if (key == "gfx_tonemap") s.gfx_tonemap = as_i() != 0;
+    else if (key == "gfx_exposure") s.gfx_exposure = std::clamp(as_f(), 0.5f, 2.0f);
+    else if (key == "gfx_contrast") s.gfx_contrast = std::clamp(as_f(), 0.7f, 1.4f);
+    else if (key == "gfx_saturation") s.gfx_saturation = std::clamp(as_f(), 0.0f, 1.5f);
+    else if (key == "gfx_sharpen") s.gfx_sharpen = as_i() != 0;
+    else if (key == "gfx_sharpen_strength") s.gfx_sharpen_strength = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "gfx_dof") s.gfx_dof = as_i() != 0;
+    else if (key == "gfx_dof_ads_only") s.gfx_dof_ads_only = as_i() != 0;
+    else if (key == "gfx_dof_strength") s.gfx_dof_strength = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "gfx_lighting") s.gfx_enhanced_lighting = as_i() != 0;
+    else if (key == "gfx_lighting_strength") s.gfx_lighting_strength = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "gfx_ssao") s.gfx_ssao = as_i() != 0;
+    else if (key == "gfx_ssao_strength") s.gfx_ssao_strength = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "gfx_contact_shadows") s.gfx_contact_shadows = as_i() != 0;
+    else if (key == "gfx_contact_shadow_strength") s.gfx_contact_shadow_strength = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "gfx_vignette") s.gfx_vignette = as_i() != 0;
+    else if (key == "gfx_vignette_strength") s.gfx_vignette_strength = std::clamp(as_f(), 0.0f, 0.8f);
+    else if (key == "gfx_film_grain") s.gfx_film_grain = as_i() != 0;
+    else if (key == "gfx_film_grain_strength") s.gfx_film_grain_strength = std::clamp(as_f(), 0.0f, 0.15f);
     else if (key == "gamepad_sensitivity") s.gamepad_sensitivity = std::clamp(as_f(), 0.25f, 2.0f);
     else if (key == "gamepad_deadzone") s.gamepad_deadzone = std::clamp(as_f(), 0.0f, 0.50f);
     else if (key == "audio_buffer") s.audio_buffer_ms = std::clamp(as_i(), 16, 512);
@@ -582,7 +814,10 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
     const bool fire = (buttons & (1u << s.fire_button.load())) != 0 || MobileDown(MobileAction::Fire);
     const bool aim = AimActive();
     if (control == GCPad::L_DIGITAL || control == GCPad::L_ANALOG)
+    {
+      s.gamepad_aim = keep_pad && original > 0.35;
       return combine(aim ? 1.0 : 0.0);
+    }
     if (control == GCPad::R_DIGITAL || control == GCPad::R_ANALOG)
       return combine(fire ? 1.0 : 0.0);
   }
@@ -610,6 +845,16 @@ void ResetDefaults()
   s.sensitivity_x = 1.0f;
   s.sensitivity_y = 1.0f;
   s.ads_sensitivity = 0.80f;
+  s.fps_ads_enabled = false;
+  s.ads_world_fov = 72.0f;
+  s.ads_weapon_fov = 68.0f;
+  s.ads_transition_ms = 180.0f;
+  s.ads_hide_crosshair = true;
+  s.ads_center_strength = 1.0f;
+  s.ads_target_x = 0.0f;
+  s.ads_target_y = 0.0f;
+  s.ads_z_offset = 0.0f;
+  s.ads_blend = 0.0f;
   s.mouse_smoothing = 0.0f;
   s.mouse_acceleration = 0.0f;
   s.invert_x = false;
@@ -634,6 +879,9 @@ void ResetDefaults()
   s.texture_filter = 0;
   s.true_color = true;
   s.disable_copy_filter = false;
+  s.enhanced_graphics = false;
+  s.enhanced_preset = 1;
+  ApplyEnhancedPreset(1);
   s.audio_buffer_ms = 120;
   s.audio_volume = 100;
   s.fill_audio_gaps = true;
@@ -649,6 +897,10 @@ void SyncFromEnvironment()
   s.sensitivity_x = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_SENSITIVITY_X", s.sensitivity_x.load()), 0.10, 4.0));
   s.sensitivity_y = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_SENSITIVITY_Y", s.sensitivity_y.load()), 0.10, 4.0));
   s.ads_sensitivity = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_ADS_SENSITIVITY", s.ads_sensitivity.load()), 0.10, 2.0));
+  s.fps_ads_enabled = EnvTrue("MOH_FPS_ADS", s.fps_ads_enabled.load());
+  s.ads_world_fov = static_cast<float>(std::clamp(EnvDouble("MOH_ADS_WORLD_FOV", s.ads_world_fov.load()), 35.0, 120.0));
+  s.ads_weapon_fov = static_cast<float>(std::clamp(EnvDouble("MOH_ADS_WEAPON_FOV", s.ads_weapon_fov.load()), 35.0, 120.0));
+  s.enhanced_graphics = EnvTrue("MOH_ENHANCED_GRAPHICS", s.enhanced_graphics.load());
   s.invert_x = EnvTrue("MOH_MOUSE_INVERT_X", s.invert_x.load());
   s.invert_y = EnvTrue("MOH_MOUSE_INVERT_Y", s.invert_y.load());
   s.ui_safe = EnvTrue("MOH_UI_SAFE", s.ui_safe.load());
@@ -701,6 +953,8 @@ void Initialize()
   if (s.initialized.exchange(true))
     return;
   s.requested_fps = -1;
+  s.original_post_shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
+  s.applied_post_shader = s.original_post_shader;
   LoadSettings();
   SyncFromEnvironment();
   auto* config = Pad::GetConfig();
@@ -733,10 +987,12 @@ void ApplyDolphinSettings()
   Config::SetBase(Config::MAIN_AUDIO_PRESERVE_PITCH, s.preserve_audio_pitch.load());
   Config::SetBase(Config::MAIN_AUDIO_VOLUME, s.audio_volume.load());
   ApplyFov();
+  ApplyAdsEnvironment();
   if (s.aspect_mode.load() != 0)
     ApplyAspect(s.aspect_mode.load());
   if (s.requested_fps.load() >= 0)
     ApplyFPS();
+  UpdateEnhancedPostProcess();
 }
 
 void SetGameplayActive(bool active)
@@ -755,6 +1011,8 @@ void SetGameplayActive(bool active)
     s.mobile_move_x = 0.0f;
     s.mobile_move_y = 0.0f;
     s.mobile_actions = 0;
+    s.gamepad_aim = false;
+    s.ads_blend = 0.0f;
   }
 }
 
@@ -1028,6 +1286,26 @@ void AdaptivePerformanceUpdate()
   }
 }
 
+void UpdateFrame()
+{
+  if (!s.initialized.load())
+    return;
+  UpdateAdsAnimation();
+  UpdateEnhancedPostProcess();
+}
+
+float GetAdsBlend() { return s.fps_ads_enabled.load() ? s.ads_blend.load() : 0.0f; }
+float GetAdsCenterStrength() { return s.ads_center_strength.load(); }
+float GetAdsTargetX() { return s.ads_target_x.load(); }
+float GetAdsTargetY() { return s.ads_target_y.load(); }
+float GetAdsZOffset() { return s.ads_z_offset.load(); }
+bool ShouldHideAdsCrosshair()
+{
+  return s.fps_ads_enabled.load() && s.ads_hide_crosshair.load() && s.ads_blend.load() > 0.72f;
+}
+void SetCurrentWeaponType(int type) { s.current_weapon_type = type; }
+int GetCurrentWeaponType() { return s.current_weapon_type.load(); }
+
 void DrawSettingsUI(float backbuffer_scale)
 {
   if (!s.settings_open.load())
@@ -1165,6 +1443,118 @@ void DrawSettingsUI(float backbuffer_scale)
                     Core::System::GetInstance().GetPerfMetrics().GetFPS(),
                     Config::Get(Config::MAIN_VI_OVERCLOCK) * NATIVE_VPS,
                     Core::System::GetInstance().GetPerfMetrics().GetMaxSpeed() * 100.0);
+        ImGui::EndTabItem();
+      }
+
+      if (ImGui::BeginTabItem("Enhanced Graphics"))
+      {
+        bool enhanced = s.enhanced_graphics.load();
+        if (ImGui::Checkbox("Enhanced Graphics (reversible post-process)", &enhanced))
+        {
+          s.enhanced_graphics = enhanced;
+          UpdateEnhancedPostProcess();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(enhanced ? "ON" : "Original renderer");
+
+        int preset = s.enhanced_preset.load();
+        const char* presets[] = {"Custom", "Enhanced", "Remastered"};
+        if (ImGui::Combo("Preset", &preset, presets, 3))
+        {
+          s.enhanced_preset = preset;
+          if (preset > 0) ApplyEnhancedPreset(preset);
+        }
+        if (!enhanced)
+          ImGui::BeginDisabled();
+
+        ImGui::SeparatorText("Light / atmosphere");
+        bool bloom = s.gfx_bloom.load();
+        if (ImGui::Checkbox("Bloom", &bloom)) { s.gfx_bloom = bloom; s.enhanced_preset = 0; }
+        float bloom_i = s.gfx_bloom_intensity.load(), bloom_t = s.gfx_bloom_threshold.load();
+        if (ImGui::SliderFloat("Bloom intensity", &bloom_i, 0.0f, 1.5f, "%.2f")) { s.gfx_bloom_intensity = bloom_i; s.enhanced_preset = 0; }
+        if (ImGui::SliderFloat("Bloom threshold", &bloom_t, 0.25f, 1.25f, "%.2f")) { s.gfx_bloom_threshold = bloom_t; s.enhanced_preset = 0; }
+        bool lighting = s.gfx_enhanced_lighting.load();
+        if (ImGui::Checkbox("Enhanced screen-space lighting", &lighting)) { s.gfx_enhanced_lighting = lighting; s.enhanced_preset = 0; }
+        float lighting_i = s.gfx_lighting_strength.load();
+        if (ImGui::SliderFloat("Lighting strength", &lighting_i, 0.0f, 1.0f, "%.2f")) { s.gfx_lighting_strength = lighting_i; s.enhanced_preset = 0; }
+        bool ssao = s.gfx_ssao.load();
+        if (ImGui::Checkbox("Ambient occlusion enhancement", &ssao)) { s.gfx_ssao = ssao; s.enhanced_preset = 0; }
+        float ssao_i = s.gfx_ssao_strength.load();
+        if (ImGui::SliderFloat("AO strength", &ssao_i, 0.0f, 1.0f, "%.2f")) { s.gfx_ssao_strength = ssao_i; s.enhanced_preset = 0; }
+        bool contact = s.gfx_contact_shadows.load();
+        if (ImGui::Checkbox("Contact-shadow enhancement", &contact)) { s.gfx_contact_shadows = contact; s.enhanced_preset = 0; }
+        float contact_i = s.gfx_contact_shadow_strength.load();
+        if (ImGui::SliderFloat("Contact shadow strength", &contact_i, 0.0f, 1.0f, "%.2f")) { s.gfx_contact_shadow_strength = contact_i; s.enhanced_preset = 0; }
+        ImGui::TextDisabled("AO/contact shadows are color/depth-cue screen-space enhancements; no game lights are replaced.");
+
+        ImGui::SeparatorText("Image");
+        bool tonemap = s.gfx_tonemap.load();
+        if (ImGui::Checkbox("Filmic tone mapping", &tonemap)) { s.gfx_tonemap = tonemap; s.enhanced_preset = 0; }
+        float exposure=s.gfx_exposure.load(), contrast=s.gfx_contrast.load(), saturation=s.gfx_saturation.load();
+        if (ImGui::SliderFloat("Exposure", &exposure, 0.5f, 2.0f, "%.2f")) { s.gfx_exposure=exposure; s.enhanced_preset=0; }
+        if (ImGui::SliderFloat("Contrast", &contrast, 0.7f, 1.4f, "%.2f")) { s.gfx_contrast=contrast; s.enhanced_preset=0; }
+        if (ImGui::SliderFloat("Saturation", &saturation, 0.0f, 1.5f, "%.2f")) { s.gfx_saturation=saturation; s.enhanced_preset=0; }
+        bool sharpen=s.gfx_sharpen.load();
+        if (ImGui::Checkbox("Sharpen", &sharpen)) { s.gfx_sharpen=sharpen; s.enhanced_preset=0; }
+        float sharpen_i=s.gfx_sharpen_strength.load();
+        if (ImGui::SliderFloat("Sharpen strength", &sharpen_i, 0.0f, 1.0f, "%.2f")) { s.gfx_sharpen_strength=sharpen_i; s.enhanced_preset=0; }
+
+        ImGui::SeparatorText("Cinematic effects");
+        bool dof=s.gfx_dof.load();
+        if (ImGui::Checkbox("Cinematic depth-of-field", &dof)) { s.gfx_dof=dof; s.enhanced_preset=0; }
+        bool dof_ads=s.gfx_dof_ads_only.load();
+        if (ImGui::Checkbox("DOF only while FPS ADS", &dof_ads)) s.gfx_dof_ads_only=dof_ads;
+        float dof_i=s.gfx_dof_strength.load();
+        if (ImGui::SliderFloat("DOF strength", &dof_i, 0.0f, 1.0f, "%.2f")) { s.gfx_dof_strength=dof_i; s.enhanced_preset=0; }
+        bool vignette=s.gfx_vignette.load();
+        if (ImGui::Checkbox("Vignette", &vignette)) { s.gfx_vignette=vignette; s.enhanced_preset=0; }
+        float vignette_i=s.gfx_vignette_strength.load();
+        if (ImGui::SliderFloat("Vignette strength", &vignette_i, 0.0f, 0.6f, "%.2f")) { s.gfx_vignette_strength=vignette_i; s.enhanced_preset=0; }
+        bool grain=s.gfx_film_grain.load();
+        if (ImGui::Checkbox("Film grain", &grain)) { s.gfx_film_grain=grain; s.enhanced_preset=0; }
+        float grain_i=s.gfx_film_grain_strength.load();
+        if (ImGui::SliderFloat("Film grain strength", &grain_i, 0.0f, 0.10f, "%.3f")) { s.gfx_film_grain_strength=grain_i; s.enhanced_preset=0; }
+
+        if (!enhanced)
+          ImGui::EndDisabled();
+        if (ImGui::Button("Restore preservation-friendly Enhanced preset"))
+        {
+          s.enhanced_preset = 1;
+          ApplyEnhancedPreset(1);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Original graphics OFF"))
+        {
+          s.enhanced_graphics = false;
+          UpdateEnhancedPostProcess();
+        }
+        ImGui::EndTabItem();
+      }
+
+      if (ImGui::BeginTabItem("Aiming"))
+      {
+        bool fps_ads=s.fps_ads_enabled.load();
+        if (ImGui::Checkbox("FPS Aim Down Sight (CoD-style presentation)", &fps_ads))
+        {
+          s.fps_ads_enabled=fps_ads;
+          if (!fps_ads) s.ads_blend=0.0f;
+          ApplyAdsEnvironment();
+        }
+        float ads_world=s.ads_world_fov.load(), ads_weapon=s.ads_weapon_fov.load();
+        float transition=s.ads_transition_ms.load();
+        if (ImGui::SliderFloat("ADS world FOV", &ads_world, 45.0f, 100.0f, "%.1f deg")) { s.ads_world_fov=ads_world; ApplyAdsEnvironment(); }
+        if (ImGui::SliderFloat("ADS weapon FOV", &ads_weapon, 40.0f, 100.0f, "%.1f deg")) { s.ads_weapon_fov=ads_weapon; ApplyAdsEnvironment(); }
+        if (ImGui::SliderFloat("ADS transition", &transition, 60.0f, 450.0f, "%.0f ms")) s.ads_transition_ms=transition;
+        bool hide=s.ads_hide_crosshair.load();
+        if (ImGui::Checkbox("Hide crosshair at full ADS", &hide)) s.ads_hide_crosshair=hide;
+        float center=s.ads_center_strength.load();
+        if (ImGui::SliderFloat("Iron-sight centering", &center, 0.0f, 1.0f, "%.2f")) s.ads_center_strength=center;
+        float tx=s.ads_target_x.load(), ty=s.ads_target_y.load(), tz=s.ads_z_offset.load();
+        if (ImGui::SliderFloat("Sight target X", &tx, -1.5f, 1.5f, "%.3f")) s.ads_target_x=tx;
+        if (ImGui::SliderFloat("Sight target Y", &ty, -1.5f, 1.5f, "%.3f")) s.ads_target_y=ty;
+        if (ImGui::SliderFloat("Sight Z offset", &tz, -1.5f, 1.5f, "%.3f")) s.ads_z_offset=tz;
+        ImGui::Text("ADS blend: %.2f | detected weapon type: %d", s.ads_blend.load(), s.current_weapon_type.load());
+        ImGui::TextWrapped("The original aim/fire mechanics remain active. FPS ADS only animates camera FOV, viewmodel centering, mouse sensitivity and optional crosshair/DOF presentation. Use the X/Y/Z sliders to fine-calibrate iron sights per build/weapon animation.");
         ImGui::EndTabItem();
       }
 
@@ -1331,6 +1721,9 @@ void DrawDebugUI(float backbuffer_scale)
     ImGui::Text("Aspect          %d:%d", s.aspect_num.load(), s.aspect_den.load());
     ImGui::Text("Internal res    %dx", s.internal_resolution.load());
     ImGui::Text("Audio buffer    %d ms", s.audio_buffer_ms.load());
+    ImGui::Text("Enhanced gfx    %s", s.enhanced_graphics.load() ? "on" : "off");
+    ImGui::Text("FPS ADS         %s  blend %.2f", s.fps_ads_enabled.load() ? "on" : "off", s.ads_blend.load());
+    ImGui::Text("Weapon type     %d", s.current_weapon_type.load());
   }
   ImGui::End();
 }

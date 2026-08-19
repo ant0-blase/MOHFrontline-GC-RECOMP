@@ -25,6 +25,7 @@ void Initialize();
 void Shutdown();
 void ApplyDolphinSettings();
 void AdaptivePerformanceUpdate();
+void UpdateFrame();
 
 void SetGameplayActive(bool active);
 bool IsGameplayActive();
@@ -50,6 +51,16 @@ void SetMobileAction(MobileAction action, bool down);
 // Consume accumulated raw/touch motion and convert it using the native MOHF
 // camera calibration. `fov_degrees` is the live player FOV stored by the game.
 bool ConsumeMouseLook(float fov_degrees, float* yaw_delta, float* pitch_delta);
+
+// Native FPS ADS state queried by the static-recomp host-call bridge.
+float GetAdsBlend();
+float GetAdsCenterStrength();
+float GetAdsTargetX();
+float GetAdsTargetY();
+float GetAdsZOffset();
+bool ShouldHideAdsCrosshair();
+void SetCurrentWeaponType(int type);
+int GetCurrentWeaponType();
 
 void DrawSettingsUI(float backbuffer_scale);
 void DrawDebugUI(float backbuffer_scale);

@@ -30,6 +30,9 @@ constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_OFF = 0xFFFFF101u;
 constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_ENTER = 0xFFFFF110u;
 constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_EXIT = 0xFFFFF111u;
 constexpr std::uint32_t MOH_HOSTCALL_MOUSE_LOOK = 0xFFFFF120u;
+constexpr std::uint32_t MOH_HOSTCALL_ADS_VIEWMODEL = 0xFFFFF130u;
+constexpr std::uint32_t MOH_HOSTCALL_ADS_STATE = 0xFFFFF131u;
+constexpr std::uint32_t MOH_HOSTCALL_ADS_CROSSHAIR = 0xFFFFF132u;
 
 std::uint32_t ReadGuestU32(CPUState* state, std::uint32_t address)
 {
@@ -60,6 +63,13 @@ void WriteGuestF32(CPUState* state, std::uint32_t address, float value)
   std::uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   state->external_write(state, address, bits, 4);
+}
+
+std::uint32_t F32Bits(float value)
+{
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
 }
 #endif
 
@@ -799,6 +809,61 @@ bool ModManager::HostCall(CPUState *state, std::uint32_t address,
     }
     return true;
   }
+  if (address == MOH_HOSTCALL_ADS_STATE) {
+    if (state)
+      state->gpr[0] = F32Bits(MohPcLayer::GetAdsBlend());
+    return true;
+  }
+  if (address == MOH_HOSTCALL_ADS_CROSSHAIR) {
+    if (state && MohPcLayer::ShouldHideAdsCrosshair())
+      state->gpr[3] = 0;
+    return true;
+  }
+  if (address == MOH_HOSTCALL_ADS_VIEWMODEL) {
+    if (!state)
+      return true;
+    const float blend = MohPcLayer::GetAdsBlend();
+    if (blend <= 0.0001f)
+      return true;
+
+    // UpdateWeaponTransforms has r30=this and has already assembled the local
+    // translation vector at guest stack +0x30.  Modify the temporary vector,
+    // never the animation-owned object fields, so releasing ADS restores the
+    // exact original weapon animation automatically.
+    const std::uint32_t weapon_object = state->gpr[30];
+    const std::uint32_t stack = state->gpr[1];
+    if (!IsMem1Address(weapon_object) || !IsMem1Address(stack))
+      return true;
+
+    const std::uint32_t weapon = ReadGuestU32(state, weapon_object + 0x30E4u);
+    if (IsMem1Address(weapon))
+      MohPcLayer::SetCurrentWeaponType(static_cast<int>(ReadGuestU32(state, weapon + 0x298u)));
+
+    const std::uint32_t vec = stack + 0x30u;
+    float x = ReadGuestF32(state, vec + 0u);
+    float y = ReadGuestF32(state, vec + 4u);
+    float z = ReadGuestF32(state, vec + 8u);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+      return true;
+
+    const float center = std::clamp(blend * MohPcLayer::GetAdsCenterStrength(), 0.0f, 1.0f);
+    x += (MohPcLayer::GetAdsTargetX() - x) * center;
+    y += (MohPcLayer::GetAdsTargetY() - y) * center;
+    z += MohPcLayer::GetAdsZOffset() * blend;
+    WriteGuestF32(state, vec + 0u, x);
+    WriteGuestF32(state, vec + 4u, y);
+    WriteGuestF32(state, vec + 8u, z);
+
+    static bool ads_logged = false;
+    if (!ads_logged) {
+      ads_logged = true;
+      std::fprintf(stderr,
+                   "[moh-pc] FPS ADS viewmodel hook active: object=%08x type=%d blend=%.2f\\n",
+                   weapon_object, MohPcLayer::GetCurrentWeaponType(), blend);
+    }
+    return true;
+  }
+
   // Reserved GMFE69 control tokens emitted directly by the native game module.
   // They toggle Dolphin's VI-frequency override only while the real gameplay
   // loop is active; shell/menu/FMVs/DVD loading remain at original timing.

@@ -21,6 +21,8 @@ HUD_SCALE="default"
 HUD_SAFE_WIDTH="default"
 ADAPTIVE_PROFILE="default"
 PC_INPUT=1
+ENHANCED_GRAPHICS="default"
+FPS_ADS="default"
 PASS_ARGS=()
 
 usage() {
@@ -44,6 +46,10 @@ MOH Frontline PC enhancements:
   --hud-scale <value>         HUD scale, 0.5-1.5
   --hud-safe-width <value>    HUD horizontal safe width, 0.7-1.0
   --adaptive-fps <profile>    off, conservative, balanced, aggressive
+  --enhanced-graphics         Enable MOHF bloom/tone-map/AO post-processing
+  --original-graphics         Force preservation/original post-processing
+  --fps-ads                   Enable modern FPS aim-down-sight presentation
+  --original-aim              Keep original Frontline aiming presentation
   --no-pc-input               Disable the keyboard/mouse FPS layer
   --moh-help                  Show this help and exit
 
@@ -132,6 +138,22 @@ while (($#)); do
       ADAPTIVE_PROFILE="${2,,}"
       shift 2
       ;;
+    --enhanced-graphics)
+      ENHANCED_GRAPHICS=1
+      shift
+      ;;
+    --original-graphics)
+      ENHANCED_GRAPHICS=0
+      shift
+      ;;
+    --fps-ads)
+      FPS_ADS=1
+      shift
+      ;;
+    --original-aim)
+      FPS_ADS=0
+      shift
+      ;;
     --no-pc-input)
       PC_INPUT=0
       shift
@@ -179,6 +201,7 @@ unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_WEAPON_FOV_DEGREES \
       MOH_ASPECT_VALUE MOH_ASPECT_NUM MOH_ASPECT_DEN MOH_ASPECT_AUTO MOH_FPS_TARGET \
       MOH_UI_SAFE MOH_MOUSE_SENSITIVITY MOH_MOUSE_SENSITIVITY_X MOH_MOUSE_SENSITIVITY_Y \
       MOH_MOUSE_ADS_SENSITIVITY MOH_HUD_SCALE MOH_HUD_SAFE_WIDTH MOH_ADAPTIVE_PROFILE \
+      MOH_ENHANCED_GRAPHICS MOH_FPS_ADS MOH_ADS_WORLD_FOV MOH_ADS_WEAPON_FOV \
       2>/dev/null || true
 
 # FOV: an explicit value is the final horizontal FOV on the selected aspect.
@@ -308,8 +331,17 @@ case "${FPS,,}" in
     ;;
 esac
 
-if [[ -n "${MOH_CAMERA_PATCH:-}" || -n "${MOH_TIMING_PATCH:-}" ]]; then
-  echo "MOH native enhancements: aspect=${ASPECT} fov=${FOV} weapon-fov=${WEAPON_FOV} fps=${FPS}"
+if [[ "$ENHANCED_GRAPHICS" != "default" ]]; then
+  export MOH_ENHANCED_GRAPHICS="$ENHANCED_GRAPHICS"
+fi
+if [[ "$FPS_ADS" != "default" ]]; then
+  export MOH_FPS_ADS="$FPS_ADS"
+  if [[ "$FPS_ADS" == "1" ]]; then export MOH_CAMERA_PATCH=1; fi
+fi
+
+if [[ -n "${MOH_CAMERA_PATCH:-}" || -n "${MOH_TIMING_PATCH:-}" ||
+      "$ENHANCED_GRAPHICS" == "1" || "$FPS_ADS" == "1" ]]; then
+  echo "MOH native enhancements: aspect=${ASPECT} fov=${FOV} weapon-fov=${WEAPON_FOV} fps=${FPS} enhanced=${ENHANCED_GRAPHICS} ads=${FPS_ADS}"
 fi
 
 PLATFORM_ARGS=()

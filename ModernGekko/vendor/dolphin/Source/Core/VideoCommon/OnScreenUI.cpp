@@ -421,6 +421,7 @@ void OnScreenUI::Finalize()
   auto& perf_metrics = Core::System::GetInstance().GetPerfMetrics();
   perf_metrics.DrawImGuiStats(m_backbuffer_scale);
   DrawDebugText();
+  MohPcLayer::UpdateFrame();
   MohPcLayer::DrawSettingsUI(m_backbuffer_scale);
   MohPcLayer::DrawDebugUI(m_backbuffer_scale);
   OSD::DrawMessages();

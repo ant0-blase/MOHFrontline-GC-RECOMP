@@ -263,12 +263,52 @@ def apply_gmfe69_generated_enhancements(generated: Path):
         (void)ctx->host_call(ctx, 0xFFFFF120u);
 """)
 
-    # The game's 2D shell/HUD transform is authored for 4:3.  Force a rebuild
-    # when the target aspect changes, then counter-scale the 2D matrix around
-    # its existing center translation so text/icons keep their proportions.
-    _inject_after_label(generated, "8001B690", """    moh_ui_prepare(ctx);
+    # CoD-style FPS ADS presentation.  UpdateWeaponTransforms has r30=this and
+    # the temporary viewmodel translation vector at guest stack+0x30 by this
+    # point. The host modifies only that temporary vector, never animation data.
+    _inject_after_label(generated, "800A8920", """    if (ctx->host_call)
+        (void)ctx->host_call(ctx, 0xFFFFF130u);
 """)
-    _inject_after_label(generated, "8001B7C8", """    moh_ui_matrix_override(ctx);
+
+    # GetCrosshairStatus is just lbz r3,0x215(r3); blr.  Let the host clear r3
+    # while fully ADS without bypassing or replacing the original HUD logic.
+    _inject_after_label(generated, "800DF23C", """    if (ctx->host_call)
+        (void)ctx->host_call(ctx, 0xFFFFF132u);
+""")
+
+    # Frontend IStudio/UIS.  Its authored coordinate space is native 640x480;
+    # apply only aspect compensation around 320,240.  HUD scale/safe-width are
+    # deliberately not applied to menus.
+    _inject_after_label(generated, "8008B6C8", """    moh_ui_begin(ctx);
+""")
+    _inject_after_label(generated, "8008B6D4", """    moh_ui_end(ctx);
+""")
+
+    # Gameplay HUD is a completely separate renderer: UserInterface::Draw
+    # submits 640x480 spritepolyvert arrays plus CFont text directly. Scope the
+    # draw so only gameplay HUD primitives receive HUD scale/safe-area changes.
+    _inject_after_label(generated, "800BEB24", """    moh_hud_begin(ctx);
+""")
+    _inject_after_label(generated, "800BEE20", """    moh_hud_end(ctx);
+""")
+
+    # Scale the actual transient HUD polygon vertices, then restore the source
+    # array after RenderList has consumed it. This changes both position and
+    # sprite size instead of merely moving a still-stretched sprite.
+    _inject_after_label(generated, "8008240C", """    moh_hud_poly_begin(ctx);
+""")
+    _inject_after_label(generated, "80082460", """    moh_hud_poly_end(ctx);
+""")
+
+    # CFont is independent of CMatrixStack.  UIS fonts inherit frontend scale;
+    # gameplay HUD fonts receive HUD scale and corrected 640x480 positions.
+    _inject_after_label(generated, "8007CB1C", """    moh_ui_font_scale_override(ctx);
+""")
+    _inject_after_label(generated, "8007CF50", """    moh_hud_text_position_override(ctx);
+""")
+    _inject_after_label(generated, "8007CDB0", """    moh_hud_centered_text_position_override(ctx);
+""")
+    _inject_after_label(generated, "8007CBB0", """    moh_hud_centered_text_position_override(ctx);
 """)
 
     # Arm high-rate VI only for actual in-level gameplay.  The shell/menu and
