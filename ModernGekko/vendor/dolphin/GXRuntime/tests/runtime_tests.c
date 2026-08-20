@@ -23,6 +23,7 @@
 #include "gxruntime/vi_clock.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -1395,6 +1396,175 @@ static void test_psq_quantized_paths(void) {
     cpu_free(&cpu);
 }
 
+typedef struct TestPsqQuantizedType {
+    u8 type;
+    u8 size;
+    s64 load_low;
+    s64 load_high;
+    s64 store_min;
+    s64 store_max;
+} TestPsqQuantizedType;
+
+static f64 reference_psq_dequant(s64 value, s32 scale) {
+    if (scale == 0)
+        return (f64)(f32)value;
+    return (f64)(f32)ldexp((f64)value, -scale);
+}
+
+static s64 reference_psq_quantize(f64 value, s64 min_value,
+                                  s64 max_value, s32 scale) {
+    const f32 conv = (f32)value * ldexpf(1.0f, scale);
+    if (isnan(conv))
+        return 0;
+    if (conv <= (f32)min_value)
+        return min_value;
+    if (conv >= (f32)max_value)
+        return max_value;
+    return (s64)conv;
+}
+
+static void write_psq_quantized_value(CPUState* cpu, u32 address,
+                                      u8 type, s64 value) {
+    switch (type) {
+    case 4:
+    case 6:
+        mem_write8(cpu, address, (u8)value);
+        break;
+    case 5:
+    case 7:
+        mem_write16(cpu, address, (u16)value);
+        break;
+    default:
+        assert(false);
+    }
+}
+
+static u32 read_psq_quantized_value(CPUState* cpu, u32 address, u8 type) {
+    switch (type) {
+    case 4:
+    case 6:
+        return mem_read8(cpu, address);
+    case 5:
+    case 7:
+        return mem_read16(cpu, address);
+    default:
+        assert(false);
+        return 0;
+    }
+}
+
+static u32 reference_psq_stored_value(const TestPsqQuantizedType* quant,
+                                      f64 value, s32 scale) {
+    const s64 result = reference_psq_quantize(
+        value, quant->store_min, quant->store_max, scale);
+    return quant->size == 1 ? (u8)result : (u16)result;
+}
+
+static void assert_psq_load_value(f64 actual, f64 expected, u8 type,
+                                  u32 encoded_scale, unsigned lane) {
+    if (f64_bits(actual) != f64_bits(expected)) {
+        fprintf(stderr,
+                "PSQ load mismatch: type=%u encoded_scale=%u lane=%u "
+                "actual=%016llx expected=%016llx\n",
+                type, encoded_scale, lane,
+                (unsigned long long)f64_bits(actual),
+                (unsigned long long)f64_bits(expected));
+    }
+    assert(f64_bits(actual) == f64_bits(expected));
+}
+
+static void assert_psq_store_value(u32 actual, u32 expected, u8 type,
+                                   u32 encoded_scale, unsigned test_case,
+                                   unsigned lane) {
+    if (actual != expected) {
+        fprintf(stderr,
+                "PSQ store mismatch: type=%u encoded_scale=%u case=%u "
+                "lane=%u actual=%04x expected=%04x\n",
+                type, encoded_scale, test_case, lane, actual, expected);
+    }
+    assert(actual == expected);
+}
+
+static void test_psq_all_quantized_scales(void) {
+    static const TestPsqQuantizedType quantized_types[] = {
+        {4, 1, 0, 255, 0, 255},
+        {5, 2, 0, 65535, 0, 65535},
+        {6, 1, -128, 127, -128, 127},
+        {7, 2, -32768, 32767, -32768, 32767},
+    };
+    const u32 address = GC_RAM_BASE + 0x180u;
+    CPUState cpu;
+    assert(cpu_init(&cpu));
+    cpu.hid2 = PPC_HID2_PSE | PPC_HID2_LSQE;
+
+    for (u32 encoded_scale = 0; encoded_scale < 64; ++encoded_scale) {
+        const s32 scale = sign_extend(encoded_scale, 6);
+
+        for (u32 type_index = 0;
+             type_index < sizeof(quantized_types) / sizeof(quantized_types[0]);
+             ++type_index) {
+            const TestPsqQuantizedType* quant = &quantized_types[type_index];
+            const u32 gqr = (encoded_scale << 24) |
+                            ((u32)quant->type << 16) |
+                            (encoded_scale << 8) | quant->type;
+            cpu.gqr[7] = gqr;
+            cpu.exception = 0;
+
+            write_psq_quantized_value(&cpu, address, quant->type,
+                                      quant->load_low);
+            write_psq_quantized_value(&cpu, address + quant->size,
+                                      quant->type, quant->load_high);
+            assert(ppc_psq_load(&cpu, 8, address, false, 7, false,
+                                0x80001000u));
+            assert(cpu.exception == 0);
+            assert_psq_load_value(
+                cpu.fpr[8], reference_psq_dequant(quant->load_low, scale),
+                quant->type, encoded_scale, 0);
+            assert_psq_load_value(
+                cpu.ps1[8], reference_psq_dequant(quant->load_high, scale),
+                quant->type, encoded_scale, 1);
+
+            const f64 finite_low = ldexp((f64)quant->store_min - 16.0, -scale);
+            const f64 finite_high = ldexp((f64)quant->store_max + 16.0, -scale);
+            const f64 store_cases[][2] = {
+                {ldexp(3.75, -scale), ldexp(7.25, -scale)},
+                {ldexp(-3.75, -scale), ldexp(-7.25, -scale)},
+                {finite_low, finite_high},
+                {NAN, INFINITY},
+                {-INFINITY, -0.0},
+            };
+
+            for (u32 test_case = 0;
+                 test_case < sizeof(store_cases) / sizeof(store_cases[0]);
+                 ++test_case) {
+                cpu.fpr[9] = store_cases[test_case][0];
+                cpu.ps1[9] = store_cases[test_case][1];
+                cpu.exception = 0;
+                mem_write32(&cpu, address, 0xA5A5A5A5u);
+
+                assert(ppc_psq_store(&cpu, 9, address, false, 7, false,
+                                     0x80001004u));
+                assert(cpu.exception == 0);
+
+                const u32 actual_low = read_psq_quantized_value(
+                    &cpu, address, quant->type);
+                const u32 actual_high = read_psq_quantized_value(
+                    &cpu, address + quant->size, quant->type);
+                const u32 expected_low = reference_psq_stored_value(
+                    quant, store_cases[test_case][0], scale);
+                const u32 expected_high = reference_psq_stored_value(
+                    quant, store_cases[test_case][1], scale);
+                assert_psq_store_value(actual_low, expected_low, quant->type,
+                                       encoded_scale, test_case, 0);
+                assert_psq_store_value(actual_high, expected_high, quant->type,
+                                       encoded_scale, test_case, 1);
+            }
+        }
+    }
+
+    cpu_free(&cpu);
+}
+
 static void test_platform_dispatch(void) {
     dol_platform_reset();
     g_guest_resolver_sets = 0;
@@ -2325,6 +2495,7 @@ int main(void) {
     test_dvd_fst();
     test_dvd_fst_edges();
     test_psq_quantized_paths();
+    test_psq_all_quantized_scales();
     test_platform_dispatch();
     test_event_clock();
     test_vi_clock();

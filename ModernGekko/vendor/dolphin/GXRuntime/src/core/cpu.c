@@ -166,6 +166,14 @@ static GXRUNTIME_ALWAYS_INLINE s32 gqr_scale(u32 value) {
     return sign_extend(value & 0x3Fu, 6);
 }
 
+/* GQR scales are signed six-bit values.  Their reciprocal load scale can be
+ * +32, so every factor used here is a normal, exactly representable f32.
+ * Constructing the IEEE-754 value directly keeps the PSQ movie/IDCT hot path
+ * out of libm without changing its rounding behavior. */
+static GXRUNTIME_ALWAYS_INLINE f32 psq_pow2(s32 exponent) {
+    return f32_value((u32)(exponent + 127) << 23);
+}
+
 
 static GXRUNTIME_ALWAYS_INLINE u32 psq_type_size(u8 type) {
     switch (type) {
@@ -191,7 +199,9 @@ static GXRUNTIME_ALWAYS_INLINE u32 psq_type_size(u8 type) {
 static GXRUNTIME_ALWAYS_INLINE f64 psq_dequant(f64 value, s32 scale) {
     if (scale == 0)
         return (f64)(f32)value;
-    return (f64)(f32)ldexp(value, -scale);
+    /* Quantized inputs are at most 16-bit integers and are therefore exact in
+     * f32 before this exact power-of-two multiply. */
+    return (f64)((f32)value * psq_pow2(-scale));
 }
 
 static GXRUNTIME_ALWAYS_INLINE f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
@@ -212,7 +222,7 @@ static GXRUNTIME_ALWAYS_INLINE f64 psq_load_value(CPUState* cpu, u32 ea, u8 type
 }
 
 static GXRUNTIME_ALWAYS_INLINE s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
-    f32 conv = (f32)value * ldexpf(1.0f, scale);
+    f32 conv = (f32)value * psq_pow2(scale);
     if (isnan(conv))
         return 0;
     if (conv <= (f32)min_value)
