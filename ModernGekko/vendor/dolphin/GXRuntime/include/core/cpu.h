@@ -360,6 +360,8 @@ void ppc_ps_res(CPUState* cpu, f64 a, f64 b, f64* result_a, f64* result_b);
 void ppc_ps_rsqrte(CPUState* cpu, f64 a, f64 b, f64* result_a, f64* result_b);
 bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
              bool subtract, bool negative, f64* output);
+bool ppc_fma_double_gmfe69_fast(CPUState* cpu, f64 a, f64 c, f64 b,
+                                  bool subtract, bool negative, f64* output);
 bool ppc_fctiw(CPUState* cpu, f64 value, bool toward_zero, u64* result);
 
 /* Instruction-shaped FP unit mirroring Dolphin's interpreter bit-exactly

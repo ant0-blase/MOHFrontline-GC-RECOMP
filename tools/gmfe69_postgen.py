@@ -892,6 +892,51 @@ def _patch_global_fctiwz_generated(generated: Path) -> tuple[int, int]:
 
 
 
+
+# MOH_GMFE69_FMA_DOUBLE_GLOBAL
+FMA_DOUBLE_GLOBAL_MARK = "MOH_GMFE69_FMA_DOUBLE_FAST_SITE"
+
+
+def _patch_global_fma_double_generated(generated: Path) -> tuple[int, int]:
+    """Route finite double-precision PPC FMA sites through the exact fast helper."""
+    chunks = Path(generated) / "chunks"
+    if not chunks.is_dir():
+        raise RuntimeError(f"GMFE69 double-FMA postgen: missing chunks directory: {chunks}")
+
+    pattern = re.compile(
+        r"ppc_fma\(\s*ctx\s*,\s*"
+        r"(ctx->fpr\[\d+\])\s*,\s*"
+        r"(ctx->fpr\[\d+\])\s*,\s*"
+        r"(ctx->fpr\[\d+\])\s*,\s*"
+        r"false\s*,\s*(true|false)\s*,\s*(true|false)\s*,\s*&result\s*\)"
+    )
+
+    total = 0
+    files = 0
+    for path in sorted(chunks.glob("*.c")):
+        text = path.read_text()
+        if FMA_DOUBLE_GLOBAL_MARK in text:
+            continue
+
+        def repl(match: re.Match[str]) -> str:
+            nonlocal total
+            total += 1
+            return (
+                "ppc_fma_double_gmfe69_fast(ctx, "
+                f"{match.group(1)}, {match.group(2)}, {match.group(3)}, "
+                f"{match.group(4)}, {match.group(5)}, &result) "
+                f"/* {FMA_DOUBLE_GLOBAL_MARK} */"
+            )
+
+        patched, count = pattern.subn(repl, text)
+        if count:
+            path.write_text(patched)
+            files += 1
+
+    print(f"  GMFE69 global double-FMA fastpath: {total} sites across {files} chunks")
+    return total, files
+
+
 # MOH_GMFE69_CSCREEN_WAIT_IDLE_BACKEDGE
 CSCREEN_WAIT_IDLE_MARK = "MOH_GMFE69_CSCREEN_WAIT_IDLE_BACKEDGE"
 CSCREEN_WAIT_PC = 0x8001B92C
@@ -963,6 +1008,11 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
     # Validated globally: inline the overwhelmingly-common MSR[FP] enabled case
     # in every generated chunk, preserving ppc_fp_available() as the exact slow path.
     _patch_global_fp_available(generated)
+
+    # perf: generic double PPC FMA still accounts for a measurable share of
+    # GMFE69 CPU time. Finite results use the exact hardware-FMA common path;
+    # NaN/Inf/exceptional cases fall back to ppc_fma().
+    _patch_global_fma_double_generated(generated)
 
     _patch_global_psq_pair_generated(generated)
 

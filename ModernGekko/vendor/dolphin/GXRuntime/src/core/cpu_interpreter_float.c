@@ -401,6 +401,40 @@ bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
 }
 
 
+/* MOH_GMFE69_FMA_DOUBLE_HELPER
+ * Exact common-path specialization for double-precision fmadd/fmsub/fnmadd/
+ * fnmsub. A finite host FMA result proves that none of the PPC NaN/Inf/FPSCR
+ * exceptional handling is needed; non-finite results fall back verbatim to
+ * ppc_fma().
+ */
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+__attribute__((target("fma")))
+#endif
+bool ppc_fma_double_gmfe69_fast(CPUState* cpu, f64 a, f64 c, f64 b,
+                                  bool subtract, bool negative, f64* output)
+{
+    const f64 addend = subtract ? -b : b;
+    f64 result = fma(a, c, addend);
+    const u64 bits = f64_bits(result);
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(
+            (bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull,
+            0))
+#else
+    if ((bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull)
+#endif
+        return ppc_fma(cpu, a, c, b, false, subtract, negative, output);
+
+    if (negative)
+        result = -result;
+
+    set_fprf(cpu, classify_f64(result));
+    *output = result;
+    return true;
+}
+
+
 /* MOH_GMFE69_FMADDS_HELPER
  *
  * Exact common-path specialization for the very hot GMFE69 particle fmadds
