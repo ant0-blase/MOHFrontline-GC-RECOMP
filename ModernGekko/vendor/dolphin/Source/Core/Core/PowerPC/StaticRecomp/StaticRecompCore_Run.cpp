@@ -34,7 +34,8 @@ void StaticRecompCore::Run()
   m_guest.ram_size = memory.GetRamSizeReal();
   m_guest.exram = memory.GetEXRAM();
   m_guest.exram_size = memory.GetExRamSizeReal();
-
+  m_l1_cache = memory.GetL1Cache();
+  m_l1_cache_size = memory.GetL1CacheSize();
 
   InitLookupTable(m_guest.ram_size, m_guest.exram_size);
 
@@ -160,8 +161,10 @@ void StaticRecompCore::Run()
           m_burst_tb_cycles += static_cast<u64>(charge > 0 ? charge : 1);
           m_guest.timebase = m_burst_tb_base + m_burst_tb_cycles / SystemTimers::TIMER_RATIO;
 
-          // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
+          // Idle-loop skipping. GMFE69 additionally uses CScreen::Wait as a
+          // high-frequency busy-wait, so allow a second game-specific target.
+          if ((m_idle_pc != 0 && m_guest.pc == m_idle_pc) ||
+              (m_idle_pc_secondary != 0 && m_guest.pc == m_idle_pc_secondary))
           {
             m_system.GetCoreTiming().Idle();
           }

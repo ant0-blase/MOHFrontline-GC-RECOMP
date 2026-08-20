@@ -446,54 +446,56 @@ bool CommandProcessorManager::IsInterruptWaiting() const
 
 void CommandProcessorManager::SetCPStatusFromGPU()
 {
-  // breakpoint
-  const bool breakpoint = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed);
-  if (m_fifo.bFF_BPEnable.load(std::memory_order_relaxed) != 0)
+  // Keep the CPU-owned breakpoint-enable flag on its dedicated control cache
+  // line (see SCPFifoStruct).  When breakpoints are disabled, publish a clear
+  // status directly instead of first reloading bFF_Breakpoint from another
+  // shared line.
+  const bool bp_enabled = m_fifo.bFF_BPEnable.load(std::memory_order_relaxed) != 0;
+  bool breakpoint = false;
+  if (bp_enabled)
   {
-    if (m_fifo.CPBreakpoint.load(std::memory_order_relaxed) ==
-        m_fifo.CPReadPointer.load(std::memory_order_relaxed))
+    breakpoint = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) != 0;
+    const u32 read_pointer = m_fifo.CPReadPointer.load(std::memory_order_relaxed);
+    if (m_fifo.CPBreakpoint.load(std::memory_order_relaxed) == read_pointer)
     {
       if (!breakpoint)
       {
-        DEBUG_LOG_FMT(COMMANDPROCESSOR, "Hit breakpoint at {}",
-                      m_fifo.CPReadPointer.load(std::memory_order_relaxed));
+        DEBUG_LOG_FMT(COMMANDPROCESSOR, "Hit breakpoint at {}", read_pointer);
+        breakpoint = true;
         m_fifo.bFF_Breakpoint.store(1, std::memory_order_relaxed);
       }
     }
-    else
+    else if (breakpoint)
     {
-      if (breakpoint)
-      {
-        DEBUG_LOG_FMT(COMMANDPROCESSOR, "Cleared breakpoint at {}",
-                      m_fifo.CPReadPointer.load(std::memory_order_relaxed));
-        m_fifo.bFF_Breakpoint.store(0, std::memory_order_relaxed);
-      }
+      DEBUG_LOG_FMT(COMMANDPROCESSOR, "Cleared breakpoint at {}", read_pointer);
+      breakpoint = false;
+      m_fifo.bFF_Breakpoint.store(0, std::memory_order_relaxed);
     }
   }
   else
   {
-    if (breakpoint)
-    {
-      DEBUG_LOG_FMT(COMMANDPROCESSOR, "Cleared breakpoint at {}",
-                    m_fifo.CPReadPointer.load(std::memory_order_relaxed));
-      m_fifo.bFF_Breakpoint = false;
-    }
+    // Disabled breakpoint state is architecturally clear.  This plain relaxed
+    // store remains on the GPU-owned status cache line and avoids two hot
+    // cross-line loads in the common GMFE69 path.
+    m_fifo.bFF_Breakpoint.store(0, std::memory_order_relaxed);
   }
 
-  // overflow & underflow check
-  m_fifo.bFF_HiWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > m_fifo.CPHiWatermark),
-      std::memory_order_relaxed);
-  m_fifo.bFF_LoWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) < m_fifo.CPLoWatermark),
-      std::memory_order_relaxed);
+  // overflow & underflow check. Take one coherent relaxed snapshot and reuse
+  // the values we just published instead of reloading the same atomics. This
+  // path runs once per FIFO step and showed up prominently in perf.
+  const u32 distance = m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+  const bool hi_watermark = distance > m_fifo.CPHiWatermark;
+  const bool lo_watermark = distance < m_fifo.CPLoWatermark;
+  m_fifo.bFF_HiWatermark.store(hi_watermark, std::memory_order_relaxed);
+  m_fifo.bFF_LoWatermark.store(lo_watermark, std::memory_order_relaxed);
 
-  bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
-               m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
-  bool ovfInt = m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) &&
-                m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed);
-  bool undfInt = m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed) &&
-                 m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed);
+  // Reuse the breakpoint value already computed above.  The old code loaded
+  // bFF_Breakpoint again after publishing it.
+  const bool bpInt = breakpoint && m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
+  const bool ovfInt = hi_watermark &&
+                      m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed);
+  const bool undfInt = lo_watermark &&
+                       m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed);
 
   bool interrupt = (bpInt || ovfInt || undfInt) && m_cp_ctrl_reg.GPReadEnable;
 
@@ -518,20 +520,21 @@ void CommandProcessorManager::SetCPStatusFromGPU()
 
 void CommandProcessorManager::SetCPStatusFromCPU()
 {
-  // overflow & underflow check
-  m_fifo.bFF_HiWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > m_fifo.CPHiWatermark),
-      std::memory_order_relaxed);
-  m_fifo.bFF_LoWatermark.store(
-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) < m_fifo.CPLoWatermark),
-      std::memory_order_relaxed);
+  // overflow & underflow check. Take one coherent relaxed snapshot and reuse
+  // the values we just published instead of reloading the same atomics. This
+  // path runs once per FIFO step and showed up prominently in perf.
+  const u32 distance = m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+  const bool hi_watermark = distance > m_fifo.CPHiWatermark;
+  const bool lo_watermark = distance < m_fifo.CPLoWatermark;
+  m_fifo.bFF_HiWatermark.store(hi_watermark, std::memory_order_relaxed);
+  m_fifo.bFF_LoWatermark.store(lo_watermark, std::memory_order_relaxed);
 
-  bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
-               m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
-  bool ovfInt = m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) &&
-                m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed);
-  bool undfInt = m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed) &&
-                 m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed);
+  const bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
+                     m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
+  const bool ovfInt = hi_watermark &&
+                      m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed);
+  const bool undfInt = lo_watermark &&
+                       m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed);
 
   bool interrupt = (bpInt || ovfInt || undfInt) && m_cp_ctrl_reg.GPReadEnable;
 

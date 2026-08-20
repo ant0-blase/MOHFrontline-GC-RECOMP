@@ -481,6 +481,38 @@ def write_tables(work: Path, images: list[ImageBuild], entry_point: int):
             f.write(f"    {{0x{a:08X}u, 0x{b:08X}u}},\n")
         f.write("};\n")
         f.write(f"#define MODULE_CHUNK_RANGE_COUNT {len(canonical)}u\n")
+
+        # Fast page hint table for the native dispatcher. The table stores the
+        # first canonical chunk that overlaps each 4 KiB guest page. The C
+        # lookup then checks only the one or two chunk boundaries that can
+        # share that page instead of binary-searching the whole table.
+        page_shift = 12
+        page_size = 1 << page_shift
+        page_base = canonical[0][0] & ~(page_size - 1)
+        page_end = (canonical[-1][1] + page_size - 1) & ~(page_size - 1)
+        page_count = (page_end - page_base) >> page_shift
+        page_hints = []
+        chunk_i = 0
+        for page in range(page_count):
+            start = page_base + page * page_size
+            end = start + page_size
+            while chunk_i < len(canonical) and canonical[chunk_i][1] <= start:
+                chunk_i += 1
+            if chunk_i < len(canonical) and canonical[chunk_i][0] < end:
+                page_hints.append(chunk_i)
+            else:
+                page_hints.append(0xFFFF)
+
+        f.write(f"#define MULTI_CHUNK_PAGE_SHIFT {page_shift}u\n")
+        f.write(f"#define MULTI_CHUNK_PAGE_BASE 0x{page_base:08X}u\n")
+        f.write(f"#define MULTI_CHUNK_PAGE_COUNT {page_count}u\n")
+        f.write("#define MULTI_CHUNK_PAGE_INVALID 0xFFFFu\n")
+        f.write("static const u16 s_chunk_page_hint[] = {\n")
+        for i in range(0, len(page_hints), 16):
+            row = page_hints[i:i + 16]
+            f.write("    " + ", ".join(f"{x}u" for x in row) + ",\n")
+        f.write("};\n")
+
         # Zero hashes are intentional: ABI v5 select_chunk_variant validates
         # against the complete accepted-hash table below instead.
         f.write("static const u64 s_chunk_hashes[] = {\n")
@@ -525,12 +557,17 @@ def write_export(work: Path, images: list[ImageBuild]):
         '''    for (u32 i = 0; i < MODULE_CHUNK_RANGE_COUNT; ++i) s_active_image[i] = MULTI_INVALID_IMAGE;\n'''
         '''    s_initialized = 1;\n}\n\n'''
         '''static int multi_chunk_index(u32 address)\n{\n'''
-        '''    u32 lo = 0u, hi = MODULE_CHUNK_RANGE_COUNT;\n'''
-        '''    while (lo < hi) {\n'''
-        '''        u32 mid = lo + (hi - lo) / 2u;\n'''
-        '''        if (address < s_chunk_ranges[mid].start) hi = mid;\n'''
-        '''        else if (address >= s_chunk_ranges[mid].end) lo = mid + 1u;\n'''
-        '''        else return (int)mid;\n'''
+        '''    const u32 delta = address - MULTI_CHUNK_PAGE_BASE;\n'''
+        '''    const u32 page = delta >> MULTI_CHUNK_PAGE_SHIFT;\n'''
+        '''    if (page >= MULTI_CHUNK_PAGE_COUNT) return -1;\n'''
+        '''    u32 chunk = s_chunk_page_hint[page];\n'''
+        '''    if (chunk == MULTI_CHUNK_PAGE_INVALID) return -1;\n'''
+        '''    /* A page can straddle a generated chunk boundary (or one of\n'''
+        '''     * the tiny overlap splits). Start from its first candidate and\n'''
+        '''     * walk only until the range start passes the requested PC. */\n'''
+        '''    for (; chunk < MODULE_CHUNK_RANGE_COUNT; ++chunk) {\n'''
+        '''        if (address < s_chunk_ranges[chunk].start) break;\n'''
+        '''        if (address < s_chunk_ranges[chunk].end) return (int)chunk;\n'''
         '''    }\n'''
         '''    return -1;\n}\n\n'''
         '''static int multi_select_chunk_variant(u32 chunk_index, u64 runtime_hash)\n{\n'''

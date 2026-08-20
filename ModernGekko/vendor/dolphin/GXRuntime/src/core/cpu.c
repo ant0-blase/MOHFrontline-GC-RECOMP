@@ -22,12 +22,14 @@
  * NULL and zero-cost unless installed; the chassis resolves the setter by name
  * via dlsym, so its absence simply disables lockstep. `offset` is the RAM byte
  * offset (into cpu->ram) about to be written, `size` the width in bytes. */
+#if defined(GXRUNTIME_ENABLE_MEM_JOURNAL)
 PPCMemWriteJournal g_mem_write_journal = NULL;
 void* g_mem_write_journal_user = NULL;
 __attribute__((visibility("default"))) void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
     g_mem_write_journal = fn;
     g_mem_write_journal_user = user;
 }
+#endif
 
 bool cpu_init(CPUState* cpu) {
     memset(cpu, 0, sizeof(*cpu));
@@ -451,13 +453,11 @@ bool ppc_psq_store0_pair_gmfe69_fast(
 
         /* Preserve mem_write32 ordering and side effects lane-by-lane. */
         clear_matching_reservation(cpu, ea);
-        if (g_mem_write_journal && offset != (u32)-1)
-            g_mem_write_journal(offset, 4u, g_mem_write_journal_user);
+        GXRUNTIME_JOURNAL_WRITE(offset, 4u);
         write_be32(ptr, ps0);
 
         clear_matching_reservation(cpu, ea + 4u);
-        if (g_mem_write_journal && offset != (u32)-1)
-            g_mem_write_journal(offset + 4u, 4u, g_mem_write_journal_user);
+        GXRUNTIME_JOURNAL_WRITE(offset + 4u, 4u);
         write_be32(ptr + 4u, ps1);
 
         return true;

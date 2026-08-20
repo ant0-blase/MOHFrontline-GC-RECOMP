@@ -257,6 +257,17 @@ bool c_function_cfg_build(CFunctionCFG* cfg, const PPCInst* insts, u32 count,
         }
     }
 
+    /*
+     * HPCOS CPU optimization: avoid materializing ctx->pc before instructions
+     * whose implementation cannot fault or escape through an external helper.
+     * This removes a store from the hot generated-code path across the whole
+     * function instead of limiting the optimization to direct loops.
+     */
+    for (u32 i = 0; i < count; ++i) {
+        if (!insts[i].embedded_data && instruction_is_pc_transparent(&insts[i]))
+            cfg->materialize_pc[i] = 0;
+    }
+
     for (u32 last = 0; last < count; ++last) {
         if (!c_function_cfg_can_loop_directly(cfg, insts, function_address,
                                               last)) {
@@ -264,10 +275,6 @@ bool c_function_cfg_build(CFunctionCFG* cfg, const PPCInst* insts, u32 count,
         }
         u32 first =
             (insts[last].branch_target - function_address) / 4u;
-        for (u32 i = first; i <= last; ++i) {
-            if (instruction_is_pc_transparent(&insts[i]))
-                cfg->materialize_pc[i] = 0;
-        }
 
         bool straight_line = true;
         bool outlinable = true;

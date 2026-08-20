@@ -37,15 +37,21 @@ struct SCPFifoStruct
   std::atomic<u32> CPBreakpoint = 0;
   std::atomic<u32> SafeCPReadPointer = 0;
 
-  std::atomic<u32> bFF_GPLinkEnable = 0;
+  // CPU-written control bits are read constantly by the GPU thread. Keep
+  // them away from CPReadWriteDistance/read/write pointers, which bounce
+  // between CPU and GPU on every FIFO step. perf on GMFE69 showed the
+  // bFF_BPEnable load alone consuming ~20% of SetCPStatusFromGPU due to
+  // false sharing with that first cache line.
+  alignas(64) std::atomic<u32> bFF_GPLinkEnable = 0;
   std::atomic<u32> bFF_GPReadEnable = 0;
   std::atomic<u32> bFF_BPEnable = 0;
   std::atomic<u32> bFF_BPInt = 0;
-  std::atomic<u32> bFF_Breakpoint = 0;
-
   std::atomic<u32> bFF_LoWatermarkInt = 0;
   std::atomic<u32> bFF_HiWatermarkInt = 0;
 
+  // GPU-written status bits get their own line as well, so publishing FIFO
+  // state does not invalidate the stable control line above.
+  alignas(64) std::atomic<u32> bFF_Breakpoint = 0;
   std::atomic<u32> bFF_LoWatermark = 0;
   std::atomic<u32> bFF_HiWatermark = 0;
 

@@ -22,6 +22,23 @@ MODULE_OPT_LEVEL="${MODULE_OPT_LEVEL:-3}"
 TOOLCHAIN="${TOOLCHAIN:-auto}"
 RUNTIME_X11="${RUNTIME_X11:-OFF}"
 
+# HPCOS-derived CPU profiles. `modern` stays portable across recent x86-64
+# hosts; `native` is the maximum-performance local build.
+MOH_PROFILE="${MOH_PROFILE:-modern}"
+case "$MOH_PROFILE" in
+  native)   MOH_MARCH_DEFAULT=native    ; MOH_RUNTIME_LTO_DEFAULT=ON  ; MOH_MEM_JOURNAL_DEFAULT=OFF ; MOH_SSP_DEFAULT=OFF ;;
+  modern)   MOH_MARCH_DEFAULT=x86-64-v3 ; MOH_RUNTIME_LTO_DEFAULT=OFF ; MOH_MEM_JOURNAL_DEFAULT=OFF ; MOH_SSP_DEFAULT=OFF ;;
+  compat)   MOH_MARCH_DEFAULT=x86-64-v2 ; MOH_RUNTIME_LTO_DEFAULT=OFF ; MOH_MEM_JOURNAL_DEFAULT=OFF ; MOH_SSP_DEFAULT=OFF ;;
+  baseline) MOH_MARCH_DEFAULT=none      ; MOH_RUNTIME_LTO_DEFAULT=OFF ; MOH_MEM_JOURNAL_DEFAULT=OFF ; MOH_SSP_DEFAULT=OFF ;;
+  lockstep) MOH_MARCH_DEFAULT=x86-64-v3 ; MOH_RUNTIME_LTO_DEFAULT=OFF ; MOH_MEM_JOURNAL_DEFAULT=ON  ; MOH_SSP_DEFAULT=ON  ;;
+  *) echo "error: MOH_PROFILE must be native, modern, compat, baseline, or lockstep" >&2; exit 2 ;;
+esac
+MOH_MARCH="${MOH_MARCH:-$MOH_MARCH_DEFAULT}"
+MOH_RUNTIME_LTO="${MOH_RUNTIME_LTO:-$MOH_RUNTIME_LTO_DEFAULT}"
+MOH_MODULE_MEM_JOURNAL="${MOH_MODULE_MEM_JOURNAL:-$MOH_MEM_JOURNAL_DEFAULT}"
+MOH_MODULE_STACK_PROTECTOR="${MOH_MODULE_STACK_PROTECTOR:-$MOH_SSP_DEFAULT}"
+MOH_MODULE_IPO="${MOH_MODULE_IPO:-ON}"
+
 fail() {
   echo "error: $*" >&2
   exit 1
@@ -183,12 +200,22 @@ echo "    toolchain:    $TOOLCHAIN"
 echo "    module opt:   O$MODULE_OPT_LEVEL"
 echo "    jobs:         $JOBS"
 echo "    X11 runtime:  $RUNTIME_X11"
+echo "    CPU profile:  $MOH_PROFILE (march=$MOH_MARCH runtime-lto=$MOH_RUNTIME_LTO module-ipo=$MOH_MODULE_IPO)"
+
+if [[ "$MOH_MARCH" == "none" ]]; then
+  RUNTIME_ARCH_FLAGS="-ffp-contract=off"
+else
+  RUNTIME_ARCH_FLAGS="-march=$MOH_MARCH -ffp-contract=off"
+fi
 
 # Reconfigure with the exact extracted DOL hash. The resulting runtime will
 # reject a different revision instead of accidentally loading the wrong native
 # module against it.
 cmake -S "$SOURCE" -B "$RUNTIME_BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS="$RUNTIME_ARCH_FLAGS" \
+  -DCMAKE_CXX_FLAGS="$RUNTIME_ARCH_FLAGS" \
+  -DENABLE_LTO="$MOH_RUNTIME_LTO" \
   -DBUILD_TESTING=OFF \
   -DMODERNGEKKO_REQUIRED_DISC_ID="$GAME_ID" \
   -DMODERNGEKKO_REQUIRED_DOL_SHA256="$ACTUAL_DOL_SHA256" \
@@ -215,7 +242,11 @@ mkdir -p "$MULTI_WORK"
   --jobs "$JOBS" \
   --backend "$BACKEND" \
   --compiler "$TOOLCHAIN" \
-  --opt-level "$MODULE_OPT_LEVEL"
+  --opt-level "$MODULE_OPT_LEVEL" \
+  --cmake-define "RECOMPCORE_MODULE_MARCH=$MOH_MARCH" \
+  --cmake-define "RECOMPCORE_MODULE_ENABLE_IPO=$MOH_MODULE_IPO" \
+  --cmake-define "RECOMPCORE_MODULE_ENABLE_MEM_JOURNAL=$MOH_MODULE_MEM_JOURNAL" \
+  --cmake-define "RECOMPCORE_MODULE_STACK_PROTECTOR=$MOH_MODULE_STACK_PROTECTOR"
 [[ -f "$BUILT_MODULE" ]] || fail "multi-image module build did not produce $BUILT_MODULE"
 MULTI_REPORT="$MULTI_WORK/work/multi-image-report.json"
 MULTI_SYMBOLS="$MULTI_WORK/work/symbols"

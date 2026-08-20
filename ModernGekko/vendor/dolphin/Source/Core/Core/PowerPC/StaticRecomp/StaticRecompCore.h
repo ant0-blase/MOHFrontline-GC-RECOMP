@@ -147,6 +147,11 @@ private:
 
   std::unique_ptr<StaticRecompLockstep::StaticRecompLockstepVerifier> m_lockstep_verifier;
 
+  // Locked-L1 mapping is stable for the emulation session; cache it so PSQ
+  // scratch accesses do not call System::GetMemory() on every byte/word.
+  u8* m_l1_cache = nullptr;
+  u32 m_l1_cache_size = 0;
+
   EmptyBlockCache m_block_cache{*this};
 
   CPUState m_guest{};
@@ -207,6 +212,7 @@ private:
   mutable u32 m_last_chunk_index = 0;
 
   u32 m_idle_pc = 0;
+  u32 m_idle_pc_secondary = 0;
   u32 m_native_cycle_quantum = 256;
   bool m_native_burst_enabled = false;
 };

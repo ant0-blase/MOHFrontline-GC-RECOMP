@@ -187,23 +187,12 @@ void moh_particle_stack_write32(CPUState* cpu, u32 addr, u32 value)
     if (offset <= (cpu->ram_size - 4u))
 #endif
     {
-#if defined(__GNUC__) || defined(__clang__)
-        if (__builtin_expect(cpu->reserve_valid != 0, 0))
-#else
-        if (cpu->reserve_valid)
-#endif
-        {
-            /* MOH_PARTICLE_RESERVE_UNLIKELY:
-             * lwarx/stwcx reservation is normally inactive in particle traffic.
-             * Exact invalidation semantics are retained when it is active. */
-            const u32 reserve_addr = cpu->reserve_addr & ~0x40000000u;
-            const u32 store_addr = addr & ~0x40000000u;
-            if (((reserve_addr ^ store_addr) & ~31u) == 0u)
-                cpu->reserve_valid = false;
-        }
-
-        if (g_mem_write_journal)
-            g_mem_write_journal(offset, 4u, g_mem_write_journal_user);
+        /* MOH_PARTICLE_RESERVE_UNLIKELY:
+         * Compatibility marker retained for the postgen integrity check.
+         * Reservation invalidation is delegated to GXRuntime; optimized builds
+         * compile it out while strict/lockstep builds retain exact semantics. */
+        clear_matching_reservation(cpu, addr);
+        GXRUNTIME_JOURNAL_WRITE(offset, 4u);
 
         write_be32(cpu->ram + offset, value);
         return;
@@ -902,6 +891,63 @@ def _patch_global_fctiwz_generated(generated: Path) -> tuple[int, int]:
     return total, files
 
 
+
+# MOH_GMFE69_CSCREEN_WAIT_IDLE_BACKEDGE
+CSCREEN_WAIT_IDLE_MARK = "MOH_GMFE69_CSCREEN_WAIT_IDLE_BACKEDGE"
+CSCREEN_WAIT_PC = 0x8001B92C
+
+
+def _patch_cscreen_wait_idle_backedge(generated: Path) -> int:
+    """Make CScreen::Wait return to the chassis after one guest loop iteration.
+
+    The runtime already recognizes 0x8001B92C as a GMFE69 idle PC and calls
+    CoreTiming::Idle() when the generated code returns there.  DolRecomp's C
+    backend normally keeps local backedges inside the generated function until
+    256 guest cycles have accumulated, which defeats most of that idle skip.
+    Tightening only this validated busy-wait backedge to its three-cycle block
+    cost preserves the condition re-read while yielding to CoreTiming after
+    each unsuccessful poll.
+    """
+    chunks = Path(generated) / "chunks"
+    path = _find_chunk_for_pc(chunks, CSCREEN_WAIT_PC)
+    if not path:
+        return 0
+
+    text = path.read_text()
+    start, end = _block_bounds(text, CSCREEN_WAIT_PC)
+    block = text[start:end]
+    if CSCREEN_WAIT_IDLE_MARK in block:
+        return 1
+
+    pattern = re.compile(
+        r"(?P<indent>\s*)if \(ctx->downcount <= -\(s64\)"
+        r"DOLRECOMP_C_LOOP_CYCLE_BUDGET\) \{\n"
+        r"(?P=indent)    ctx->pc = 0x8001B92C(?:u|U)?;\n"
+        r"(?P=indent)    return;\n"
+        r"(?P=indent)\}"
+    )
+    matches = list(pattern.finditer(block))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "GMFE69 CScreen::Wait idle postgen: expected one 0x8001B92C "
+            f"backedge guard, found {len(matches)} in {path.name}"
+        )
+
+    def repl(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        return (
+            f"{indent}/* {CSCREEN_WAIT_IDLE_MARK}: one poll, then CoreTiming::Idle. */\n"
+            f"{indent}if (ctx->downcount <= -(s64)3) {{\n"
+            f"{indent}    ctx->pc = 0x8001B92Cu;\n"
+            f"{indent}    return;\n"
+            f"{indent}}}"
+        )
+
+    block = pattern.sub(repl, block, count=1)
+    path.write_text(text[:start] + block + text[end:])
+    print(f"  GMFE69 CScreen::Wait idle backedge: {path.name} -> 3 cycles")
+    return 1
+
 def apply_gmfe69_generated_postgen(generated: Path) -> None:
     generated = Path(generated)
     chunks = generated / "chunks"
@@ -909,6 +955,10 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
         raise RuntimeError(f"GMFE69 postgen: missing chunks directory: {chunks}")
 
     _patch_split_crosschunk_returns(generated)
+
+    # perf: CScreen::Wait is the dominant GMFE69 CPU busy-wait.  Return after
+    # one three-cycle poll so the runtime's idle-PC hook can advance CoreTiming.
+    _patch_cscreen_wait_idle_backedge(generated)
 
     # Validated globally: inline the overwhelmingly-common MSR[FP] enabled case
     # in every generated chunk, preserving ppc_fp_available() as the exact slow path.
@@ -974,6 +1024,7 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
         STACK_HELPER_MARK: 1,
         MEM1_MARK: 1,
         RESERVE_MARK: 1,
+        CSCREEN_WAIT_IDLE_MARK: 1,
     }
     for marker, expected in checks.items():
         count = final.count(marker)

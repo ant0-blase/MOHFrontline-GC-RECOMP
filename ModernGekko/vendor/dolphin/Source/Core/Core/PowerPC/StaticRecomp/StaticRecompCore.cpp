@@ -181,14 +181,20 @@ void StaticRecompCore::Init()
 
   LoadModule();
   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
+  m_idle_pc_secondary = 0;
 
-  // Medal of Honor: Frontline (GMFE69) idle loop.
+  // Medal of Honor: Frontline (GMFE69) has two hot wait loops. SelectThread is
+  // the original scheduler idle target; CScreen::Wait was identified by perf
+  // as a guest busy-wait that repeatedly returns at 0x8001B92C when its local
+  // cycle budget expires. Let CoreTiming skip the remainder of the slice for
+  // either loop instead of burning host CPU polling the same condition.
   if (m_module && std::strncmp(m_module->game_id, "GMFE69", 6) == 0)
   {
     m_idle_pc = 0x80115F64u;
+    m_idle_pc_secondary = 0x8001B92Cu;
     std::fprintf(stderr,
-                 "[staticrecomp] GMFE69 built-in idle PC override = %08x\n",
-                 m_idle_pc);
+                 "[staticrecomp] GMFE69 built-in idle PCs = %08x, %08x\n",
+                 m_idle_pc, m_idle_pc_secondary);
   }
 
   m_native_cycle_quantum = std::clamp(
@@ -203,8 +209,8 @@ void StaticRecompCore::Init()
        std::strcmp(native_burst, "on") == 0);
 
   std::fprintf(stderr,
-               "[staticrecomp] idle PC = %08x, native quantum = %u cycles, native burst = %s\n",
-               m_idle_pc, m_native_cycle_quantum,
+               "[staticrecomp] idle PCs = %08x/%08x, native quantum = %u cycles, native burst = %s\n",
+               m_idle_pc, m_idle_pc_secondary, m_native_cycle_quantum,
                m_native_burst_enabled ? "on" : "off");
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
