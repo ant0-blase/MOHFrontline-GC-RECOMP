@@ -188,6 +188,43 @@ struct ModManager::Impl {
   static constexpr std::size_t DISPATCH_CACHE_SIZE = 256;
   static_assert((DISPATCH_CACHE_SIZE & (DISPATCH_CACHE_SIZE - 1)) == 0);
 
+  // Fast negative filter for the StaticRecomp host-call probe.
+  //
+  // dolrecomp_call() asks ctx->host_call() before entering every generated
+  // native block.  The overwhelming majority of GMFE69 PCs have no mod hook
+  // or patch at all, but sending those misses through ModManager::HostCall()
+  // and Dispatch() still pays their comparatively large C++ prologues and
+  // lookup machinery.  Keep one bit per 4 KiB MEM1 page containing at least
+  // one static hook/patch so the chassis can reject empty pages cheaply.
+  //
+  // Addresses outside canonical MEM1 deliberately stay conservative and use
+  // the exact maps.  Pending return hooks are handled separately because the
+  // return PC itself need not live on a page containing a static hook.
+  static constexpr std::uint32_t MEM1_DISPATCH_BASE = 0x80000000u;
+  static constexpr std::uint32_t MEM1_DISPATCH_END = 0x81800000u;
+  static constexpr std::uint32_t HOST_CALL_PAGE_SHIFT = 12u;
+  static constexpr std::size_t HOST_CALL_PAGE_COUNT =
+      (MEM1_DISPATCH_END - MEM1_DISPATCH_BASE) >> HOST_CALL_PAGE_SHIFT;
+  static constexpr std::size_t HOST_CALL_PAGE_WORDS =
+      (HOST_CALL_PAGE_COUNT + 63u) / 64u;
+
+  void MarkHostCallPage(std::uint32_t address) {
+    if (address < MEM1_DISPATCH_BASE || address >= MEM1_DISPATCH_END)
+      return;
+    const std::size_t page =
+        (address - MEM1_DISPATCH_BASE) >> HOST_CALL_PAGE_SHIFT;
+    host_call_pages[page >> 6u] |= std::uint64_t{1} << (page & 63u);
+  }
+
+  bool HostCallPageMayContain(std::uint32_t address) const {
+    if (address < MEM1_DISPATCH_BASE || address >= MEM1_DISPATCH_END)
+      return true;
+    const std::size_t page =
+        (address - MEM1_DISPATCH_BASE) >> HOST_CALL_PAGE_SHIFT;
+    return (host_call_pages[page >> 6u] &
+            (std::uint64_t{1} << (page & 63u))) != 0;
+  }
+
   std::vector<std::unique_ptr<Mod>> mods;
   std::vector<LoadedModInfo> loaded;
   std::unordered_map<std::string, Mod *> mods_by_id;
@@ -199,6 +236,7 @@ struct ModManager::Impl {
   std::vector<ModernGekkoModFunction *> import_slots;
   std::vector<PendingReturn> pending_returns;
   std::array<DispatchCacheEntry, DISPATCH_CACHE_SIZE> dispatch_cache{};
+  std::array<std::uint64_t, HOST_CALL_PAGE_WORDS> host_call_pages{};
   bool runtime_started = false;
   ModernGekkoModHostApi host_api{};
 
@@ -527,6 +565,14 @@ ModLoadReport ModManager::Load(const std::vector<ModSource> &sources,
     return report;
   }
 
+  // Hooks and patches are immutable after Load().  Build the compact MEM1
+  // negative filter once, outside the native execution hot path.
+  m_impl->host_call_pages.fill(0);
+  for (const auto &entry : m_impl->patches)
+    m_impl->MarkHostCallPage(entry.first);
+  for (const auto &entry : m_impl->hooks)
+    m_impl->MarkHostCallPage(entry.first);
+
   for (const auto &mod : m_impl->mods) {
     const auto *desc = mod->descriptor;
     m_impl->loaded.push_back(
@@ -616,6 +662,7 @@ void ModManager::Unload() {
   m_impl->pending_returns.clear();
   m_impl->callbacks.clear();
   m_impl->dispatch_cache = {};
+  m_impl->host_call_pages.fill(0);
   m_impl->hooks.clear();
   m_impl->patches.clear();
   m_impl->exports.clear();
@@ -715,12 +762,20 @@ const std::vector<LoadedModInfo> &ModManager::GetLoadedMods() const {
 }
 
 bool ModManager::HandlesAddress(std::uint32_t address) const {
-  if (m_impl->patches.contains(address) || m_impl->hooks.contains(address))
+  // Dynamic return hooks must win over the static page filter: their return PC
+  // can be anywhere, including a page with no registered entry hook/patch.
+  if (!m_impl->pending_returns.empty() &&
+      std::ranges::any_of(m_impl->pending_returns,
+                          [address](const Impl::PendingReturn &pending) {
+                            return pending.address == address;
+                          }))
     return true;
-  return std::ranges::any_of(m_impl->pending_returns,
-                             [address](const Impl::PendingReturn &pending) {
-                               return pending.address == address;
-                             });
+
+  // Common GMFE69 path: one cached bitmap load instead of two unordered_map
+  // probes.  Exact lookup is retained for the relatively few candidate pages.
+  if (!m_impl->HostCallPageMayContain(address))
+    return false;
+  return m_impl->patches.contains(address) || m_impl->hooks.contains(address);
 }
 
 bool ModManager::HandlesRange(std::uint32_t start, std::uint32_t end) const {

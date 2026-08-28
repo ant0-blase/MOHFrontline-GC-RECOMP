@@ -165,6 +165,7 @@ void StaticRecompCore::Init()
   m_block_cache.Init();
 
   m_guest = CPUState{};
+  m_host_call_filter_armed = false;
   m_guest.external_read = HookExternalRead;
   m_guest.external_write = HookExternalWrite;
   m_guest.external_read32 = HookExternalRead32;

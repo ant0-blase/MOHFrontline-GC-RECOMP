@@ -22,8 +22,47 @@ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
 bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
-  return core->m_module_source.host_call &&
-         core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
+  if (!core->m_module_source.host_call)
+    return false;
+
+  // The generated C dispatcher probes ctx->host_call for every native block.
+  // Once ModManager has received the first ordinary guest-code probe (which
+  // preserves its one-shot runtime_start callback), reject addresses that the
+  // immutable hook/patch tables say cannot possibly be handled.  This keeps
+  // the hot negative path out of ModManager::HostCall/Dispatch entirely.
+  //
+  // Explicit MOH PC-layer control tokens live at 0xFFFFF1xx and therefore do
+  // not take this filter; mouse/ADS/VP6/VI host calls retain their exact path.
+  const bool physical_ram = address < cpu->ram_size;
+  const bool canonical_ram =
+      address >= 0x80000000u &&
+      static_cast<u64>(address - 0x80000000u) < cpu->ram_size;
+  const bool normal_guest_code = physical_ram || canonical_ram;
+
+  if (core->m_host_call_filter_armed && normal_guest_code &&
+      core->m_module_source.host_call_contains)
+  {
+    bool may_handle = core->m_module_source.host_call_contains(
+        address, core->m_module_source.host_call_user);
+    if (!may_handle && physical_ram)
+    {
+      may_handle = core->m_module_source.host_call_contains(
+          address | 0x80000000u, core->m_module_source.host_call_user);
+    }
+    if (!may_handle)
+      return false;
+  }
+
+  const bool handled = core->m_module_source.host_call(
+      cpu, address, core->m_module_source.host_call_user);
+
+  // Do not arm on an explicit 0xFFFFF1xx PC-layer token: those are handled
+  // before ModManager::Dispatch and therefore do not fire runtime_start.
+  // The first normal generated-code probe is intentionally allowed through.
+  if (normal_guest_code)
+    core->m_host_call_filter_armed = true;
+
+  return handled;
 }
 
 u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)

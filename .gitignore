@@ -50,6 +50,7 @@ perf.data.*
 *.core
 /core
 /core.*
+/perf-moh-*
 
 # Local inspection output
 /unknown-opcodes*.csv

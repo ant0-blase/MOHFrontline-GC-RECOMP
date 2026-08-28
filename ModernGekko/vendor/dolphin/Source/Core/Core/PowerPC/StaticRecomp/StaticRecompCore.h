@@ -161,6 +161,7 @@ private:
   bool m_module_active = false;
   u32 m_host_call_passthrough_pc = 0;
   bool m_host_call_passthrough = false;
+  bool m_host_call_filter_armed = false;
   std::unique_ptr<JitBase> m_fallback_jit;
 
   u64 m_native_dispatches = 0;
