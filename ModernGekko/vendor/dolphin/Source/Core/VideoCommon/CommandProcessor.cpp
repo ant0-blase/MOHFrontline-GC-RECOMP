@@ -338,8 +338,6 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
 
 void CommandProcessorManager::GatherPipeBursted()
 {
-  SetCPStatusFromCPU();
-
   auto& processor_interface = m_system.GetProcessorInterface();
 
   // if we aren't linked, we don't care about gather pipe data
@@ -389,8 +387,23 @@ void CommandProcessorManager::GatherPipeBursted()
   // from every gather-pipe burst while preserving the old pre-increment test.
   const u32 distance_before_burst =
       m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
+  const u32 distance_after_burst = distance_before_burst + GPFifo::GATHER_PIPE_SIZE;
+
   if (distance_before_burst > m_fifo.CPHiWatermark)
     m_system.GetCoreTiming().ForceExceptionCheck(0);
+
+  // CP interrupt state can only change when a FIFO watermark is crossed.
+  // SetCPStatusFromCPU used to run for every 32-byte gather burst, even when
+  // the distance remained on the same side of both thresholds.  Keep exact
+  // transition semantics while removing that hot-path bookkeeping.
+  const bool crossed_hi =
+      (distance_before_burst > m_fifo.CPHiWatermark) !=
+      (distance_after_burst > m_fifo.CPHiWatermark);
+  const bool crossed_lo =
+      (distance_before_burst < m_fifo.CPLoWatermark) !=
+      (distance_after_burst < m_fifo.CPLoWatermark);
+  if (crossed_hi || crossed_lo)
+    SetCPStatusFromCPU();
 
   m_system.GetFifo().RunGpu();
 
@@ -491,13 +504,6 @@ void CommandProcessorManager::SetCPStatusFromGPU()
   const bool hi_watermark = distance > m_fifo.CPHiWatermark;
   const bool lo_watermark = distance < m_fifo.CPLoWatermark;
 
-  // These are derived status values.  Avoid dirtying the GPU-owned status
-  // cache line unless the visible value actually changes.
-  if ((m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) != 0) != hi_watermark)
-    m_fifo.bFF_HiWatermark.store(hi_watermark, std::memory_order_relaxed);
-  if ((m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed) != 0) != lo_watermark)
-    m_fifo.bFF_LoWatermark.store(lo_watermark, std::memory_order_relaxed);
-
   const bool bpInt = breakpoint && bp_int_enabled;
   const bool ovfInt = hi_watermark && hi_int_enabled;
   const bool undfInt = lo_watermark && lo_int_enabled;
@@ -535,11 +541,6 @@ void CommandProcessorManager::SetCPStatusFromCPU()
   const u32 distance = m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
   const bool hi_watermark = distance > m_fifo.CPHiWatermark;
   const bool lo_watermark = distance < m_fifo.CPLoWatermark;
-
-  if ((m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) != 0) != hi_watermark)
-    m_fifo.bFF_HiWatermark.store(hi_watermark, std::memory_order_relaxed);
-  if ((m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed) != 0) != lo_watermark)
-    m_fifo.bFF_LoWatermark.store(lo_watermark, std::memory_order_relaxed);
 
   const bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
                      m_cp_ctrl_reg.BPInt;
@@ -615,6 +616,11 @@ void CommandProcessorManager::SetCpControlRegister()
   m_fifo.bFF_HiWatermarkInt.store(m_cp_ctrl_reg.FifoOverflowIntEnable, std::memory_order_relaxed);
   m_fifo.bFF_LoWatermarkInt.store(m_cp_ctrl_reg.FifoUnderflowIntEnable, std::memory_order_relaxed);
   m_fifo.bFF_GPLinkEnable.store(m_cp_ctrl_reg.GPLinkEnable, std::memory_order_relaxed);
+
+  // Control-register writes are rare.  Re-evaluate the interrupt state here
+  // so the FIFO hot loops only need to call SetCPStatus* on actual watermark
+  // or breakpoint transitions.
+  SetCPStatusFromCPU();
 
   DEBUG_LOG_FMT(COMMANDPROCESSOR, "\t GPREAD {} | BP {} | Int {} | OvF {} | UndF {} | LINK {}",
                 m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? "ON" : "OFF",

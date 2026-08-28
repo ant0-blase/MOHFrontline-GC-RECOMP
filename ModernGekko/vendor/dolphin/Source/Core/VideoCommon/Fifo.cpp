@@ -324,6 +324,7 @@ void FifoManager::RunGpuLoop()
 
             u32 cyclesExecuted = 0;
             u32 readPtr = fifo.CPReadPointer.load(std::memory_order_relaxed);
+            const u32 previous_read_ptr = readPtr;
             ReadDataFromFifo(readPtr);
 
             if (readPtr == fifo.CPEnd.load(std::memory_order_relaxed))
@@ -331,27 +332,44 @@ void FifoManager::RunGpuLoop()
             else
               readPtr += GPFifo::GATHER_PIPE_SIZE;
 
-            const s32 distance =
-                static_cast<s32>(fifo.CPReadWriteDistance.load(std::memory_order_relaxed)) -
-                GPFifo::GATHER_PIPE_SIZE;
-            ASSERT_MSG(COMMANDPROCESSOR, distance >= 0,
-                       "Negative fifo.CPReadWriteDistance = {} in FIFO Loop !\nThat can produce "
-                       "instability in the game. Please report it.",
-                       distance);
-
             u8* write_ptr = m_video_buffer_write_ptr;
             m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
                 DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
 
             fifo.CPReadPointer.store(readPtr, std::memory_order_relaxed);
-            fifo.CPReadWriteDistance.fetch_sub(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
+            const u32 distance_before = fifo.CPReadWriteDistance.fetch_sub(
+                GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
+            const s32 distance_after =
+                static_cast<s32>(distance_before) - GPFifo::GATHER_PIPE_SIZE;
+            ASSERT_MSG(COMMANDPROCESSOR, distance_after >= 0,
+                       "Negative fifo.CPReadWriteDistance = {} in FIFO Loop !\nThat can produce "
+                       "instability in the game. Please report it.",
+                       distance_after);
+
             if ((write_ptr - m_video_buffer_read_ptr) == 0)
             {
               fifo.SafeCPReadPointer.store(fifo.CPReadPointer.load(std::memory_order_relaxed),
                                            std::memory_order_relaxed);
             }
 
-            command_processor.SetCPStatusFromGPU();
+            // The CP status only changes when the GPU crosses a FIFO watermark
+            // or enters/leaves the configured breakpoint.  Calling the full
+            // status routine after every 32-byte block dominated the GMFE69
+            // profile (~14% of P-core cycles), despite almost all calls seeing
+            // exactly the same state.
+            const u32 distance_after_u32 = static_cast<u32>(distance_after);
+            const bool crossed_hi =
+                (distance_before > fifo.CPHiWatermark) !=
+                (distance_after_u32 > fifo.CPHiWatermark);
+            const bool crossed_lo =
+                (distance_before < fifo.CPLoWatermark) !=
+                (distance_after_u32 < fifo.CPLoWatermark);
+            const u32 breakpoint = fifo.CPBreakpoint.load(std::memory_order_relaxed);
+            const bool crossed_breakpoint =
+                (previous_read_ptr == breakpoint) != (readPtr == breakpoint);
+
+            if (crossed_hi || crossed_lo || crossed_breakpoint)
+              command_processor.SetCPStatusFromGPU();
 
             if (m_config_sync_gpu)
             {
