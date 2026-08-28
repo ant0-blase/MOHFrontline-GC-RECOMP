@@ -424,7 +424,13 @@ void FifoManager::RunGpuLoop()
           // again on empty/event-only GPU wakeups.
           if (processed_fifo)
             g_vertex_manager->Flush();
-          g_framebuffer_manager->RefreshPeekCache();
+
+          // GMFE69 perf round 7: RefreshPeekCache() was spending almost all of
+          // its sampled time immediately returning from its two needs_refresh
+          // tests.  Probe the compact summary bit first and enter the full EFB
+          // cache path only when an invalidation actually queued readback work.
+          if (g_framebuffer_manager->NeedsPeekCacheRefresh())
+            g_framebuffer_manager->RefreshPeekCache();
         }
       },
       100);

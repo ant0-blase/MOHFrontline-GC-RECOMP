@@ -558,6 +558,7 @@ void FramebufferManager::RefreshPeekCache()
 
   m_efb_depth_cache.needs_refresh = false;
   m_efb_color_cache.needs_refresh = false;
+  m_efb_peek_cache_refresh_pending = false;
 
   if (flush_command_buffer)
   {
@@ -577,6 +578,7 @@ void FramebufferManager::InvalidatePeekCache(bool forced)
       }
 
       m_efb_color_cache.needs_refresh = true;
+      m_efb_peek_cache_refresh_pending = true;
     }
 
     m_efb_color_cache.has_active_tiles = false;
@@ -592,6 +594,7 @@ void FramebufferManager::InvalidatePeekCache(bool forced)
       }
 
       m_efb_depth_cache.needs_refresh = true;
+      m_efb_peek_cache_refresh_pending = true;
     }
 
     m_efb_depth_cache.has_active_tiles = false;
@@ -781,6 +784,7 @@ void FramebufferManager::DestroyReadbackFramebuffer()
   };
   DestroyCache(m_efb_color_cache);
   DestroyCache(m_efb_depth_cache);
+  m_efb_peek_cache_refresh_pending = false;
 }
 
 void FramebufferManager::PopulateEFBCache(bool depth, u32 tile_index, bool async)

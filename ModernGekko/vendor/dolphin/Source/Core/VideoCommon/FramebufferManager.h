@@ -121,6 +121,13 @@ public:
   void InvalidatePeekCache(bool forced = true);
   void RefreshPeekCache();
   void FlagPeekCacheAsOutOfDate();
+
+  // RefreshPeekCache() is polled from the GPU loop.  Most wakes have no EFB
+  // readback work at all, so expose a compact summary bit and avoid touching
+  // the two larger EFBCacheData cache lines (and the out-of-line call) on the
+  // overwhelmingly common clean path.
+  bool NeedsPeekCacheRefresh() const { return m_efb_peek_cache_refresh_pending; }
+
   void EndOfFrame();
 
   // Writes a value to the framebuffer. This will never block, and writes will be batched.
@@ -193,6 +200,11 @@ protected:
 
   void DoLoadState(PointerWrap& p);
   void DoSaveState(PointerWrap& p);
+
+  // Hot GPU-loop summary of m_efb_color_cache.needs_refresh ||
+  // m_efb_depth_cache.needs_refresh.  Keep it before the larger framebuffer
+  // state so the clean-path probe lives in the first object cache line.
+  bool m_efb_peek_cache_refresh_pending = false;
 
   float m_efb_scale = 1.0f;
   PixelFormat m_prev_efb_format;
