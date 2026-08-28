@@ -261,6 +261,9 @@ struct ModManager::Impl {
   bool runtime_started = false;
   ModernGekkoModHostApi host_api{};
 
+  bool DispatchSlow(ModManager *owner, CPUState *state,
+                    std::uint32_t address);
+
   static std::string ExportKey(const std::string &provider,
                                const std::string &name) {
     return EventKey(provider, name);
@@ -694,18 +697,52 @@ void ModManager::Unload() {
   m_impl->runtime_started = false;
 }
 
+// Extremely hot native-hostcall path.  Once runtime_start has fired and no
+// dynamic return hook is pending, recurring patch-only PCs can be served
+// entirely from the 256-entry direct cache.  Keep the large generic resolver
+// out-of-line so this common path does not inherit its stack frame, unordered
+// map machinery or hook-vector bookkeeping.
 bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
   if (!state)
     return false;
-  if (!m_impl->runtime_started) {
-    m_impl->runtime_started = true;
-    TriggerEvent("*", "runtime_start", state);
+
+  Impl &impl = *m_impl;
+  if (impl.runtime_started && impl.pending_returns.empty()) {
+    auto &cached = impl.dispatch_cache[
+        (address >> 2u) & (Impl::DISPATCH_CACHE_SIZE - 1u)];
+
+    if (cached.valid && cached.address == address && cached.hooks == nullptr) {
+      if (!cached.patch)
+        return false;
+      cached.patch(state);
+      return true;
+    }
   }
-  if (!m_impl->pending_returns.empty() &&
-      m_impl->pending_returns.back().address == address &&
-      m_impl->pending_returns.back().stack_pointer == state->gpr[1]) {
-    auto pending = std::move(m_impl->pending_returns.back());
-    m_impl->pending_returns.pop_back();
+
+  return impl.DispatchSlow(this, state, address);
+}
+
+#if defined(_MSC_VER)
+#define MODERNGEKKO_DISPATCH_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define MODERNGEKKO_DISPATCH_NOINLINE __attribute__((noinline))
+#else
+#define MODERNGEKKO_DISPATCH_NOINLINE
+#endif
+
+MODERNGEKKO_DISPATCH_NOINLINE bool
+ModManager::Impl::DispatchSlow(ModManager *owner, CPUState *state,
+                               std::uint32_t address) {
+  if (!runtime_started) {
+    runtime_started = true;
+    owner->TriggerEvent("*", "runtime_start", state);
+  }
+
+  if (!pending_returns.empty() &&
+      pending_returns.back().address == address &&
+      pending_returns.back().stack_pointer == state->gpr[1]) {
+    auto pending = std::move(pending_returns.back());
+    pending_returns.pop_back();
     for (auto it = pending.functions.rbegin(); it != pending.functions.rend();
          ++it)
       InvokePreservingCpuState(state, *it);
@@ -714,7 +751,7 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
   // Dispatch is hit very frequently by native recomp hooks.  The hook/patch
   // tables are immutable after Load(), so cache the resolved entries by guest
   // address and avoid two unordered_map hashes on recurring hot addresses.
-  auto &cached = m_impl->dispatch_cache[
+  auto &cached = dispatch_cache[
       (address >> 2u) & (Impl::DISPATCH_CACHE_SIZE - 1u)];
   const Impl::Hooks *address_hooks = nullptr;
   ModernGekkoModFunction address_patch = nullptr;
@@ -723,10 +760,10 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
     address_hooks = cached.hooks;
     address_patch = cached.patch;
   } else {
-    const auto hooks = m_impl->hooks.find(address);
-    const auto patch = m_impl->patches.find(address);
-    address_hooks = hooks != m_impl->hooks.end() ? &hooks->second : nullptr;
-    address_patch = patch != m_impl->patches.end() ? patch->second : nullptr;
+    const auto found_hooks = hooks.find(address);
+    const auto found_patch = patches.find(address);
+    address_hooks = found_hooks != hooks.end() ? &found_hooks->second : nullptr;
+    address_patch = found_patch != patches.end() ? found_patch->second : nullptr;
     cached.address = address;
     cached.hooks = address_hooks;
     cached.patch = address_patch;
@@ -738,9 +775,9 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
       InvokePreservingCpuState(state, function);
 
     if (!address_hooks->returning.empty()) {
-      if (m_impl->pending_returns.size() >= 4096u)
-        m_impl->pending_returns.erase(m_impl->pending_returns.begin());
-      m_impl->pending_returns.push_back(
+      if (pending_returns.size() >= 4096u)
+        pending_returns.erase(pending_returns.begin());
+      pending_returns.push_back(
           {state->lr, state->gpr[1], address_hooks->returning});
     }
   }
@@ -749,6 +786,8 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
   address_patch(state);
   return true;
 }
+
+#undef MODERNGEKKO_DISPATCH_NOINLINE
 
 bool ModManager::TriggerEvent(const std::string &provider_id,
                               const std::string &event_name, CPUState *state) {

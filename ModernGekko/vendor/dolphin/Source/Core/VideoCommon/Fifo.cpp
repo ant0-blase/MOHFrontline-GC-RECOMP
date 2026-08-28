@@ -404,11 +404,18 @@ void FifoManager::RunGpuLoop()
               }
             }
 
-            // This call is pretty important in DualCore mode and must be called in the FIFO Loop.
-            // If we don't, s_swapRequested or s_efbAccessRequested won't be set to false
-            // leading the CPU thread to wait in Video_OutputXFB or Video_AccessEFB thus slowing
-            // things down.
-            AsyncRequests::GetInstance()->PullEvents();
+            // This check is important in DualCore mode: real swap/EFB requests
+            // still need to be consumed from inside the FIFO loop so the CPU
+            // thread cannot remain blocked in Video_OutputXFB/Video_AccessEFB.
+            //
+            // GMFE69 perf round 9: the queue is empty on almost every 32-byte
+            // FIFO iteration. perf showed PullEvents() spending essentially
+            // all of its samples in its empty-queue prologue/epilogue. Inline
+            // the queue's existing acquire-load here and enter the heavy drain
+            // function only when there is actual asynchronous work.
+            auto* const async_requests = AsyncRequests::GetInstance();
+            if (async_requests->HasPendingEvents())
+              async_requests->PullEvents();
           }
 
           // fast skip remaining GPU time if fifo is empty

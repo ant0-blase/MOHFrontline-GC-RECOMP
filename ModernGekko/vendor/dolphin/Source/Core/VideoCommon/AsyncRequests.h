@@ -21,6 +21,13 @@ public:
   // Called from the Video thread.
   void PullEvents();
 
+  // Cheap hot-path probe for the FIFO loop. PullEvents() contains the full
+  // event-drain path and therefore gets a sizeable stack frame/stack canary
+  // even when the SPSC queue is empty. Keep the existing acquire load from
+  // SPSCQueue::Empty(), but let the compiler inline it at the call site so an
+  // empty queue does not enter PullEvents() at all.
+  bool HasPendingEvents() const { return !m_queue.Empty(); }
+
   // The following are called from the CPU thread.
   void WaitForEmptyQueue();
 
