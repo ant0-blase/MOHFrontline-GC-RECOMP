@@ -820,8 +820,19 @@ bool ModManager::HandlesRange(std::uint32_t start, std::uint32_t end) const {
 
 bool ModManager::Empty() const { return m_impl->mods.empty(); }
 
-bool ModManager::HostCall(CPUState *state, std::uint32_t address,
-                          void *user_data) {
+// The MOH PC-layer token handler carries sizeable locals (mouse/ADS state,
+// logging buffers, etc.).  Keeping it in ModManager::HostCall forces clang to
+// build a stack frame and stack-canary path even for the overwhelmingly common
+// native guest-address case that simply tail-dispatches a mod hook.
+#if defined(_MSC_VER)
+#define MODERNGEKKO_HOSTCALL_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define MODERNGEKKO_HOSTCALL_NOINLINE __attribute__((noinline))
+#else
+#define MODERNGEKKO_HOSTCALL_NOINLINE
+#endif
+MODERNGEKKO_HOSTCALL_NOINLINE static bool
+HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data) {
 #if defined(MODERNGEKKO_MOH_PC_LAYER)
   if (address == MOH_HOSTCALL_GAMEPLAY_ENTER || address == MOH_HOSTCALL_GAMEPLAY_EXIT) {
     const bool active = address == MOH_HOSTCALL_GAMEPLAY_ENTER;
@@ -998,6 +1009,30 @@ bool ModManager::HostCall(CPUState *state, std::uint32_t address,
   }
 
 #endif
+  return user_data &&
+         static_cast<ModManager *>(user_data)->Dispatch(state, address);
+}
+#undef MODERNGEKKO_HOSTCALL_NOINLINE
+
+bool ModManager::HostCall(CPUState *state, std::uint32_t address,
+                          void *user_data) {
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
+  // All native MOH PC-layer control tokens live in the compact F100..F141
+  // window.  Ordinary guest PCs are nowhere near this range, so keep their
+  // path leaf-like: one unsigned range check followed by a tail call into
+  // Dispatch().  The expensive token implementation stays completely cold.
+  constexpr std::uint32_t token_span =
+      MOH_HOSTCALL_VP6_MOVIE_OFF - MOH_HOSTCALL_VI_GAMEPLAY_ON;
+  const std::uint32_t token_offset =
+      address - MOH_HOSTCALL_VI_GAMEPLAY_ON;
+#if defined(__GNUC__) || defined(__clang__)
+  if (__builtin_expect(token_offset <= token_span, 0))
+#else
+  if (token_offset <= token_span)
+#endif
+    return HandleMohPcLayerHostCall(state, address, user_data);
+#endif
+
   return user_data &&
          static_cast<ModManager *>(user_data)->Dispatch(state, address);
 }
