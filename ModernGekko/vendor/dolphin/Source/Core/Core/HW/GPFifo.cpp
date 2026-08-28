@@ -87,8 +87,33 @@ void GPFifoManager::UpdateGatherPipe()
   auto& system = m_system;
   auto& memory = system.GetMemory();
   auto& processor_interface = system.GetProcessorInterface();
+  auto& command_processor = system.GetCommandProcessor();
 
   size_t pipe_count = GetGatherPipeCount();
+
+  // Static recomp writes check the gather pipe after every scalar store, so
+  // the overwhelmingly common case is exactly one 32-byte burst with at most
+  // seven spill bytes. Keep that path branch-light and avoid the generic loop
+  // plus a zero-length memmove on every burst.
+  if (pipe_count >= GATHER_PIPE_SIZE && pipe_count < GATHER_PIPE_SIZE * 2)
+  {
+    memory.CopyToEmu(processor_interface.m_fifo_cpu_write_pointer, m_gather_pipe,
+                     GATHER_PIPE_SIZE);
+
+    if (processor_interface.m_fifo_cpu_write_pointer == processor_interface.m_fifo_cpu_end)
+      processor_interface.m_fifo_cpu_write_pointer = processor_interface.m_fifo_cpu_base;
+    else
+      processor_interface.m_fifo_cpu_write_pointer += GATHER_PIPE_SIZE;
+
+    command_processor.GatherPipeBursted();
+
+    pipe_count -= GATHER_PIPE_SIZE;
+    if (pipe_count != 0)
+      std::memmove(m_gather_pipe, m_gather_pipe + GATHER_PIPE_SIZE, pipe_count);
+    SetGatherPipeCount(pipe_count);
+    return;
+  }
+
   size_t processed;
   for (processed = 0; pipe_count >= GATHER_PIPE_SIZE; processed += GATHER_PIPE_SIZE)
   {
@@ -103,11 +128,12 @@ void GPFifoManager::UpdateGatherPipe()
     else
       processor_interface.m_fifo_cpu_write_pointer += GATHER_PIPE_SIZE;
 
-    system.GetCommandProcessor().GatherPipeBursted();
+    command_processor.GatherPipeBursted();
   }
 
   // move back the spill bytes
-  memmove(m_gather_pipe, m_gather_pipe + processed, pipe_count);
+  if (pipe_count != 0)
+    std::memmove(m_gather_pipe, m_gather_pipe + processed, pipe_count);
   SetGatherPipeCount(pipe_count);
 }
 

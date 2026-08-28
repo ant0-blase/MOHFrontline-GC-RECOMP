@@ -178,6 +178,16 @@ struct ModManager::Impl {
     std::vector<ModernGekkoModFunction> functions;
   };
 
+  struct DispatchCacheEntry {
+    std::uint32_t address = 0;
+    const Hooks *hooks = nullptr;
+    ModernGekkoModFunction patch = nullptr;
+    bool valid = false;
+  };
+
+  static constexpr std::size_t DISPATCH_CACHE_SIZE = 256;
+  static_assert((DISPATCH_CACHE_SIZE & (DISPATCH_CACHE_SIZE - 1)) == 0);
+
   std::vector<std::unique_ptr<Mod>> mods;
   std::vector<LoadedModInfo> loaded;
   std::unordered_map<std::string, Mod *> mods_by_id;
@@ -188,6 +198,7 @@ struct ModManager::Impl {
       callbacks;
   std::vector<ModernGekkoModFunction *> import_slots;
   std::vector<PendingReturn> pending_returns;
+  std::array<DispatchCacheEntry, DISPATCH_CACHE_SIZE> dispatch_cache{};
   bool runtime_started = false;
   ModernGekkoModHostApi host_api{};
 
@@ -604,6 +615,7 @@ void ModManager::Unload() {
   }
   m_impl->pending_returns.clear();
   m_impl->callbacks.clear();
+  m_impl->dispatch_cache = {};
   m_impl->hooks.clear();
   m_impl->patches.clear();
   m_impl->exports.clear();
@@ -633,24 +645,45 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
       *state = saved;
     }
   }
-  const auto hooks = m_impl->hooks.find(address);
-  if (hooks != m_impl->hooks.end()) {
-    for (ModernGekkoModFunction function : hooks->second.entry) {
+
+  // Dispatch is hit very frequently by native recomp hooks.  The hook/patch
+  // tables are immutable after Load(), so cache the resolved entries by guest
+  // address and avoid two unordered_map hashes on recurring hot addresses.
+  auto &cached = m_impl->dispatch_cache[
+      (address >> 2u) & (Impl::DISPATCH_CACHE_SIZE - 1u)];
+  const Impl::Hooks *address_hooks = nullptr;
+  ModernGekkoModFunction address_patch = nullptr;
+
+  if (cached.valid && cached.address == address) {
+    address_hooks = cached.hooks;
+    address_patch = cached.patch;
+  } else {
+    const auto hooks = m_impl->hooks.find(address);
+    const auto patch = m_impl->patches.find(address);
+    address_hooks = hooks != m_impl->hooks.end() ? &hooks->second : nullptr;
+    address_patch = patch != m_impl->patches.end() ? patch->second : nullptr;
+    cached.address = address;
+    cached.hooks = address_hooks;
+    cached.patch = address_patch;
+    cached.valid = true;
+  }
+
+  if (address_hooks) {
+    for (ModernGekkoModFunction function : address_hooks->entry) {
       const CPUState saved = *state;
       function(state);
       *state = saved;
     }
-    if (!hooks->second.returning.empty()) {
+    if (!address_hooks->returning.empty()) {
       if (m_impl->pending_returns.size() >= 4096u)
         m_impl->pending_returns.erase(m_impl->pending_returns.begin());
       m_impl->pending_returns.push_back(
-          {state->lr, state->gpr[1], hooks->second.returning});
+          {state->lr, state->gpr[1], address_hooks->returning});
     }
   }
-  const auto patch = m_impl->patches.find(address);
-  if (patch == m_impl->patches.end())
+  if (!address_patch)
     return false;
-  patch->second(state);
+  address_patch(state);
   return true;
 }
 

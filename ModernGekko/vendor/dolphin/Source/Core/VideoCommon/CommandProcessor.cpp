@@ -392,17 +392,23 @@ void CommandProcessorManager::GatherPipeBursted()
   if (distance_before_burst > m_fifo.CPHiWatermark)
     m_system.GetCoreTiming().ForceExceptionCheck(0);
 
-  // CP interrupt state can only change when a FIFO watermark is crossed.
-  // SetCPStatusFromCPU used to run for every 32-byte gather burst, even when
-  // the distance remained on the same side of both thresholds.  Keep exact
-  // transition semantics while removing that hot-path bookkeeping.
-  const bool crossed_hi =
-      (distance_before_burst > m_fifo.CPHiWatermark) !=
-      (distance_after_burst > m_fifo.CPHiWatermark);
-  const bool crossed_lo =
-      (distance_before_burst < m_fifo.CPLoWatermark) !=
-      (distance_after_burst < m_fifo.CPLoWatermark);
-  if (crossed_hi || crossed_lo)
+  // Only test watermarks whose interrupt source is armed. MOH Frontline
+  // normally leaves both disabled, so avoid touching both thresholds on every
+  // 32-byte CPU gather burst.
+  bool status_transition = false;
+  if (m_cp_ctrl_reg.FifoOverflowIntEnable)
+  {
+    status_transition |=
+        (distance_before_burst > m_fifo.CPHiWatermark) !=
+        (distance_after_burst > m_fifo.CPHiWatermark);
+  }
+  if (m_cp_ctrl_reg.FifoUnderflowIntEnable)
+  {
+    status_transition |=
+        (distance_before_burst < m_fifo.CPLoWatermark) !=
+        (distance_after_burst < m_fifo.CPLoWatermark);
+  }
+  if (status_transition)
     SetCPStatusFromCPU();
 
   m_system.GetFifo().RunGpu();
@@ -466,17 +472,21 @@ void CommandProcessorManager::SetCPStatusFromGPU()
   // when the CPU actually reads STATUS_REGISTER, so avoid touching the
   // CPU/GPU-shared FIFO cache lines on every 32-byte GPU step.
   const bool bp_enabled = m_fifo.bFF_BPEnable.load(std::memory_order_relaxed) != 0;
-  const bool bp_int_enabled = m_fifo.bFF_BPInt.load(std::memory_order_relaxed) != 0;
   const bool hi_int_enabled =
       m_fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed) != 0;
   const bool lo_int_enabled =
       m_fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed) != 0;
 
-  if (!bp_enabled && !bp_int_enabled && !hi_int_enabled && !lo_int_enabled &&
-      !m_interrupt_set.IsSet() && !m_interrupt_waiting.IsSet())
+  // BPInt has no effect unless breakpoint detection itself is enabled. Delay
+  // that shared control-line load until after the common no-status-work exit.
+  if (!bp_enabled && !hi_int_enabled && !lo_int_enabled && !m_interrupt_set.IsSet() &&
+      !m_interrupt_waiting.IsSet())
   {
     return;
   }
+
+  const bool bp_int_enabled =
+      bp_enabled && m_fifo.bFF_BPInt.load(std::memory_order_relaxed) != 0;
 
   bool breakpoint = false;
   if (bp_enabled)

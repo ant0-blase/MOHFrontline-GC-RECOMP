@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -215,10 +216,22 @@ GameInspectResult InspectGame(const std::filesystem::path& input_root)
       return {{}, "can't hash files/_Main.rel"};
     metadata.rel_sha256 = *rel_hash;
   }
-  const auto assets_hash = HashDirectorySha256(root / "files");
-  if (!assets_hash)
-    return {{}, "can't hash the files directory"};
-  metadata.assets_sha256 = *assets_hash;
+
+  // Hashing every file under files/ is useful for tooling/integrity checks,
+  // but it is not required to select or validate the native recomp module.
+  // On large extracted games this can dominate startup CPU time (GMFE69 perf
+  // captures spend most sampled cycles here), so allow launchers to skip it.
+  // Set MODERNGEKKO_SKIP_ASSET_HASH=0 to force the original full verification.
+  const char* skip_asset_hash = std::getenv("MODERNGEKKO_SKIP_ASSET_HASH");
+  const bool skip_assets = skip_asset_hash != nullptr && skip_asset_hash[0] != '\0' &&
+                           !(skip_asset_hash[0] == '0' && skip_asset_hash[1] == '\0');
+  if (!skip_assets)
+  {
+    const auto assets_hash = HashDirectorySha256(root / "files");
+    if (!assets_hash)
+      return {{}, "can't hash the files directory"};
+    metadata.assets_sha256 = *assets_hash;
+  }
   return {std::move(metadata), {}};
 }
 }  // namespace moderngekko

@@ -177,6 +177,11 @@ else
 fi
 export STATICRECOMP_NATIVE_BURST="${STATICRECOMP_NATIVE_BURST:-1}"
 
+# GMFE69 does not need a complete files/ SHA-256 scan to select the native
+# module.  Avoid re-reading/hash-processing the whole extracted game on every
+# launch and during perf captures.  Set this to 0 for a full integrity hash.
+export MODERNGEKKO_SKIP_ASSET_HASH="${MODERNGEKKO_SKIP_ASSET_HASH:-1}"
+
 if [[ ! -x "$RUNTIME" ]]; then
   echo "error: local runtime is missing: $RUNTIME" >&2
   echo "run $ROOT/build.sh first" >&2

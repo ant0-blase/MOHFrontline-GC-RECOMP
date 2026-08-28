@@ -312,6 +312,7 @@ void FifoManager::RunGpuLoop()
           auto& command_processor = m_system.GetCommandProcessor();
           auto& fifo = command_processor.GetFifo();
           command_processor.SetCPStatusFromGPU();
+          bool processed_fifo = false;
 
           // check if we are able to run this buffer
           while (!command_processor.IsInterruptWaiting() &&
@@ -322,6 +323,7 @@ void FifoManager::RunGpuLoop()
             if (m_config_sync_gpu && m_sync_ticks.load() < m_config_sync_gpu_min_distance)
               break;
 
+            processed_fifo = true;
             u32 cyclesExecuted = 0;
             u32 readPtr = fifo.CPReadPointer.load(std::memory_order_relaxed);
             const u32 previous_read_ptr = readPtr;
@@ -352,23 +354,35 @@ void FifoManager::RunGpuLoop()
                                            std::memory_order_relaxed);
             }
 
-            // The CP status only changes when the GPU crosses a FIFO watermark
-            // or enters/leaves the configured breakpoint.  Calling the full
-            // status routine after every 32-byte block dominated the GMFE69
-            // profile (~14% of P-core cycles), despite almost all calls seeing
-            // exactly the same state.
+            // Only inspect a transition source when the corresponding CP
+            // feature is armed. On MOH Frontline the watermark IRQs and
+            // breakpoint are normally disabled, so this removes three shared
+            // FIFO/cache-line reads from the 32-byte GPU hot loop.
             const u32 distance_after_u32 = static_cast<u32>(distance_after);
-            const bool crossed_hi =
-                (distance_before > fifo.CPHiWatermark) !=
-                (distance_after_u32 > fifo.CPHiWatermark);
-            const bool crossed_lo =
-                (distance_before < fifo.CPLoWatermark) !=
-                (distance_after_u32 < fifo.CPLoWatermark);
-            const u32 breakpoint = fifo.CPBreakpoint.load(std::memory_order_relaxed);
-            const bool crossed_breakpoint =
-                (previous_read_ptr == breakpoint) != (readPtr == breakpoint);
+            bool status_transition = false;
 
-            if (crossed_hi || crossed_lo || crossed_breakpoint)
+            if (fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed))
+            {
+              status_transition |=
+                  (distance_before > fifo.CPHiWatermark) !=
+                  (distance_after_u32 > fifo.CPHiWatermark);
+            }
+
+            if (fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed))
+            {
+              status_transition |=
+                  (distance_before < fifo.CPLoWatermark) !=
+                  (distance_after_u32 < fifo.CPLoWatermark);
+            }
+
+            if (fifo.bFF_BPEnable.load(std::memory_order_relaxed))
+            {
+              const u32 breakpoint = fifo.CPBreakpoint.load(std::memory_order_relaxed);
+              status_transition |=
+                  (previous_read_ptr == breakpoint) != (readPtr == breakpoint);
+            }
+
+            if (status_transition)
               command_processor.SetCPStatusFromGPU();
 
             if (m_config_sync_gpu)
@@ -397,9 +411,11 @@ void FifoManager::RunGpuLoop()
               m_sync_wakeup_event.Set();
           }
 
-          // The fifo is empty and it's unlikely we will get any more work in the near future.
-          // Make sure VertexManager finishes drawing any primitives it has stored in it's buffer.
-          g_vertex_manager->Flush();
+          // If this wake processed no FIFO data, the previous pass already
+          // flushed all queued primitives. Avoid paying VertexManager::Flush
+          // again on empty/event-only GPU wakeups.
+          if (processed_fifo)
+            g_vertex_manager->Flush();
           g_framebuffer_manager->RefreshPeekCache();
         }
       },
