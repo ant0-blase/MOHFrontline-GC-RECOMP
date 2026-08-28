@@ -155,6 +155,27 @@ bool EndsWith(const std::string &text, const std::string &suffix) {
 bool IsPackagedLibrary(const std::filesystem::path &path) {
   return EndsWith(path.filename().string(), ".mgm" + LibrarySuffix());
 }
+
+// Keep the very large CPUState snapshot out of ModManager::Dispatch's stack
+// frame. Dispatch is entered extremely often by native recomp host-call
+// probes, while state-preserving entry/return hooks are comparatively rare.
+// If this helper is inlined, clang reserves the snapshot in Dispatch anyway.
+#if defined(_MSC_VER)
+#define MODERNGEKKO_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define MODERNGEKKO_NOINLINE __attribute__((noinline))
+#else
+#define MODERNGEKKO_NOINLINE
+#endif
+
+MODERNGEKKO_NOINLINE void InvokePreservingCpuState(
+    CPUState *state, ModernGekkoModFunction function) {
+  const CPUState saved = *state;
+  function(state);
+  *state = saved;
+}
+
+#undef MODERNGEKKO_NOINLINE
 }
 
 struct ModManager::Impl {
@@ -686,11 +707,8 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
     auto pending = std::move(m_impl->pending_returns.back());
     m_impl->pending_returns.pop_back();
     for (auto it = pending.functions.rbegin(); it != pending.functions.rend();
-         ++it) {
-      const CPUState saved = *state;
-      (*it)(state);
-      *state = saved;
-    }
+         ++it)
+      InvokePreservingCpuState(state, *it);
   }
 
   // Dispatch is hit very frequently by native recomp hooks.  The hook/patch
@@ -716,11 +734,9 @@ bool ModManager::Dispatch(CPUState *state, std::uint32_t address) {
   }
 
   if (address_hooks) {
-    for (ModernGekkoModFunction function : address_hooks->entry) {
-      const CPUState saved = *state;
-      function(state);
-      *state = saved;
-    }
+    for (ModernGekkoModFunction function : address_hooks->entry)
+      InvokePreservingCpuState(state, function);
+
     if (!address_hooks->returning.empty()) {
       if (m_impl->pending_returns.size() >= 4096u)
         m_impl->pending_returns.erase(m_impl->pending_returns.begin());
@@ -770,6 +786,15 @@ bool ModManager::HandlesAddress(std::uint32_t address) const {
                             return pending.address == address;
                           }))
     return true;
+
+  // Dispatch has already resolved recurring hook PCs in the common case.
+  // Consult that tiny direct-mapped cache before touching either unordered_map.
+  // pending_returns is checked above because it is dynamic and must override a
+  // cached static miss.
+  const auto &cached = m_impl->dispatch_cache[
+      (address >> 2u) & (Impl::DISPATCH_CACHE_SIZE - 1u)];
+  if (cached.valid && cached.address == address)
+    return cached.hooks != nullptr || cached.patch != nullptr;
 
   // Common GMFE69 path: one cached bitmap load instead of two unordered_map
   // probes.  Exact lookup is retained for the relatively few candidate pages.

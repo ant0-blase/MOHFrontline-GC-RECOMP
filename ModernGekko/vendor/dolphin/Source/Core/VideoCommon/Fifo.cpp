@@ -311,7 +311,15 @@ void FifoManager::RunGpuLoop()
         {
           auto& command_processor = m_system.GetCommandProcessor();
           auto& fifo = command_processor.GetFifo();
-          command_processor.SetCPStatusFromGPU();
+
+          // GMFE69 perf round 4: transition checks inside the FIFO loop already
+          // call SetCPStatusFromGPU() when an enabled watermark/breakpoint
+          // actually changes. At wakeup, run the full calculation only after
+          // CPU-side CP state changed. Ordinary wakeups become one cheap atomic
+          // generation check instead of repeatedly touching shared FIFO state.
+          if (command_processor.ConsumeGpuStatusRefresh())
+            command_processor.SetCPStatusFromGPU();
+
           bool processed_fifo = false;
 
           // check if we are able to run this buffer

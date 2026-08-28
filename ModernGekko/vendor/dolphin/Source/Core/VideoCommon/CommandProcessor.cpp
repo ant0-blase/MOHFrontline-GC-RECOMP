@@ -92,6 +92,10 @@ void CommandProcessorManager::DoState(PointerWrap& p)
 
   p.Do(m_interrupt_set);
   p.Do(m_interrupt_waiting);
+
+  // A loaded state (and harmlessly, a saved state) needs one fresh GPU-side
+  // CP status evaluation before normal transition-only tracking resumes.
+  RequestGpuStatusRefresh();
 }
 
 static inline void WriteHigh(std::atomic<u32>& reg, u16 highbits)
@@ -120,6 +124,8 @@ void CommandProcessorManager::Init()
 
   m_interrupt_set.Clear();
   m_interrupt_waiting.Clear();
+  m_gpu_status_seen_generation = 0;
+  m_gpu_status_generation.store(1u, std::memory_order_relaxed);
 
   m_event_type_update_interrupts =
       m_system.GetCoreTiming().RegisterEvent("CPInterrupt", UpdateInterrupts_Wrapper);
@@ -289,9 +295,11 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   }
   mmio->Register(base | FIFO_RW_DISTANCE_HI, fifo_rw_distance_hi_r,
                  MMIO::ComplexWrite<u16>([WMASK_HI_RESTRICT](Core::System& system_, u32, u16 val) {
-                   auto& fifo_ = system_.GetCommandProcessor().GetFifo();
+                   auto& cp_ = system_.GetCommandProcessor();
+                   auto& fifo_ = cp_.GetFifo();
                    system_.GetFifo().SyncGPUForRegisterAccess();
                    WriteHigh(fifo_.CPReadWriteDistance, val & WMASK_HI_RESTRICT);
+                   cp_.RequestGpuStatusRefresh();
                    system_.GetFifo().RunGpu();
                  }));
 
@@ -448,6 +456,11 @@ void CommandProcessorManager::UpdateInterrupts(u64 userdata)
   }
   m_system.GetCoreTiming().ForceExceptionCheck(0);
   m_interrupt_waiting.Clear();
+
+  // FIFO state may have changed on the CPU while the GPU loop was blocked by
+  // m_interrupt_waiting. Re-evaluate CP status once when the GPU is released.
+  RequestGpuStatusRefresh();
+
   m_system.GetFifo().RunGpu();
 }
 
@@ -626,6 +639,10 @@ void CommandProcessorManager::SetCpControlRegister()
   m_fifo.bFF_HiWatermarkInt.store(m_cp_ctrl_reg.FifoOverflowIntEnable, std::memory_order_relaxed);
   m_fifo.bFF_LoWatermarkInt.store(m_cp_ctrl_reg.FifoUnderflowIntEnable, std::memory_order_relaxed);
   m_fifo.bFF_GPLinkEnable.store(m_cp_ctrl_reg.GPLinkEnable, std::memory_order_relaxed);
+
+  // Publish one GPU-side re-evaluation for this rare control-state change.
+  // The existing CPU-side status update below remains intact.
+  RequestGpuStatusRefresh();
 
   // Control-register writes are rare.  Re-evaluate the interrupt state here
   // so the FIFO hot loops only need to call SetCPStatus* on actual watermark

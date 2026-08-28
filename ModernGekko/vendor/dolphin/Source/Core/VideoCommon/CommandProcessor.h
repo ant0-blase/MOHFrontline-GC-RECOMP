@@ -183,6 +183,25 @@ public:
 
   bool IsInterruptWaiting() const;
 
+  // The GPU loop used to run the complete CP status calculation on every
+  // wakeup, even when the CPU had changed no CP state at all. Keep a
+  // generation counter instead: CPU-side state changes publish a new
+  // generation and the GPU pays only one relaxed/acquire load on ordinary
+  // wakeups.
+  bool ConsumeGpuStatusRefresh()
+  {
+    const u32 generation = m_gpu_status_generation.load(std::memory_order_acquire);
+    if (generation == m_gpu_status_seen_generation)
+      return false;
+    m_gpu_status_seen_generation = generation;
+    return true;
+  }
+
+  void RequestGpuStatusRefresh()
+  {
+    m_gpu_status_generation.fetch_add(1u, std::memory_order_release);
+  }
+
   void SetCpClearRegister();
   void SetCpControlRegister();
   void SetCpStatusRegister();
@@ -208,6 +227,12 @@ private:
 
   Common::Flag m_interrupt_set;
   Common::Flag m_interrupt_waiting;
+
+  // CPU writes are rare; GPU wakeups are extremely frequent. The generation
+  // itself is atomic because it crosses threads, while the seen value belongs
+  // to the GPU thread after initialization.
+  alignas(64) std::atomic<u32> m_gpu_status_generation{1};
+  u32 m_gpu_status_seen_generation = 0;
 
   bool m_is_fifo_error_seen = false;
 
