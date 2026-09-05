@@ -10,6 +10,7 @@
 !/iso/README.md
 /extracted/*
 !/extracted/README.md
+/HD
 
 # Common disc/image variants if copied somewhere by mistake
 *.iso

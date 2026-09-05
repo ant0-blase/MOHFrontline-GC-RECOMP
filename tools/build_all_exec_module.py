@@ -296,6 +296,16 @@ def apply_gmfe69_generated_enhancements(generated: Path):
         (void)ctx->host_call(ctx, 0xFFFFF141u);
 """)
 
+    # M1 Garand quality-of-life manual reload.  At 0x800A4A68 r3 is the
+    # GetValue(action 15 / reload) result and r31 is still CPlayerObject*.
+    # Temporarily expose clip=0 only while stock reload event 17 is dispatched,
+    # then restore the real clip at 0x800A4A88.  The original animation, reload
+    # state and CWeapon::DoneReloading remain completely authoritative.
+    _inject_after_label(generated, "800A4A68", """    moh_m1_manual_reload_prepare(ctx);
+""")
+    _inject_after_label(generated, "800A4A88", """    moh_m1_manual_reload_restore(ctx);
+""")
+
     # Native PC mouse look.  Inject before BeginUpdate's epilogue, while r31
     # still contains the live CPlayerObject* (mr r31,r3 at function entry).
     # 0x800A4CE8 is too late: lmw at 0x800A4CD8 has already restored r31.

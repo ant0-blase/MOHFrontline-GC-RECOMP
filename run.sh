@@ -23,6 +23,12 @@ ADAPTIVE_PROFILE="default"
 PC_INPUT=1
 ENHANCED_GRAPHICS="default"
 FPS_ADS="default"
+
+# Optional PS3 remaster asset layer.
+# Keep remaster data separate from the legally extracted GameCube files.
+PS3_ASSETS="auto"
+PS3_FILES="$ROOT/HD/PS3_FILES"
+
 PASS_ARGS=()
 
 usage() {
@@ -50,6 +56,10 @@ MOH Frontline PC enhancements:
   --original-graphics         Force preservation/original post-processing
   --fps-ads                   Enable modern FPS aim-down-sight presentation
   --original-aim              Keep original Frontline aiming presentation
+  --ps3-assets                Enable HD/PS3_FILES remaster asset layer
+  --no-ps3-assets             Disable PS3 remaster assets
+  --ps3-files <directory>     Override PS3 asset directory
+                              Default: HD/PS3_FILES
   --no-pc-input               Disable the keyboard/mouse FPS layer
   --moh-help                  Show this help and exit
 
@@ -154,6 +164,20 @@ while (($#)); do
       FPS_ADS=0
       shift
       ;;
+    --ps3-assets)
+      PS3_ASSETS=1
+      shift
+      ;;
+    --no-ps3-assets)
+      PS3_ASSETS=0
+      shift
+      ;;
+    --ps3-files)
+      need_value "$1" "${2:-}"
+      PS3_FILES="$2"
+      PS3_ASSETS=1
+      shift 2
+      ;;
     --no-pc-input)
       PC_INPUT=0
       shift
@@ -198,6 +222,7 @@ if [[ ! -f "$GAME/sys/main.dol" ]]; then
   exit 1
 fi
 mkdir -p "$USER_DIR"
+mkdir -p "$ROOT/HD/PS3_FILES"
 
 export MOH_PC_SETTINGS_PATH="$USER_DIR/moh_pc_settings.ini"
 export MOH_PC_INPUT="$PC_INPUT"
@@ -207,7 +232,42 @@ unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_WEAPON_FOV_DEGREES \
       MOH_UI_SAFE MOH_MOUSE_SENSITIVITY MOH_MOUSE_SENSITIVITY_X MOH_MOUSE_SENSITIVITY_Y \
       MOH_MOUSE_ADS_SENSITIVITY MOH_HUD_SCALE MOH_HUD_SAFE_WIDTH MOH_ADAPTIVE_PROFILE \
       MOH_ENHANCED_GRAPHICS MOH_FPS_ADS MOH_ADS_WORLD_FOV MOH_ADS_WEAPON_FOV \
+      MOH_PS3_ASSETS MOH_PS3_FILES \
       2>/dev/null || true
+
+# ---------------------------------------------------------------
+# Optional PS3 remaster assets.
+#
+# Auto mode activates only when HD/PS3_FILES contains at least one
+# file. Raw resources remain completely separate from extracted/.
+# ---------------------------------------------------------------
+if [[ "$PS3_ASSETS" == "auto" ]]; then
+  if [[ -d "$PS3_FILES" ]] && \
+     find "$PS3_FILES" -type f -print -quit 2>/dev/null | grep -q .; then
+    PS3_ASSETS=1
+  else
+    PS3_ASSETS=0
+  fi
+fi
+
+if [[ "$PS3_ASSETS" == "1" ]]; then
+  if [[ ! -d "$PS3_FILES" ]]; then
+    echo "error: PS3 asset directory does not exist: $PS3_FILES" >&2
+    exit 2
+  fi
+
+  export MOH_PS3_ASSETS=1
+  export MOH_PS3_FILES="$PS3_FILES"
+
+  # The remaster assets are intended to be used together with the
+  # remaster presentation shader unless the user explicitly selected
+  # original graphics.
+  if [[ "$ENHANCED_GRAPHICS" == "default" ]]; then
+    ENHANCED_GRAPHICS=1
+  fi
+else
+  export MOH_PS3_ASSETS=0
+fi
 
 # FOV: an explicit value is the final horizontal FOV on the selected aspect.
 case "${FOV,,}" in
@@ -347,6 +407,10 @@ fi
 if [[ -n "${MOH_CAMERA_PATCH:-}" || -n "${MOH_TIMING_PATCH:-}" ||
       "$ENHANCED_GRAPHICS" == "1" || "$FPS_ADS" == "1" ]]; then
   echo "MOH native enhancements: aspect=${ASPECT} fov=${FOV} weapon-fov=${WEAPON_FOV} fps=${FPS} enhanced=${ENHANCED_GRAPHICS} ads=${FPS_ADS}"
+fi
+
+if [[ "$PS3_ASSETS" == "1" ]]; then
+  echo "PS3 remaster assets: $PS3_FILES"
 fi
 
 PLATFORM_ARGS=()

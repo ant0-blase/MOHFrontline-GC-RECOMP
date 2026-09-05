@@ -831,6 +831,235 @@ void moh_ui_font_scale_override(CPUState* ctx)
     ctx->fpr[2] *= y_scale;
 }
 
+/*
+ * Frontline intentionally rejects a manual M1 Garand reload while rounds are
+ * still present in the en-bloc clip.  The existing generator hooks already run
+ * moh_m1_manual_reload_prepare() at 0x800A4A68 (reload input result) and
+ * moh_m1_manual_reload_restore() at 0x800A4A88 (after event 17 dispatch).
+ *
+ * v6h restored the real clip immediately at 0x800A4A88, which is too early for
+ * Frontline's BS/script reload logic: the script can process event 17 after the
+ * input block has returned, so it saw the original non-empty M1 clip and kept
+ * rejecting the reload.
+ *
+ * Keep the M1 exposed as empty across frames until CWeapon::StartReloading has
+ * set its stock "reloading" flag (bit 0x80 at weapon+0x2C0).  The 0x800A4A88
+ * hook executes every player update, so it doubles as a cheap poll without any
+ * new generated-code hook.  Once the stock reload has really started, restore
+ * the exact partial clip; DoneReloading then completes the normal animation and
+ * ammo bookkeeping instead of permanently discarding the remaining rounds.
+ */
+static int s_m1_manual_reload_pending;
+static u32 s_m1_manual_reload_weapon;
+static u16 s_m1_manual_reload_clip;
+static u32 s_m1_manual_reload_wait_frames;
+static int s_m1_manual_reload_logged;
+static int s_m1_manual_reload_started_logged;
+
+static int moh_is_cached_mem1(u32 address)
+{
+    return address >= 0x80000000u && address < 0x81800000u;
+}
+
+static u32 moh_player_current_weapon(CPUState* ctx, u32 player)
+{
+    u32 player_weapon;
+    s32 slot;
+
+    if (!ctx || !moh_is_cached_mem1(player))
+        return 0u;
+
+    /* Mirror CPlayerObject::GetCurrentWeapon().  Bit 0x40 at +0x396 selects
+     * the special weapon pointer at +0x5E0; ordinary inventory weapons use
+     * current slot +0x45C and CPlayerWeaponObject::m_weapon at +0x30E4. */
+    if ((mem_read8(ctx, player + 0x396u) & 0x40u) != 0u)
+        return mem_read32(ctx, player + 0x5E0u);
+
+    slot = (s32)mem_read32(ctx, player + 0x45Cu);
+    if (slot < 0 || slot >= 64)
+        return 0u;
+
+    player_weapon = mem_read32(ctx, player + 0x460u + (u32)slot * 4u);
+    if (!moh_is_cached_mem1(player_weapon))
+        return 0u;
+
+    return mem_read32(ctx, player_weapon + 0x30E4u);
+}
+
+static void moh_m1_manual_reload_clear_state(void)
+{
+    s_m1_manual_reload_pending = 0;
+    s_m1_manual_reload_weapon = 0u;
+    s_m1_manual_reload_clip = 0u;
+    s_m1_manual_reload_wait_frames = 0u;
+}
+
+void moh_m1_manual_reload_restore(CPUState* ctx)
+{
+    u32 weapon;
+    u32 current_weapon;
+    u8 flags;
+    int reload_started;
+
+    if (!ctx || !s_m1_manual_reload_pending)
+        return;
+
+    weapon = s_m1_manual_reload_weapon;
+    if (!moh_is_cached_mem1(weapon))
+    {
+        moh_m1_manual_reload_clear_state();
+        return;
+    }
+
+    /*
+     * A fast weapon switch used to leave the old M1 fake-empty until the
+     * timeout expired. Restore it immediately as soon as the player's current
+     * weapon changes. r31 is still the live CPlayerObject* at the 0x800A4A88
+     * poll site.
+     */
+    current_weapon = moh_player_current_weapon(ctx, ctx->gpr[31]);
+    if (moh_is_cached_mem1(current_weapon) && current_weapon != weapon)
+    {
+        if (mem_read16(ctx, weapon + 0x286u) == 0u)
+            mem_write16(ctx, weapon + 0x286u, s_m1_manual_reload_clip);
+
+        fprintf(stderr,
+                "[moh-enh] M1 tactical reload cancelled by weapon switch; "
+                "restored clip=%u\\n",
+                (unsigned)s_m1_manual_reload_clip);
+        moh_m1_manual_reload_clear_state();
+        return;
+    }
+
+    /* CWeapon::StartReloading @ 0x800D61C4 sets bit 0x80 in +0x2C0.
+     * Do NOT restore the partial clip until that real stock state is reached. */
+    flags = mem_read8(ctx, weapon + 0x2C0u);
+    reload_started = (flags & 0x80u) != 0u;
+
+    if (!reload_started)
+    {
+        ++s_m1_manual_reload_wait_frames;
+
+        /* A swallowed/cancelled event must not make the M1 unable to fire for
+         * several seconds. One second at 60 Hz is ample for the stock script
+         * to enter StartReloading. */
+        if (s_m1_manual_reload_wait_frames < 60u)
+            return;
+    }
+
+    if (mem_read16(ctx, weapon + 0x286u) == 0u)
+        mem_write16(ctx, weapon + 0x286u, s_m1_manual_reload_clip);
+
+    if (reload_started && !s_m1_manual_reload_started_logged)
+    {
+        s_m1_manual_reload_started_logged = 1;
+        fprintf(stderr,
+                "[moh-enh] M1 Garand tactical reload accepted by stock reload state "
+                "(restored clip=%u after %u frame(s))\\n",
+                (unsigned)s_m1_manual_reload_clip,
+                (unsigned)s_m1_manual_reload_wait_frames);
+    }
+    else if (!reload_started)
+    {
+        fprintf(stderr,
+                "[moh-enh] WARNING: M1 tactical reload cancelled/timed out; "
+                "restoring clip\\n");
+    }
+
+    moh_m1_manual_reload_clear_state();
+}
+
+void moh_m1_manual_reload_prepare(CPUState* ctx)
+{
+    u32 player;
+    u32 weapon;
+    u32 properties;
+    u32 weapon_type;
+    s16 clip;
+    s16 reserve;
+    s16 max_clip;
+
+    if (!ctx)
+        return;
+
+    /* r3 is GetValue(action 15): zero means the reload button was not pressed.
+     * r31 remains the live CPlayerObject* throughout this BeginUpdate block. */
+    if (ctx->gpr[3] == 0u)
+        return;
+
+    player = ctx->gpr[31];
+    weapon = moh_player_current_weapon(ctx, player);
+
+    /*
+     * Never dispatch reload event 17 repeatedly while our previous tactical
+     * reload is waiting for the stock script. Re-triggering the event can
+     * wedge the weapon's reload/fire state when R is spammed.
+     *
+     * If the player switched weapons between presses, restore the old M1 first
+     * and then evaluate the new current weapon normally.
+     */
+    if (s_m1_manual_reload_pending)
+    {
+        if (weapon == s_m1_manual_reload_weapon)
+        {
+            ctx->gpr[3] = 0u;
+            return;
+        }
+        moh_m1_manual_reload_restore(ctx);
+    }
+    if (!moh_is_cached_mem1(weapon))
+        return;
+
+    weapon_type = mem_read32(ctx, weapon + 0x298u);
+    properties = mem_read32(ctx, weapon + 0x280u);
+    if (!moh_is_cached_mem1(properties))
+        return;
+
+    reserve = (s16)mem_read16(ctx, weapon + 0x284u);
+    clip = (s16)mem_read16(ctx, weapon + 0x286u);
+    max_clip = (s16)mem_read16(ctx, properties + 0x04u);
+
+    /* Runtime diagnostics identify the actual player M1 Garand as weapon type
+     * 14 in GMFE69 (some earlier experiments observed 20 in another weapon
+     * path).  Accept both internal aliases, but still require the Garand's
+     * characteristic 8-round en-bloc capacity so no other weapon is touched. */
+    if ((weapon_type != 14u && weapon_type != 20u) || max_clip != 8)
+        return;
+
+    /*
+     * Full M1 / no reserve: consume R completely. Sending stock reload event
+     * 17 for a reload that cannot happen can leave the scripted weapon state
+     * unable to fire. Setting r3=0 here makes the original cmpwi @ 0x800A4A68
+     * take its normal "no reload input" branch.
+     */
+    if (clip >= max_clip || reserve <= 0)
+    {
+        ctx->gpr[3] = 0u;
+        return;
+    }
+
+    /* Empty clip uses Frontline's normal empty/reload flow. */
+    if (clip <= 0)
+        return;
+
+    s_m1_manual_reload_pending = 1;
+    s_m1_manual_reload_weapon = weapon;
+    s_m1_manual_reload_clip = (u16)clip;
+    s_m1_manual_reload_wait_frames = 0u;
+
+    /* Keep this value at zero until StartReloading has actually committed. */
+    mem_write16(ctx, weapon + 0x286u, 0u);
+
+    if (!s_m1_manual_reload_logged)
+    {
+        s_m1_manual_reload_logged = 1;
+        fprintf(stderr,
+                "[moh-enh] M1 Garand partial-clip tactical reload armed "
+                "(type=%u clip=%d/%d reserve=%d)\\n",
+                weapon_type, (int)clip, (int)max_clip, (int)reserve);
+    }
+}
+
 int moh_timing_enabled(void)
 {
     refresh_config();

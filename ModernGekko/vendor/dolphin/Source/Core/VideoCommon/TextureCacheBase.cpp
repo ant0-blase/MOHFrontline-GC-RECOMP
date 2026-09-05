@@ -54,6 +54,7 @@
 #include "VideoCommon/TextureConversionShader.h"
 #include "VideoCommon/TextureConverterShaderGen.h"
 #include "VideoCommon/TextureDecoder.h"
+#include "VideoCommon/PS3TextureBridge.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoConfig.h"
@@ -1595,6 +1596,88 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     for (const auto& action : g_graphics_mod_manager->GetTextureCreateActions(texture_name))
     {
       action->OnTextureCreate(&texture_create);
+    }
+  }
+
+
+  // Medal of Honor: Frontline PS3 remaster asset bridge.
+  //
+  // Explicit Dolphin HD texture packs always win. If no regular custom
+  // texture exists, CPU-decode the original GameCube texture and look for
+  // a visually matching, integer-scaled PS3 .ssh image.
+  if (!custom_texture_data && PS3TextureBridge::IsEnabled())
+  {
+    const u32 ps3_raw_width =
+        texture_info.GetRawWidth();
+
+    const u32 ps3_raw_height =
+        texture_info.GetRawHeight();
+
+    const u32 ps3_expanded_width =
+        texture_info.GetExpandedWidth();
+
+    const u32 ps3_expanded_height =
+        texture_info.GetExpandedHeight();
+
+    const std::size_t ps3_probe_size =
+        static_cast<std::size_t>(ps3_expanded_width) *
+        ps3_expanded_height *
+        sizeof(u32);
+
+    // Do not allocate ridiculous probes for malformed/game-generated textures.
+    if (ps3_raw_width > 0 &&
+        ps3_raw_height > 0 &&
+        ps3_expanded_width >= ps3_raw_width &&
+        ps3_expanded_height >= ps3_raw_height &&
+        ps3_probe_size <= 64ull * 1024ull * 1024ull)
+    {
+      std::vector<u8> ps3_probe(ps3_probe_size);
+
+      if (!(texture_info.GetTextureFormat() == TextureFormat::RGBA8 &&
+            texture_info.IsFromTmem()))
+      {
+        TexDecoder_Decode(
+            ps3_probe.data(),
+            texture_info.GetData(),
+            ps3_expanded_width,
+            ps3_expanded_height,
+            texture_info.GetTextureFormat(),
+            texture_info.GetTlutAddress(),
+            texture_info.GetTlutFormat());
+      }
+      else
+      {
+        TexDecoder_DecodeRGBA8FromTmem(
+            ps3_probe.data(),
+            texture_info.GetData(),
+            texture_info.GetTmemOddAddress(),
+            ps3_expanded_width,
+            ps3_expanded_height);
+      }
+
+      std::string ps3_source_name;
+      float ps3_match_score = 0.0f;
+
+      custom_texture_data =
+          PS3TextureBridge::FindReplacement(
+              ps3_probe.data(),
+              ps3_raw_width,
+              ps3_raw_height,
+              ps3_expanded_width,
+              full_hash,
+              &ps3_source_name,
+              &ps3_match_score);
+
+      if (custom_texture_data)
+      {
+        // This data is already host RGBA8; never pass it through the GX
+        // decoder again.
+        has_arbitrary_mipmaps = false;
+
+        // Avoid dumping the lower-resolution GC source as an HD candidate
+        // after a remaster replacement was accepted.
+        skip_texture_dump = true;
+      }
     }
   }
 

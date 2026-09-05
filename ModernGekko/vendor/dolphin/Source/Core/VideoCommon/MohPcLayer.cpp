@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/MohPcLayer.h"
+#include "VideoCommon/PS3RemasterAssets.h"
 
 #include "Common/Config/Config.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -96,6 +97,9 @@ struct State
   std::atomic<float> sensitivity_x{1.0f};
   std::atomic<float> sensitivity_y{1.0f};
   std::atomic<float> ads_sensitivity{0.80f};
+  // Full-ADS movement multiplier. 0.45 = 45% of normal movement speed.
+  // The live multiplier is blended smoothly with ads_blend.
+  std::atomic<float> ads_move_speed{0.45f};
 
   // Optional modern FPS aim-down-sights. Original MOHF aiming remains the
   // gameplay authority; this layer only modernizes camera/viewmodel presentation.
@@ -599,6 +603,7 @@ void SaveSettings()
   f << "sensitivity_x=" << s.sensitivity_x.load() << '\n';
   f << "sensitivity_y=" << s.sensitivity_y.load() << '\n';
   f << "ads_sensitivity=" << s.ads_sensitivity.load() << '\n';
+  f << "ads_move_speed=" << s.ads_move_speed.load() << '\n';
   f << "fps_ads=" << s.fps_ads_enabled.load() << '\n';
   f << "ads_world_fov=" << s.ads_world_fov.load() << '\n';
   f << "ads_weapon_fov=" << s.ads_weapon_fov.load() << '\n';
@@ -708,6 +713,7 @@ void LoadSettings()
     else if (key == "sensitivity_x") s.sensitivity_x = std::clamp(as_f(), 0.10f, 4.0f);
     else if (key == "sensitivity_y") s.sensitivity_y = std::clamp(as_f(), 0.10f, 4.0f);
     else if (key == "ads_sensitivity") s.ads_sensitivity = std::clamp(as_f(), 0.10f, 2.0f);
+    else if (key == "ads_move_speed") s.ads_move_speed = std::clamp(as_f(), 0.10f, 1.0f);
     else if (key == "fps_ads") s.fps_ads_enabled = as_i() != 0;
     else if (key == "ads_world_fov") s.ads_world_fov = std::clamp(as_f(), 35.0f, 120.0f);
     else if (key == "ads_weapon_fov") s.ads_weapon_fov = std::clamp(as_f(), 35.0f, 120.0f);
@@ -835,17 +841,33 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
       if (ConsumePulse(s.menu_left)) x = -1.0;
       if (ConsumePulse(s.menu_right)) x = 1.0;
     }
+
+    // Modern ADS movement slowdown.  Use the same animated ADS blend as the
+    // camera/viewmodel so entering and leaving ADS never causes an abrupt speed
+    // step.  This is applied to keyboard, mobile and the physical main stick.
+    double movement_scale = 1.0;
+    if (s.fps_ads_enabled.load(std::memory_order_relaxed) &&
+        s.gameplay.load(std::memory_order_relaxed))
+    {
+      const double blend = std::clamp<double>(s.ads_blend.load(std::memory_order_relaxed), 0.0, 1.0);
+      const double full_ads_scale =
+          std::clamp<double>(s.ads_move_speed.load(std::memory_order_relaxed), 0.10, 1.0);
+      movement_scale = 1.0 - blend * (1.0 - full_ads_scale);
+    }
+
     if (control == ControllerEmu::ReshapableInput::X_INPUT_OVERRIDE)
     {
       if (x != 0.0 || !keep_pad)
-        return static_cast<ControlState>(x);
-      return static_cast<ControlState>(ApplyDeadzone(original, s.gamepad_deadzone.load(), 1.0));
+        return static_cast<ControlState>(x * movement_scale);
+      return static_cast<ControlState>(
+          ApplyDeadzone(original, s.gamepad_deadzone.load(), 1.0) * movement_scale);
     }
     if (control == ControllerEmu::ReshapableInput::Y_INPUT_OVERRIDE)
     {
       if (y != 0.0 || !keep_pad)
-        return static_cast<ControlState>(y);
-      return static_cast<ControlState>(ApplyDeadzone(original, s.gamepad_deadzone.load(), 1.0));
+        return static_cast<ControlState>(y * movement_scale);
+      return static_cast<ControlState>(
+          ApplyDeadzone(original, s.gamepad_deadzone.load(), 1.0) * movement_scale);
     }
   }
   else if (group == GCPad::C_STICK_GROUP)
@@ -883,10 +905,17 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
   {
     const u32 buttons = s.mouse_buttons.load();
     const bool fire = (buttons & (1u << s.fire_button.load())) != 0 || MobileDown(MobileAction::Fire);
-    const bool aim = AimActive();
     if (control == GCPad::L_DIGITAL || control == GCPad::L_ANALOG)
     {
+      // Keep physical L as an input source for native FPS ADS, but do not
+      // forward L into MOHF's original aim mode while native ADS is active.
+      // The stock aim mode locks forward/back movement; native ADS already
+      // owns camera/FOV/viewmodel, so consuming L keeps full movement.
       s.gamepad_aim = keep_pad && original > 0.35;
+      const bool aim = AimActive();
+      if (s.fps_ads_enabled.load(std::memory_order_relaxed) &&
+          s.gameplay.load(std::memory_order_relaxed) && aim)
+        return static_cast<ControlState>(0.0);
       return combine(aim ? 1.0 : 0.0);
     }
     if (control == GCPad::R_DIGITAL || control == GCPad::R_ANALOG)
@@ -916,6 +945,7 @@ void ResetDefaults()
   s.sensitivity_x = 1.0f;
   s.sensitivity_y = 1.0f;
   s.ads_sensitivity = 0.80f;
+  s.ads_move_speed = 0.45f;
   s.fps_ads_enabled = false;
   s.ads_world_fov = 64.0f;
   s.ads_weapon_fov = 55.0f;
@@ -982,6 +1012,7 @@ void SyncFromEnvironment()
   s.sensitivity_x = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_SENSITIVITY_X", s.sensitivity_x.load()), 0.10, 4.0));
   s.sensitivity_y = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_SENSITIVITY_Y", s.sensitivity_y.load()), 0.10, 4.0));
   s.ads_sensitivity = static_cast<float>(std::clamp(EnvDouble("MOH_MOUSE_ADS_SENSITIVITY", s.ads_sensitivity.load()), 0.10, 2.0));
+  s.ads_move_speed = static_cast<float>(std::clamp(EnvDouble("MOH_ADS_MOVE_SPEED", s.ads_move_speed.load()), 0.10, 1.0));
   s.fps_ads_enabled = EnvTrue("MOH_FPS_ADS", s.fps_ads_enabled.load());
   s.ads_world_fov = static_cast<float>(std::clamp(EnvDouble("MOH_ADS_WORLD_FOV", s.ads_world_fov.load()), 35.0, 120.0));
   s.ads_weapon_fov = static_cast<float>(std::clamp(EnvDouble("MOH_ADS_WEAPON_FOV", s.ads_weapon_fov.load()), 35.0, 120.0));
@@ -1037,6 +1068,8 @@ void Initialize()
 {
   if (s.initialized.exchange(true))
     return;
+
+  PS3RemasterAssets::Initialize();
   s.requested_fps = -1;
   s.original_post_shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
   s.applied_post_shader = s.original_post_shader;
@@ -1057,6 +1090,8 @@ void Shutdown()
 {
   if (!s.initialized.exchange(false))
     return;
+
+  PS3RemasterAssets::Shutdown();
   SaveSettings();
 }
 
@@ -1483,9 +1518,9 @@ void DrawCrosshair(float backbuffer_scale)
       s.settings_open.load() || s.movie_active.load())
     return;
 
-  // Native PC crosshair is authoritative whenever enabled.
-  // Keep it visible during ADS as requested; only the original MOH
-  // crosshair is suppressed.
+  // The native CS-style crosshair remains visible during FPS ADS.
+  // The original MOH reticle is suppressed separately, so there is no
+  // duplicate reticle while aiming.
   const ImGuiIO& io = ImGui::GetIO();
   if (io.DisplaySize.x <= 1.0f || io.DisplaySize.y <= 1.0f)
     return;
@@ -1782,6 +1817,7 @@ void DrawSettingsUI(float backbuffer_scale)
           s.ads_world_fov = 64.0f;
           s.ads_weapon_fov = 55.0f;
           s.ads_transition_ms = 110.0f;
+          s.ads_move_speed = 0.45f;
           s.ads_center_strength = 1.0f;
 
           // Pull the viewmodel left/forward toward the actual iron-sight axis.
@@ -1796,6 +1832,10 @@ void DrawSettingsUI(float backbuffer_scale)
         if (ImGui::SliderFloat("ADS world FOV", &ads_world, 45.0f, 100.0f, "%.1f deg")) { s.ads_world_fov=ads_world; ApplyAdsEnvironment(); }
         if (ImGui::SliderFloat("ADS weapon FOV", &ads_weapon, 40.0f, 100.0f, "%.1f deg")) { s.ads_weapon_fov=ads_weapon; ApplyAdsEnvironment(); }
         if (ImGui::SliderFloat("ADS transition", &transition, 60.0f, 450.0f, "%.0f ms")) s.ads_transition_ms=transition;
+        float ads_move_speed = s.ads_move_speed.load();
+        if (ImGui::SliderFloat("ADS movement speed", &ads_move_speed, 0.20f, 1.00f, "%.2fx"))
+          s.ads_move_speed = ads_move_speed;
+        ImGui::TextDisabled("0.45x = 45%% of normal movement at full ADS; slowdown follows the ADS transition.");
         bool hide=s.ads_hide_crosshair.load();
         if (ImGui::Checkbox("Hide crosshair at full ADS", &hide)) s.ads_hide_crosshair=hide;
         float center=s.ads_center_strength.load();

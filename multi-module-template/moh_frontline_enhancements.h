@@ -20,6 +20,10 @@ void moh_hud_poly_end(CPUState* ctx);
 void moh_hud_text_position_override(CPUState* ctx);
 void moh_hud_centered_text_position_override(CPUState* ctx);
 void moh_ui_font_scale_override(CPUState* ctx);
+/* GMFE69 quality-of-life: allow the M1 Garand to start its original reload
+ * sequence with a partially used en-bloc clip. */
+void moh_m1_manual_reload_prepare(CPUState* ctx);
+void moh_m1_manual_reload_restore(CPUState* ctx);
 int moh_timing_enabled(void);
 void moh_player_vertical_delta_fix(CPUState* ctx);
 void moh_timing_set_gameplay(CPUState* ctx, int active);

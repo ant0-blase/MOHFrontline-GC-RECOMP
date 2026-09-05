@@ -159,6 +159,36 @@ float HashNoise(float2 p)
   return frac(sin(dot(p, float2(12.9898, 78.233)) + float(GetTime()) * 0.017) * 43758.5453);
 }
 
+float3 BrightPass(float3 c)
+{
+  float l = Luma(c);
+
+  // PS3 Frontline remaster uses a separate bloom capture/composite path.
+  // Threshold every source sample BEFORE blur accumulation.
+  const float knee = 0.22;
+
+  float gate =
+      smoothstep(BLOOM_THRESHOLD - knee,
+                 BLOOM_THRESHOLD + knee,
+                 l);
+
+  return c * gate;
+}
+
+float3 BuildRemasterNormal(float ln, float ls, float le, float lw)
+{
+  // Temporary screen-space approximation.
+  //
+  // The real PS3 renderer exposes normal/detail material textures.
+  // Those will later be supplied by the Remaster Asset Layer.
+  float gx = le - lw;
+  float gy = ls - ln;
+
+  return normalize(float3(-gx * 3.0,
+                          -gy * 3.0,
+                           1.0));
+}
+
 void main()
 {
   float4 src = Sample();
@@ -172,57 +202,304 @@ void main()
   float2 px = GetInvResolution();
   float3 center = src.rgb;
 
-  // Four-neighbour local statistics are intentionally shared by the lighting,
-  // AO/contact-shadow heuristic and sharpening passes to keep the shader cheap.
-  float3 n = SampleLocation(uv + float2(0.0, -1.0) * px).rgb;
-  float3 s = SampleLocation(uv + float2(0.0,  1.0) * px).rgb;
-  float3 e = SampleLocation(uv + float2(1.0,  0.0) * px).rgb;
-  float3 w = SampleLocation(uv + float2(-1.0, 0.0) * px).rgb;
-  float3 local = (n + s + e + w) * 0.25;
+  // Shared neighbourhood for the remaster lighting/material approximation.
+  float3 n  = SampleLocation(uv + float2( 0.0, -1.0) * px).rgb;
+  float3 s1 = SampleLocation(uv + float2( 0.0,  1.0) * px).rgb;
+  float3 e  = SampleLocation(uv + float2( 1.0,  0.0) * px).rgb;
+  float3 w  = SampleLocation(uv + float2(-1.0,  0.0) * px).rgb;
+
+  float3 ne = SampleLocation(uv + float2( 1.0, -1.0) * px).rgb;
+  float3 nw = SampleLocation(uv + float2(-1.0, -1.0) * px).rgb;
+  float3 se = SampleLocation(uv + float2( 1.0,  1.0) * px).rgb;
+  float3 sw = SampleLocation(uv + float2(-1.0,  1.0) * px).rgb;
+
+  float3 local =
+      (n + s1 + e + w +
+       ne + nw + se + sw) * 0.125;
+
   float lc = Luma(center);
   float ll = Luma(local);
 
   if (OptionEnabled(LIGHTING_ENABLE))
   {
-    // Local-light separation: preserves authored colors while making highlights
-    // and broad lighting gradients read more clearly at high internal res.
-    float light_delta = clamp(lc - ll, -0.25, 0.25);
-    center += center * light_delta * LIGHTING_STRENGTH * 1.35;
+    // PS3 remaster material concepts found in the renderer:
+    //
+    //   g_NormalTexture
+    //   g_DetailTexture
+    //   g_vCameraPos
+    //   g_vLightPosition
+    //   g_vLightColor
+    //   g_vLightDirWorld
+    //   g_vSpecularLightMultiplier
+    //
+    // Preserve the original GX lighting and layer a restrained approximation
+    // on top of it until the real PS3 DetailMaps are wired to ModernGekko.
+
+    float ln = Luma(n);
+    float ls = Luma(s1);
+    float le = Luma(e);
+    float lw = Luma(w);
+
+    float3 normal =
+        BuildRemasterNormal(ln, ls, le, lw);
+
+    // Camera-facing directional presentation light.
+    float3 light_dir =
+        normalize(float3(-0.42, -0.50, 0.76));
+
+    float3 view_dir =
+        float3(0.0, 0.0, 1.0);
+
+    float3 half_dir =
+        normalize(light_dir + view_dir);
+
+    float ndotl =
+        max(dot(normal, light_dir), 0.0);
+
+    float diffuse_delta =
+        ndotl - 0.52;
+
+    center *=
+        1.0 +
+        diffuse_delta *
+        LIGHTING_STRENGTH *
+        0.34;
+
+    // Approximate the high-frequency response contributed by
+    // DetailMaps/*_normal.ssh.
+    float3 high_frequency =
+        center - local;
+
+    float detail_mask =
+        clamp(
+            (abs(le - lw) + abs(ls - ln)) * 1.8 +
+            abs(lc - ll) * 1.2,
+            0.0,
+            1.0);
+
+    center +=
+        high_frequency *
+        LIGHTING_STRENGTH *
+        0.30 *
+        (0.45 + detail_mask * 0.55);
+
+    // Approximate g_vSpecularLightMultiplier.
+    float spec =
+        pow(max(dot(normal, half_dir), 0.0),
+            24.0);
+
+    // Prevent every matte wall from becoming glossy.
+    float spec_gate =
+        smoothstep(0.20, 0.88, lc) *
+        (0.25 + detail_mask * 0.75);
+
+    center +=
+        float3(1.00, 0.95, 0.86) *
+        spec *
+        spec_gate *
+        LIGHTING_STRENGTH *
+        0.24;
+
+    // Very restrained rim response.
+    float rim =
+        pow(clamp(1.0 - normal.z,
+                  0.0,
+                  1.0),
+            1.6);
+
+    center +=
+        center *
+        rim *
+        LIGHTING_STRENGTH *
+        0.07;
   }
 
   if (OptionEnabled(SSAO_ENABLE))
   {
-    // Screen-space/luminance AO approximation. It intentionally does not claim
-    // to replace the game's geometry/light shadow system.
-    float cavity = clamp((ll - lc) * 2.2, 0.0, 1.0);
-    center *= 1.0 - cavity * SSAO_STRENGTH * 0.48;
+    float cavity =
+        clamp((ll - lc) * 2.35,
+              0.0,
+              1.0);
+
+    float diagonal =
+        (Luma(ne) +
+         Luma(nw) +
+         Luma(se) +
+         Luma(sw)) * 0.25;
+
+    cavity =
+        max(
+            cavity,
+            clamp((diagonal - lc) * 1.65,
+                  0.0,
+                  1.0));
+
+    center *=
+        1.0 -
+        cavity *
+        SSAO_STRENGTH *
+        0.46;
   }
 
   if (OptionEnabled(CONTACT_SHADOW_ENABLE))
   {
-    float gx = abs(Luma(e) - Luma(w));
-    float gy = abs(Luma(s) - Luma(n));
-    float edge = clamp((gx + gy) * 2.4, 0.0, 1.0);
-    float dark_side = clamp(ll - lc + 0.08, 0.0, 1.0);
-    center *= 1.0 - edge * dark_side * CONTACT_SHADOW_STRENGTH * 0.38;
+    // Short-range directional shadowing aligned with the presentation light.
+    //
+    // This is still screen-space. The real long-term solution is a host-side
+    // remaster light/shadow pass driven by the PS3 .lit files.
+
+    float2 shadow_dir =
+        normalize(float2(0.42, 0.50));
+
+    float l1 =
+        Luma(
+            SampleLocation(
+                uv + shadow_dir * px * 2.5).rgb);
+
+    float l2 =
+        Luma(
+            SampleLocation(
+                uv + shadow_dir * px * 5.0).rgb);
+
+    float l3 =
+        Luma(
+            SampleLocation(
+                uv + shadow_dir * px * 8.0).rgb);
+
+    float occluder =
+        max(max(l1, l2), l3);
+
+    float directional_shadow =
+        clamp((occluder - lc) * 1.65,
+              0.0,
+              1.0);
+
+    float gx =
+        abs(Luma(e) - Luma(w));
+
+    float gy =
+        abs(Luma(s1) - Luma(n));
+
+    float edge =
+        clamp((gx + gy) * 2.0,
+              0.0,
+              1.0);
+
+    float edge_shadow =
+        edge *
+        clamp(ll - lc + 0.04,
+              0.0,
+              1.0) *
+        0.65;
+
+    float shadow =
+        max(directional_shadow,
+            edge_shadow);
+
+    center *=
+        1.0 -
+        shadow *
+        CONTACT_SHADOW_STRENGTH *
+        0.48;
   }
 
   if (OptionEnabled(BLOOM_ENABLE))
   {
-    float2 r1 = px * 2.0;
-    float2 r2 = px * 5.0;
+    // The PS3 executable contains distinct:
+    //
+    //   Bloom capture
+    //   Bloom
+    //   CompositeBloom
+    //
+    // Threshold each sample first, then accumulate multiple blur scales.
+
+    float2 r1 = px * 1.75;
+    float2 r2 = px * 4.50;
+    float2 r3 = px * 8.00;
+
     float3 bloom = float3(0.0);
-    bloom += SampleLocation(uv + float2( 1.0,  0.0) * r1).rgb;
-    bloom += SampleLocation(uv + float2(-1.0,  0.0) * r1).rgb;
-    bloom += SampleLocation(uv + float2( 0.0,  1.0) * r1).rgb;
-    bloom += SampleLocation(uv + float2( 0.0, -1.0) * r1).rgb;
-    bloom += SampleLocation(uv + float2( 1.0,  1.0) * r2).rgb;
-    bloom += SampleLocation(uv + float2(-1.0,  1.0) * r2).rgb;
-    bloom += SampleLocation(uv + float2( 1.0, -1.0) * r2).rgb;
-    bloom += SampleLocation(uv + float2(-1.0, -1.0) * r2).rgb;
-    bloom *= 0.125;
-    float gate = smoothstep(BLOOM_THRESHOLD, BLOOM_THRESHOLD + 0.35, Luma(bloom));
-    center += bloom * gate * BLOOM_INTENSITY * 0.55;
+
+    // Inner bloom.
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2( 1.0, 0.0) * r1).rgb) *
+        1.00;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(-1.0, 0.0) * r1).rgb) *
+        1.00;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(0.0,  1.0) * r1).rgb) *
+        1.00;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(0.0, -1.0) * r1).rgb) *
+        1.00;
+
+    // Medium diagonal glow.
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2( 1.0,  1.0) * r2).rgb) *
+        0.70;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(-1.0,  1.0) * r2).rgb) *
+        0.70;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2( 1.0, -1.0) * r2).rgb) *
+        0.70;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(-1.0, -1.0) * r2).rgb) *
+        0.70;
+
+    // Wide bloom.
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2( 1.0, 0.0) * r3).rgb) *
+        0.42;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(-1.0, 0.0) * r3).rgb) *
+        0.42;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(0.0,  1.0) * r3).rgb) *
+        0.42;
+
+    bloom +=
+        BrightPass(
+            SampleLocation(
+                uv + float2(0.0, -1.0) * r3).rgb) *
+        0.42;
+
+    bloom *= 1.0 / 8.48;
+
+    center +=
+        bloom *
+        BLOOM_INTENSITY *
+        0.68;
   }
 
   if (OptionEnabled(DOF_ENABLE) && DOF_STRENGTH > 0.001)
