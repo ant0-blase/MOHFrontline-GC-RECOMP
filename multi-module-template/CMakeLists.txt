@@ -68,7 +68,12 @@ target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_GAME_ID="${GAME_ID}")
 # fallback while removing the unnecessary EXRAM/MEM2 check from every inline
 # memory access.
 if(GAME_ID STREQUAL "GMFE69")
-  target_compile_definitions(${MODULE_NAME} PRIVATE GXRUNTIME_GAMECUBE_MEM1_ONLY=1)
+  target_compile_definitions(${MODULE_NAME} PRIVATE
+    GXRUNTIME_GAMECUBE_MEM1_ONLY=1
+    # MOH Frontline's sound-bank path can surface physical MEM1 offsets
+    # (for example 0x0057A551 == cached 0x8057A551).  Match ModernGekko's
+    # AddressSpace semantics instead of forwarding those offsets to Dolphin MMU.
+    GXRUNTIME_ALLOW_PHYSICAL_MEM1_ALIAS=1)
 endif()
 if(RECOMPCORE_MODULE_ENABLE_MEM_JOURNAL)
   target_compile_definitions(${MODULE_NAME} PRIVATE GXRUNTIME_ENABLE_MEM_JOURNAL=1)

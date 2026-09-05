@@ -87,8 +87,10 @@ struct State
   std::atomic<bool> invert_x{false};
   std::atomic<bool> invert_y{false};
   std::atomic<bool> ui_safe{true};
-  std::atomic<bool> adaptive_fps{true};
-  std::atomic<int> adaptive_profile{2}; // 0 off, 1 conservative, 2 balanced, 3 aggressive
+  std::atomic<bool> adaptive_fps{false};
+  std::atomic<u32> armed_present_xfb{0};
+  std::atomic<u32> direct_presented_xfb{0};
+  std::atomic<int> adaptive_profile{0}; // legacy setting; fixed VI target is used
   std::atomic<bool> raw_mouse{true};
   std::atomic<float> sensitivity{1.0f};
   std::atomic<float> sensitivity_x{1.0f};
@@ -98,15 +100,30 @@ struct State
   // Optional modern FPS aim-down-sights. Original MOHF aiming remains the
   // gameplay authority; this layer only modernizes camera/viewmodel presentation.
   std::atomic<bool> fps_ads_enabled{false};
-  std::atomic<float> ads_world_fov{72.0f};
-  std::atomic<float> ads_weapon_fov{68.0f};
-  std::atomic<float> ads_transition_ms{180.0f};
+  std::atomic<float> ads_world_fov{64.0f};
+  std::atomic<float> ads_weapon_fov{55.0f};
+  std::atomic<float> ads_transition_ms{110.0f};
   std::atomic<bool> ads_hide_crosshair{true};
   std::atomic<float> ads_center_strength{1.0f};
-  std::atomic<float> ads_target_x{0.0f};
+  std::atomic<float> ads_target_x{-0.32f};
   std::atomic<float> ads_target_y{0.0f};
-  std::atomic<float> ads_z_offset{0.0f};
+  std::atomic<float> ads_z_offset{0.06f};
   std::atomic<float> ads_blend{0.0f};
+
+  // Native PC/CS-style crosshair.
+  std::atomic<bool> pc_crosshair{true};
+  std::atomic<float> crosshair_r{0.20f};
+  std::atomic<float> crosshair_g{1.00f};
+  std::atomic<float> crosshair_b{0.20f};
+  std::atomic<float> crosshair_a{1.00f};
+  std::atomic<float> crosshair_h_length{8.0f};
+  std::atomic<float> crosshair_v_length{8.0f};
+  std::atomic<float> crosshair_gap{4.0f};
+  std::atomic<float> crosshair_thickness{2.0f};
+  std::atomic<bool> crosshair_dot{false};
+  std::atomic<float> crosshair_dot_size{2.0f};
+  std::atomic<bool> crosshair_outline{true};
+  std::atomic<float> crosshair_outline_size{1.0f};
   std::atomic<bool> gamepad_aim{false};
   std::atomic<int> current_weapon_type{-1};
   std::atomic<float> mouse_smoothing{0.0f};
@@ -117,6 +134,9 @@ struct State
   std::atomic<bool> crouch_latched{false};
   std::array<std::atomic<u32>, static_cast<size_t>(Action::Count)> keys{};
   std::array<std::atomic<bool>, 512> ascii_keys{};
+  std::atomic<bool> escape_down{false};
+  std::atomic<bool> tab_down{false};
+  std::atomic<bool> home_down{false};
   std::atomic<bool> ctrl_down{false};
   std::atomic<u32> mouse_buttons{0};
   std::atomic<double> rel_x{0.0};
@@ -244,6 +264,12 @@ bool KeyDown(u32 sym)
     return s.ascii_keys[sym].load(std::memory_order_relaxed);
   if (sym == KEY_CTRL_L || sym == KEY_CTRL_R)
     return s.ctrl_down.load(std::memory_order_relaxed);
+  if (sym == KEY_ESCAPE)
+    return s.escape_down.load(std::memory_order_relaxed);
+  if (sym == KEY_TAB)
+    return s.tab_down.load(std::memory_order_relaxed);
+  if (sym == KEY_HOME)
+    return s.home_down.load(std::memory_order_relaxed);
   return false;
 }
 
@@ -547,6 +573,7 @@ void ApplyFPS()
     UnsetEnv("MOH_TIMING_PATCH");
     UnsetEnv("MOH_FPS_TARGET");
     Config::SetCurrent(Config::MAIN_VI_OVERCLOCK_ENABLE, false);
+    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK, 1.0f);
     return;
   }
   SetEnv("MOH_TIMING_PATCH", "1");
@@ -581,6 +608,19 @@ void SaveSettings()
   f << "ads_target_x=" << s.ads_target_x.load() << '\n';
   f << "ads_target_y=" << s.ads_target_y.load() << '\n';
   f << "ads_z_offset=" << s.ads_z_offset.load() << '\n';
+  f << "pc_crosshair=" << s.pc_crosshair.load() << '\n';
+  f << "crosshair_r=" << s.crosshair_r.load() << '\n';
+  f << "crosshair_g=" << s.crosshair_g.load() << '\n';
+  f << "crosshair_b=" << s.crosshair_b.load() << '\n';
+  f << "crosshair_a=" << s.crosshair_a.load() << '\n';
+  f << "crosshair_h_length=" << s.crosshair_h_length.load() << '\n';
+  f << "crosshair_v_length=" << s.crosshair_v_length.load() << '\n';
+  f << "crosshair_gap=" << s.crosshair_gap.load() << '\n';
+  f << "crosshair_thickness=" << s.crosshair_thickness.load() << '\n';
+  f << "crosshair_dot=" << s.crosshair_dot.load() << '\n';
+  f << "crosshair_dot_size=" << s.crosshair_dot_size.load() << '\n';
+  f << "crosshair_outline=" << s.crosshair_outline.load() << '\n';
+  f << "crosshair_outline_size=" << s.crosshair_outline_size.load() << '\n';
   f << "mouse_smoothing=" << s.mouse_smoothing.load() << '\n';
   f << "mouse_acceleration=" << s.mouse_acceleration.load() << '\n';
   f << "invert_x=" << s.invert_x.load() << '\n';
@@ -677,6 +717,19 @@ void LoadSettings()
     else if (key == "ads_target_x") s.ads_target_x = std::clamp(as_f(), -2.0f, 2.0f);
     else if (key == "ads_target_y") s.ads_target_y = std::clamp(as_f(), -2.0f, 2.0f);
     else if (key == "ads_z_offset") s.ads_z_offset = std::clamp(as_f(), -2.0f, 2.0f);
+    else if (key == "pc_crosshair") s.pc_crosshair = as_i() != 0;
+    else if (key == "crosshair_r") s.crosshair_r = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "crosshair_g") s.crosshair_g = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "crosshair_b") s.crosshair_b = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "crosshair_a") s.crosshair_a = std::clamp(as_f(), 0.0f, 1.0f);
+    else if (key == "crosshair_h_length") s.crosshair_h_length = std::clamp(as_f(), 0.0f, 40.0f);
+    else if (key == "crosshair_v_length") s.crosshair_v_length = std::clamp(as_f(), 0.0f, 40.0f);
+    else if (key == "crosshair_gap") s.crosshair_gap = std::clamp(as_f(), 0.0f, 30.0f);
+    else if (key == "crosshair_thickness") s.crosshair_thickness = std::clamp(as_f(), 0.5f, 8.0f);
+    else if (key == "crosshair_dot") s.crosshair_dot = as_i() != 0;
+    else if (key == "crosshair_dot_size") s.crosshair_dot_size = std::clamp(as_f(), 0.5f, 10.0f);
+    else if (key == "crosshair_outline") s.crosshair_outline = as_i() != 0;
+    else if (key == "crosshair_outline_size") s.crosshair_outline_size = std::clamp(as_f(), 0.5f, 5.0f);
     else if (key == "mouse_smoothing") s.mouse_smoothing = std::clamp(as_f(), 0.0f, 0.95f);
     else if (key == "mouse_acceleration") s.mouse_acceleration = std::clamp(as_f(), 0.0f, 2.0f);
     else if (key == "invert_x") s.invert_x = as_i() != 0;
@@ -864,15 +917,29 @@ void ResetDefaults()
   s.sensitivity_y = 1.0f;
   s.ads_sensitivity = 0.80f;
   s.fps_ads_enabled = false;
-  s.ads_world_fov = 72.0f;
-  s.ads_weapon_fov = 68.0f;
-  s.ads_transition_ms = 180.0f;
+  s.ads_world_fov = 64.0f;
+  s.ads_weapon_fov = 55.0f;
+  s.ads_transition_ms = 110.0f;
   s.ads_hide_crosshair = true;
   s.ads_center_strength = 1.0f;
-  s.ads_target_x = 0.0f;
+  s.ads_target_x = -0.32f;
   s.ads_target_y = 0.0f;
-  s.ads_z_offset = 0.0f;
+  s.ads_z_offset = 0.06f;
   s.ads_blend = 0.0f;
+
+  s.pc_crosshair = true;
+  s.crosshair_r = 0.20f;
+  s.crosshair_g = 1.00f;
+  s.crosshair_b = 0.20f;
+  s.crosshair_a = 1.00f;
+  s.crosshair_h_length = 8.0f;
+  s.crosshair_v_length = 8.0f;
+  s.crosshair_gap = 4.0f;
+  s.crosshair_thickness = 2.0f;
+  s.crosshair_dot = false;
+  s.crosshair_dot_size = 2.0f;
+  s.crosshair_outline = true;
+  s.crosshair_outline_size = 1.0f;
   s.mouse_smoothing = 0.0f;
   s.mouse_acceleration = 0.0f;
   s.invert_x = false;
@@ -884,8 +951,8 @@ void ResetDefaults()
   s.gamepad_enabled = true;
   s.gamepad_sensitivity = 1.0f;
   s.gamepad_deadzone = 0.10f;
-  s.adaptive_fps = true;
-  s.adaptive_profile = 2;
+  s.adaptive_fps = false;
+  s.adaptive_profile = 0;
   s.ui_safe = true;
   s.hud_scale = 1.0f;
   s.hud_safe_width = 1.0f;
@@ -1025,6 +1092,8 @@ void SetGameplayActive(bool active)
   s.smooth_y = 0.0;
   if (!active)
   {
+    s.armed_present_xfb.store(0, std::memory_order_relaxed);
+    s.direct_presented_xfb.store(0, std::memory_order_relaxed);
     s.aim_latched = false;
     s.crouch_latched = false;
     s.mobile_move_x = 0.0f;
@@ -1122,6 +1191,12 @@ void KeyEvent(u32 keysym, bool down)
     s.ascii_keys[keysym] = down;
   if (keysym == KEY_CTRL_L || keysym == KEY_CTRL_R)
     s.ctrl_down = down;
+  else if (keysym == KEY_ESCAPE)
+    s.escape_down = down;
+  else if (keysym == KEY_TAB)
+    s.tab_down = down;
+  else if (keysym == KEY_HOME)
+    s.home_down = down;
 
   if (down)
   {
@@ -1295,56 +1370,80 @@ void SetMobileAction(MobileAction action, bool down)
   } while (true);
 }
 
+void ArmGameplayPresent(u32 xfb_addr)
+{
+  if (!s.initialized.load() || !s.gameplay.load() || s.requested_fps.load() < 0 || xfb_addr == 0)
+    return;
+  s.armed_present_xfb.store(xfb_addr, std::memory_order_release);
+}
+
+bool ConsumeGameplayPresent(u32 xfb_addr)
+{
+  if (!s.gameplay.load() || xfb_addr == 0)
+    return false;
+  u32 expected = xfb_addr;
+  if (!s.armed_present_xfb.compare_exchange_strong(expected, 0, std::memory_order_acq_rel))
+    return false;
+  s.direct_presented_xfb.store(xfb_addr, std::memory_order_release);
+  return true;
+}
+
+bool ConsumeVBlankPresentSuppression(u32 xfb_addr)
+{
+  if (xfb_addr == 0)
+    return false;
+  u32 expected = xfb_addr;
+  return s.direct_presented_xfb.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+}
+
 void AdaptivePerformanceUpdate()
 {
-  if (!s.initialized.load() || !s.gameplay.load() || !s.adaptive_fps.load() ||
-      s.adaptive_profile.load() == 0 || !std::getenv("MOH_TIMING_PATCH") ||
-      !Config::Get(Config::MAIN_VI_OVERCLOCK_ENABLE))
+  // Very small capacity follower, not the old audio-conservative controller.
+  // The requested FPS is a ceiling.  If the host only sustains e.g. 110/120,
+  // lower the gameplay VI to ~110 so CoreTiming/DSP remain at 100% real time.
+  // When headroom returns, gently climb back to the user's requested ceiling.
+  if (!s.initialized.load() || !s.gameplay.load())
     return;
 
-  const int fps = s.requested_fps.load();
-  const double target_fps = fps == 0 ? 1000.0 : (fps > 0 ? fps : NATIVE_VPS);
-  const double target_factor = std::max(1.0, target_fps / NATIVE_VPS);
-  const double current = Config::Get(Config::MAIN_VI_OVERCLOCK);
-  const double max_speed = Core::System::GetInstance().GetPerfMetrics().GetMaxSpeed();
-  if (!std::isfinite(max_speed) || max_speed <= 0.0)
+  const int requested_fps = s.requested_fps.load();
+  if (requested_fps < 0)
     return;
 
-  const int profile = std::clamp(s.adaptive_profile.load(), 1, 3);
-  const double alpha = profile == 1 ? 0.12 : (profile == 2 ? 0.20 : 0.30);
-  const double low = profile == 1 ? 0.99 : (profile == 2 ? 0.985 : 0.975);
-  const double high = profile == 1 ? 1.12 : (profile == 2 ? 1.09 : 1.06);
-  const double recovery_step = profile == 1 ? 0.020 : (profile == 2 ? 0.035 : 0.055);
-  s.adaptive_ema = s.adaptive_ema * (1.0 - alpha) + max_speed * alpha;
+  using clock = std::chrono::steady_clock;
+  static auto last_adjust = clock::now();
+  const auto now = clock::now();
+  if (now - last_adjust < std::chrono::milliseconds(250))
+    return;
+  last_adjust = now;
 
-  double next = current;
-  if (s.adaptive_ema < low)
+  const auto& perf = Core::System::GetInstance().GetPerfMetrics();
+  const double speed = std::clamp(perf.GetSpeed(), 0.25, 1.25);
+  const double max_speed = std::clamp(perf.GetMaxSpeed(), 0.25, 4.0);
+  const double target_hz = requested_fps == 0 ? 1000.0 : static_cast<double>(requested_fps);
+  double current_hz = static_cast<double>(Config::Get(Config::MAIN_VI_OVERCLOCK)) * NATIVE_VPS;
+  current_hz = std::clamp(current_hz, 20.0, target_hz);
+
+  double next_hz = current_hz;
+  if (speed < 0.985)
   {
-    s.adaptive_recovery_samples = 0;
-    const double pressure = std::clamp(s.adaptive_ema * 0.985, 0.82, 0.995);
-    next = std::max(1.0, current * pressure);
+    // One proportional correction is enough to turn 110/120 (~91.7%) into
+    // an ~110-Hz VI while keeping the guest clock/audio at full speed.
+    next_hz = current_hz * std::clamp(speed * 0.997, 0.70, 0.995);
   }
-  else if (s.adaptive_ema > high && current < target_factor)
+  else if (speed > 0.997 && current_hz + 0.25 < target_hz)
   {
-    ++s.adaptive_recovery_samples;
-    if (s.adaptive_recovery_samples >= (profile == 3 ? 2 : 3))
-    {
-      next = std::min(target_factor, current + recovery_step);
-      s.adaptive_recovery_samples = 0;
-    }
-  }
-  else
-  {
-    s.adaptive_recovery_samples = 0;
+    // Use measured headroom when available, but climb slowly to avoid hunting.
+    const double headroom_gain = std::clamp(max_speed * 0.985, 1.005, 1.08);
+    next_hz = current_hz * headroom_gain;
   }
 
-  if (std::fabs(next - current) > 0.010)
+  // Never jump below 20 Hz from a transient stall; normal 56/82/110-style
+  // drops are preserved as real frame rates while game/audio timing stays 1x.
+  next_hz = std::clamp(next_hz, 20.0, target_hz);
+  if (std::abs(next_hz - current_hz) >= 0.20)
   {
-    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK, static_cast<float>(next));
-    std::fprintf(stderr,
-                 "[moh-pc] adaptive FPS/audio: VI %.3f -> %.3f (EMA %.1f%%, instant %.1f%%, ~%.1f FPS)\\n",
-                 current, next, s.adaptive_ema * 100.0, max_speed * 100.0,
-                 next * NATIVE_VPS);
+    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK,
+                       static_cast<float>(next_hz / NATIVE_VPS));
   }
 }
 
@@ -1352,6 +1451,7 @@ void UpdateFrame()
 {
   if (!s.initialized.load())
     return;
+  AdaptivePerformanceUpdate();
   UpdateAdsAnimation();
   UpdateEnhancedPostProcess();
 }
@@ -1363,10 +1463,92 @@ float GetAdsTargetY() { return s.ads_target_y.load(); }
 float GetAdsZOffset() { return s.ads_z_offset.load(); }
 bool ShouldHideAdsCrosshair()
 {
+  // Native PC crosshair completely replaces the original MOH reticle.
+  if (s.pc_crosshair.load() && s.gameplay.load())
+    return true;
+
   return s.fps_ads_enabled.load() && s.ads_hide_crosshair.load() && s.ads_blend.load() > 0.72f;
+}
+
+bool IsPcCrosshairEnabled()
+{
+  return s.pc_crosshair.load() && s.gameplay.load();
 }
 void SetCurrentWeaponType(int type) { s.current_weapon_type = type; }
 int GetCurrentWeaponType() { return s.current_weapon_type.load(); }
+
+void DrawCrosshair(float backbuffer_scale)
+{
+  if (!s.initialized.load() || !s.gameplay.load() || !s.pc_crosshair.load() ||
+      s.settings_open.load() || s.movie_active.load())
+    return;
+
+  // Native PC crosshair is authoritative whenever enabled.
+  // Keep it visible during ADS as requested; only the original MOH
+  // crosshair is suppressed.
+  const ImGuiIO& io = ImGui::GetIO();
+  if (io.DisplaySize.x <= 1.0f || io.DisplaySize.y <= 1.0f)
+    return;
+
+  // Opt-in visual identity check; never changes defaults or saved settings.
+  static const bool debug_crosshair = [] {
+    const char* value = std::getenv("MOH_CROSSHAIR_DEBUG");
+    return value && std::string_view(value) == "1";
+  }();
+  const float scale = std::max(backbuffer_scale, 0.25f);
+  const float gap = (debug_crosshair ? 24.0f : std::max(s.crosshair_gap.load(), 0.0f)) * scale;
+  const float horizontal =
+      (debug_crosshair ? 80.0f : std::max(s.crosshair_h_length.load(), 0.0f)) * scale;
+  const float vertical =
+      (debug_crosshair ? 80.0f : std::max(s.crosshair_v_length.load(), 0.0f)) * scale;
+  const float thickness = std::max(s.crosshair_thickness.load(), 0.5f) * scale;
+  const float outline = std::max(s.crosshair_outline_size.load(), 0.0f) * scale;
+
+  const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+
+  const ImU32 color = debug_crosshair ? IM_COL32(255, 0, 255, 255) :
+      ImGui::ColorConvertFloat4ToU32(ImVec4(
+      std::clamp(s.crosshair_r.load(), 0.0f, 1.0f),
+      std::clamp(s.crosshair_g.load(), 0.0f, 1.0f),
+      std::clamp(s.crosshair_b.load(), 0.0f, 1.0f),
+      std::clamp(s.crosshair_a.load(), 0.0f, 1.0f)));
+
+  constexpr ImU32 outline_color = IM_COL32(0, 0, 0, 220);
+  ImDrawList* draw = ImGui::GetForegroundDrawList();
+
+  auto line = [&](const ImVec2& a, const ImVec2& b)
+  {
+    if (s.crosshair_outline.load() && outline > 0.0f)
+      draw->AddLine(a, b, outline_color, thickness + outline * 2.0f);
+    draw->AddLine(a, b, color, thickness);
+  };
+
+  if (horizontal > 0.0f)
+  {
+    line(ImVec2(center.x - gap - horizontal, center.y),
+         ImVec2(center.x - gap, center.y));
+    line(ImVec2(center.x + gap, center.y),
+         ImVec2(center.x + gap + horizontal, center.y));
+  }
+
+  if (vertical > 0.0f)
+  {
+    line(ImVec2(center.x, center.y - gap - vertical),
+         ImVec2(center.x, center.y - gap));
+    line(ImVec2(center.x, center.y + gap),
+         ImVec2(center.x, center.y + gap + vertical));
+  }
+
+  if (s.crosshair_dot.load())
+  {
+    const float radius = std::max(s.crosshair_dot_size.load(), 0.5f) * scale;
+
+    if (s.crosshair_outline.load() && outline > 0.0f)
+      draw->AddCircleFilled(center, radius + outline, outline_color, 20);
+
+    draw->AddCircleFilled(center, radius, color, 20);
+  }
+}
 
 void DrawSettingsUI(float backbuffer_scale)
 {
@@ -1396,16 +1578,7 @@ void DrawSettingsUI(float backbuffer_scale)
           s.requested_fps = fps_values[fps_idx];
           ApplyFPS();
         }
-        bool adaptive = s.adaptive_fps.load();
-        if (ImGui::Checkbox("Adaptive FPS to protect audio / full-speed emulation", &adaptive))
-          s.adaptive_fps = adaptive;
-        int adaptive_profile = s.adaptive_profile.load();
-        const char* adaptive_items[] = {"Off", "Conservative", "Balanced", "Aggressive"};
-        if (ImGui::Combo("Adaptive profile", &adaptive_profile, adaptive_items, 4))
-        {
-          s.adaptive_profile = adaptive_profile;
-          s.adaptive_fps = adaptive_profile != 0;
-        }
+        ImGui::TextDisabled("FPS target is a ceiling; gameplay VI follows sustainable speed, audio stays real-time");
 
         bool fov_on = s.fov_override.load();
         if (ImGui::Checkbox("Custom world FOV", &fov_on))
@@ -1602,6 +1775,22 @@ void DrawSettingsUI(float backbuffer_scale)
           if (!fps_ads) s.ads_blend=0.0f;
           ApplyAdsEnvironment();
         }
+        ImGui::SameLine();
+        if (ImGui::Button("CoD ADS preset"))
+        {
+          s.fps_ads_enabled = true;
+          s.ads_world_fov = 64.0f;
+          s.ads_weapon_fov = 55.0f;
+          s.ads_transition_ms = 110.0f;
+          s.ads_center_strength = 1.0f;
+
+          // Pull the viewmodel left/forward toward the actual iron-sight axis.
+          s.ads_target_x = -0.32f;
+          s.ads_target_y = 0.0f;
+          s.ads_z_offset = 0.06f;
+
+          ApplyAdsEnvironment();
+        }
         float ads_world=s.ads_world_fov.load(), ads_weapon=s.ads_weapon_fov.load();
         float transition=s.ads_transition_ms.load();
         if (ImGui::SliderFloat("ADS world FOV", &ads_world, 45.0f, 100.0f, "%.1f deg")) { s.ads_world_fov=ads_world; ApplyAdsEnvironment(); }
@@ -1616,7 +1805,67 @@ void DrawSettingsUI(float backbuffer_scale)
         if (ImGui::SliderFloat("Sight target Y", &ty, -1.5f, 1.5f, "%.3f")) s.ads_target_y=ty;
         if (ImGui::SliderFloat("Sight Z offset", &tz, -1.5f, 1.5f, "%.3f")) s.ads_z_offset=tz;
         ImGui::Text("ADS blend: %.2f | detected weapon type: %d", s.ads_blend.load(), s.current_weapon_type.load());
-        ImGui::TextWrapped("The original aim/fire mechanics remain active. FPS ADS only animates camera FOV, viewmodel centering, mouse sensitivity and optional crosshair/DOF presentation. Use the X/Y/Z sliders to fine-calibrate iron sights per build/weapon animation.");
+        ImGui::TextWrapped("CoD preset pulls the weapon toward the screen centre/iron-sight axis. Fine-tune Sight target X/Y and Z offset per weapon if necessary.");
+
+        ImGui::SeparatorText("PC crosshair");
+
+        bool pc_crosshair = s.pc_crosshair.load();
+        if (ImGui::Checkbox("Use native PC crosshair", &pc_crosshair))
+          s.pc_crosshair = pc_crosshair;
+
+        float color[4] = {
+            s.crosshair_r.load(),
+            s.crosshair_g.load(),
+            s.crosshair_b.load(),
+            s.crosshair_a.load()};
+
+        if (ImGui::ColorEdit4("Crosshair color", color, ImGuiColorEditFlags_AlphaBar))
+        {
+          s.crosshair_r = color[0];
+          s.crosshair_g = color[1];
+          s.crosshair_b = color[2];
+          s.crosshair_a = color[3];
+        }
+
+        float h_len = s.crosshair_h_length.load();
+        float v_len = s.crosshair_v_length.load();
+        float gap = s.crosshair_gap.load();
+        float thickness = s.crosshair_thickness.load();
+
+        if (ImGui::SliderFloat("Horizontal line length", &h_len, 0.0f, 40.0f, "%.1f px"))
+          s.crosshair_h_length = h_len;
+
+        if (ImGui::SliderFloat("Vertical line length", &v_len, 0.0f, 40.0f, "%.1f px"))
+          s.crosshair_v_length = v_len;
+
+        if (ImGui::SliderFloat("Crosshair gap", &gap, 0.0f, 30.0f, "%.1f px"))
+          s.crosshair_gap = gap;
+
+        if (ImGui::SliderFloat("Crosshair thickness", &thickness, 0.5f, 8.0f, "%.1f px"))
+          s.crosshair_thickness = thickness;
+
+        bool dot = s.crosshair_dot.load();
+        if (ImGui::Checkbox("Center dot", &dot))
+          s.crosshair_dot = dot;
+
+        if (dot)
+        {
+          float dot_size = s.crosshair_dot_size.load();
+          if (ImGui::SliderFloat("Center dot size", &dot_size, 0.5f, 10.0f, "%.1f px"))
+            s.crosshair_dot_size = dot_size;
+        }
+
+        bool outline = s.crosshair_outline.load();
+        if (ImGui::Checkbox("Crosshair outline", &outline))
+          s.crosshair_outline = outline;
+
+        if (outline)
+        {
+          float outline_size = s.crosshair_outline_size.load();
+          if (ImGui::SliderFloat("Outline size", &outline_size, 0.5f, 5.0f, "%.1f px"))
+            s.crosshair_outline_size = outline_size;
+        }
+
         ImGui::EndTabItem();
       }
 
@@ -1774,7 +2023,7 @@ void DrawDebugUI(float backbuffer_scale)
     const auto& perf = Core::System::GetInstance().GetPerfMetrics();
     ImGui::Text("FPS             %7.2f", perf.GetFPS());
     ImGui::Text("Emulation max   %7.1f %%", perf.GetMaxSpeed() * 100.0);
-    ImGui::Text("Adaptive EMA    %7.1f %%", s.adaptive_ema * 100.0);
+    ImGui::Text("FPS control      fixed VI target (adaptive off)");
     ImGui::Text("VI              %7.2f Hz", Config::Get(Config::MAIN_VI_OVERCLOCK) * NATIVE_VPS);
     ImGui::Text("Gameplay        %s", s.gameplay.load() ? "yes" : "no");
     ImGui::Text("Mouse capture   %s", WantsRelativeMouse() ? "yes" : "no");

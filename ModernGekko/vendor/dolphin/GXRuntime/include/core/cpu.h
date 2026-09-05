@@ -199,12 +199,22 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
      * MEM1 is fixed at 24 MiB. Non-MEM1 addresses return NULL and continue
      * through the existing external/MMIO path used by the memory helpers.
      *
-     * Keeps generated code small and architecture-neutral:
-     * i686, x86-64 and AArch64 all use the same C source.
+     * Some ModernGekko bridges expose a MEM1 pointer in physical form
+     * (0x00000000..0x017FFFFF) instead of its cached/uncached effective alias
+     * (0x80000000/0xC0000000 + offset).  AddressSpace::Resolve() already
+     * accepts both forms.  Keep that behaviour opt-in here so a title which
+     * needs physical MEM1 aliases does not fall through to Dolphin's MMU and
+     * spuriously raise a DSI for an otherwise valid MEM1 offset.
      */
+#if defined(GXRUNTIME_ALLOW_PHYSICAL_MEM1_ALIAS)
+    const u32 offset = (masked_addr < GC_MAIN_RAM_SIZE)
+                           ? masked_addr
+                           : (masked_addr - GC_RAM_BASE);
+#else
     const u32 offset = masked_addr - GC_RAM_BASE;
+#endif
 
-    if (offset <= GC_MAIN_RAM_SIZE - size) {
+    if (size <= GC_MAIN_RAM_SIZE && offset <= GC_MAIN_RAM_SIZE - size) {
         if (out_offset)
             *out_offset = offset;
         GXRUNTIME_ASSUME(cpu->ram != NULL);

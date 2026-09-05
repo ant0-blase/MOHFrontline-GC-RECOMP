@@ -65,6 +65,9 @@
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VertexShaderManager.h"
 #include "VideoCommon/VideoConfig.h"
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
+#include "VideoCommon/MohPcLayer.h"
+#endif
 #include "VideoCommon/VideoState.h"
 #include "VideoCommon/Widescreen.h"
 #include "VideoCommon/XFStateManager.h"
@@ -101,7 +104,11 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
   auto& system = Core::System::GetInstance();
   auto& core_timing = system.GetCoreTiming();
 
-  if (!g_ActiveConfig.bImmediateXFB)
+  bool suppress_moh_vi_present = false;
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
+  suppress_moh_vi_present = MohPcLayer::ConsumeVBlankPresentSuppression(xfb_addr);
+#endif
+  if (!g_ActiveConfig.bImmediateXFB && !suppress_moh_vi_present)
   {
     system.GetFifo().SyncGPU(Fifo::SyncGPUReason::Swap);
 

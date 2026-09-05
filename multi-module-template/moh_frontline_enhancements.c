@@ -79,6 +79,7 @@ static int s_hud_logged;
 #define MOH_HOSTCALL_GAMEPLAY_ENTER   0xFFFFF110u
 #define MOH_HOSTCALL_GAMEPLAY_EXIT    0xFFFFF111u
 #define MOH_HOSTCALL_ADS_STATE        0xFFFFF131u
+#define MOH_HOSTCALL_FRAME_PRESENT     0xFFFFF133u
 
 static int env_enabled(const char* name)
 {
@@ -578,14 +579,42 @@ void moh_ui_end(CPUState* ctx)
     s_ui_root_y_scale = 1.0;
 }
 
+static int s_hud_hide_guest_crosshair = 0;
+static int s_hud_crosshair_log_once = 0;
+
+static int moh_query_hide_guest_crosshair(CPUState* ctx)
+{
+    u32 saved_r3;
+    int hide;
+
+    if (!ctx || !ctx->host_call)
+        return 0;
+
+    /*
+     * 0xFFFFF132 = native crosshair host call.
+     * Use r3=1 as sentinel. Host changes r3 to 0 when the original
+     * GMFE69 crosshair must be suppressed.
+     */
+    saved_r3 = ctx->gpr[3];
+    ctx->gpr[3] = 1u;
+
+    (void)ctx->host_call(ctx, 0xFFFFF132u);
+
+    hide = ctx->gpr[3] == 0u;
+    ctx->gpr[3] = saved_r3;
+
+    return hide;
+}
+
 void moh_hud_begin(CPUState* ctx)
 {
     double x_scale;
     double y_scale;
 
-    (void)ctx;
     if (s_hud_draw_depth++ != 0u)
         return;
+
+    s_hud_hide_guest_crosshair = moh_query_hide_guest_crosshair(ctx);
 
     if (!moh_hud_compute_scales(&x_scale, &y_scale))
     {
@@ -618,6 +647,7 @@ void moh_hud_end(CPUState* ctx)
 
     s_hud_root_x_scale = 1.0;
     s_hud_root_y_scale = 1.0;
+    s_hud_hide_guest_crosshair = 0;
 }
 
 void moh_hud_poly_begin(CPUState* ctx)
@@ -626,42 +656,107 @@ void moh_hud_poly_begin(CPUState* ctx)
     const f32 center_y = 240.0f;
     const u32 verts = ctx ? ctx->gpr[4] : 0u;
     const u32 count = ctx ? ctx->gpr[5] : 0u;
+
+    f32 min_x = 1000000.0f;
+    f32 max_x = -1000000.0f;
+    f32 min_y = 1000000.0f;
+    f32 max_y = -1000000.0f;
+
+    int kill_guest_crosshair = 0;
     u32 i;
 
     s_hud_poly_address = 0u;
     s_hud_poly_count = 0u;
 
-    if (!ctx || s_hud_draw_depth == 0u || count == 0u || count > MOH_HUD_MAX_POLY_VERTS)
+    if (!ctx || s_hud_draw_depth == 0u ||
+        count == 0u || count > MOH_HUD_MAX_POLY_VERTS)
         return;
-    if (verts < 0x80000000u || verts > 0x817FFFFFu - count * 24u)
+
+    if (verts < 0x80000000u ||
+        verts > 0x817FFFFFu - count * 24u)
         return;
+
+    /* Inspect original 640x480 HUD coordinates first. */
+    for (i = 0; i < count; ++i)
+    {
+        const u32 vertex = verts + i * 24u;
+        const f32 x = f32_from_bits(mem_read32(ctx, vertex + 8u));
+        const f32 y = f32_from_bits(mem_read32(ctx, vertex + 12u));
+
+        if (!isfinite(x) || !isfinite(y))
+            return;
+
+        if (x < min_x) min_x = x;
+        if (x > max_x) max_x = x;
+        if (y < min_y) min_y = y;
+        if (y > max_y) max_y = y;
+    }
+
+    /*
+     * Original MOH reticle is small geometry centred around 320x240.
+     * Only run this detector when the native PC crosshair explicitly
+     * requests replacement of the guest one.
+     */
+    if (s_hud_hide_guest_crosshair && count == 4u)
+    {
+        const f32 width = max_x - min_x;
+        const f32 height = max_y - min_y;
+
+        const int near_center =
+            max_x >= center_x - 36.0f &&
+            min_x <= center_x + 36.0f &&
+            max_y >= center_y - 36.0f &&
+            min_y <= center_y + 36.0f;
+
+        const int reticle_size =
+            width >= 1.0f && width <= 96.0f &&
+            height >= 1.0f && height <= 96.0f;
+
+        if (near_center && reticle_size)
+            kill_guest_crosshair = 1;
+    }
 
     for (i = 0; i < count; ++i)
     {
         const u32 vertex = verts + i * 24u;
         const u32 x_bits = mem_read32(ctx, vertex + 8u);
         const u32 y_bits = mem_read32(ctx, vertex + 12u);
+
         const f32 x = f32_from_bits(x_bits);
         const f32 y = f32_from_bits(y_bits);
-        const f32 out_x = center_x + (x - center_x) * (f32)s_hud_root_x_scale;
-        const f32 out_y = center_y + (y - center_y) * (f32)s_hud_root_y_scale;
-
-        if (!isfinite(x) || !isfinite(y))
-        {
-            /* Restore any vertices already touched before abandoning. */
-            while (i != 0u)
-            {
-                --i;
-                mem_write32(ctx, verts + i * 24u + 8u, s_hud_saved_x[i]);
-                mem_write32(ctx, verts + i * 24u + 12u, s_hud_saved_y[i]);
-            }
-            return;
-        }
 
         s_hud_saved_x[i] = x_bits;
         s_hud_saved_y[i] = y_bits;
-        mem_write32(ctx, vertex + 8u, f32_bits(out_x));
-        mem_write32(ctx, vertex + 12u, f32_bits(out_y));
+
+        if (kill_guest_crosshair)
+        {
+            /* Remove only transient draw geometry. */
+            mem_write32(ctx, vertex + 8u, f32_bits(-4096.0f));
+            mem_write32(ctx, vertex + 12u, f32_bits(-4096.0f));
+        }
+        else
+        {
+            const f32 out_x =
+                center_x + (x - center_x) * (f32)s_hud_root_x_scale;
+            const f32 out_y =
+                center_y + (y - center_y) * (f32)s_hud_root_y_scale;
+
+            mem_write32(ctx, vertex + 8u, f32_bits(out_x));
+            mem_write32(ctx, vertex + 12u, f32_bits(out_y));
+        }
+    }
+
+    if (kill_guest_crosshair && !s_hud_crosshair_log_once)
+    {
+        s_hud_crosshair_log_once = 1;
+
+        fprintf(stderr,
+                "[moh-enh] original crosshair draw suppressed "
+                "(%.1f,%.1f -> %.1f,%.1f)\n",
+                (double)min_x,
+                (double)min_y,
+                (double)max_x,
+                (double)max_y);
     }
 
     s_hud_poly_address = verts;
@@ -740,6 +835,27 @@ int moh_timing_enabled(void)
 {
     refresh_config();
     return s_timing_enabled && s_gameplay_active;
+}
+
+void moh_player_vertical_delta_fix(CPUState* ctx)
+{
+    double delta;
+
+    if (!ctx)
+        return;
+    refresh_config();
+    if (!s_timing_enabled || !s_gameplay_active)
+        return;
+
+    delta = ctx->fpr[28];
+    if (!isfinite(delta) || delta <= 0.0 || delta >= 1.0)
+        return;
+
+    /* Original instruction at 0x800A310C has just computed f0 = vertical/delta.
+     * For sub-1 deltas this artificially amplifies the contact/step correction.
+     * Multiplying by the same delta restores the original vertical value while
+     * leaving the rest of BeginUpdate's fractional-delta logic untouched. */
+    ctx->fpr[0] *= delta * delta;
 }
 
 void moh_timing_set_gameplay(CPUState* ctx, int active)
@@ -860,6 +976,15 @@ void moh_timing_frame_advance(void)
             fprintf(stderr, "[moh-enh] gameplay FPS unlock: %.3f FPS, delta=%.6f ticks\n",
                     s_target_fps, s_delta_ticks);
     }
+}
+
+
+void moh_timing_arm_present(CPUState* ctx)
+{
+    refresh_config();
+    if (!ctx || !s_timing_enabled || !s_gameplay_active || !ctx->host_call)
+        return;
+    (void)ctx->host_call(ctx, MOH_HOSTCALL_FRAME_PRESENT);
 }
 
 f64 moh_timing_delta_ticks(void)

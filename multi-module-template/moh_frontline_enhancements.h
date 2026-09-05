@@ -21,6 +21,7 @@ void moh_hud_text_position_override(CPUState* ctx);
 void moh_hud_centered_text_position_override(CPUState* ctx);
 void moh_ui_font_scale_override(CPUState* ctx);
 int moh_timing_enabled(void);
+void moh_player_vertical_delta_fix(CPUState* ctx);
 void moh_timing_set_gameplay(CPUState* ctx, int active);
 void moh_timing_frame_advance(void);
 f64 moh_timing_delta_ticks(void);
@@ -28,6 +29,7 @@ u32 moh_timing_integer_ticks(void);
 f64 moh_timing_game_time_seconds(void);
 u32 moh_timing_frame_count(void);
 u32 moh_timing_vsyncs(CPUState* ctx);
+void moh_timing_arm_present(CPUState* ctx);
 
 #ifdef __cplusplus
 }

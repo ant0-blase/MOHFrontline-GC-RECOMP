@@ -33,6 +33,7 @@ constexpr std::uint32_t MOH_HOSTCALL_MOUSE_LOOK = 0xFFFFF120u;
 constexpr std::uint32_t MOH_HOSTCALL_ADS_VIEWMODEL = 0xFFFFF130u;
 constexpr std::uint32_t MOH_HOSTCALL_ADS_STATE = 0xFFFFF131u;
 constexpr std::uint32_t MOH_HOSTCALL_ADS_CROSSHAIR = 0xFFFFF132u;
+constexpr std::uint32_t MOH_HOSTCALL_FRAME_PRESENT = 0xFFFFF133u;
 constexpr std::uint32_t MOH_HOSTCALL_VP6_MOVIE_ON = 0xFFFFF140u;
 constexpr std::uint32_t MOH_HOSTCALL_VP6_MOVIE_OFF = 0xFFFFF141u;
 
@@ -984,8 +985,14 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     return true;
   }
   if (address == MOH_HOSTCALL_ADS_CROSSHAIR) {
-    if (state && MohPcLayer::ShouldHideAdsCrosshair())
+    if (state &&
+        (MohPcLayer::IsPcCrosshairEnabled() ||
+         MohPcLayer::ShouldHideAdsCrosshair()))
+    {
+      // The native CS-style reticle is authoritative. Never allow the
+      // original GMFE69 crosshair status to reach the HUD while enabled.
       state->gpr[3] = 0;
+    }
     return true;
   }
   if (address == MOH_HOSTCALL_ADS_VIEWMODEL) {
@@ -1030,6 +1037,12 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
                    "[moh-pc] FPS ADS viewmodel hook active: object=%08x type=%d blend=%.2f\\n",
                    weapon_object, MohPcLayer::GetCurrentWeaponType(), blend);
     }
+    return true;
+  }
+
+
+  if (address == MOH_HOSTCALL_FRAME_PRESENT) {
+    MohPcLayer::ArmGameplayPresent(state->gpr[3]);
     return true;
   }
 

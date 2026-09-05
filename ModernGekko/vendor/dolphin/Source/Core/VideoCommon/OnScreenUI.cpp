@@ -422,6 +422,7 @@ void OnScreenUI::Finalize()
   perf_metrics.DrawImGuiStats(m_backbuffer_scale);
   DrawDebugText();
   MohPcLayer::UpdateFrame();
+  MohPcLayer::DrawCrosshair(m_backbuffer_scale);
   MohPcLayer::DrawSettingsUI(m_backbuffer_scale);
   MohPcLayer::DrawDebugUI(m_backbuffer_scale);
   OSD::DrawMessages();

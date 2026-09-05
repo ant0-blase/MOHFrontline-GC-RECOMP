@@ -26,6 +26,9 @@
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/GeometryShaderManager.h"
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
+#include "VideoCommon/MohPcLayer.h"
+#endif
 #include "VideoCommon/OpcodeDecoding.h"
 #include "VideoCommon/PerfQueryBase.h"
 #include "VideoCommon/PixelEngine.h"
@@ -358,7 +361,11 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
         //       Might also clean up some issues with games doing XFB copies they don't intend to
         //       display.
 
-        if (g_ActiveConfig.bImmediateXFB)
+        bool moh_final_frame = false;
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
+        moh_final_frame = MohPcLayer::ConsumeGameplayPresent(destAddr);
+#endif
+        if (g_ActiveConfig.bImmediateXFB || moh_final_frame)
         {
           // below div two to convert from bytes to pixels - it expects width, not stride
           g_presenter->ImmediateSwap(destAddr, destStride / 2, destStride, height);

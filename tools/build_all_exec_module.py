@@ -243,6 +243,36 @@ def _inject_after_label(generated: Path, label: str, body: str, occurrence: str 
 def apply_gmfe69_generated_enhancements(generated: Path):
     """Inject GMFE69 overrides into the actual generated C fast paths."""
 
+    # SND bank parser safety. SNDI_parsetimbre receives a pointer-to-pointer in
+    # r3 and immediately dereferences the stream as CPU memory. A corrupted or
+    # tagged stream such as 0x8869xxxx is outside GameCube MEM1 and otherwise
+    # makes SNDI_getb/SNDI_gettag walk thousands of invalid bytes. Bail out
+    # before the function prologue and report "no more timbres" (r3 = 0).
+    # Accept physical, cached and uncached aliases of the 24 MiB MEM1 only.
+    _inject_after_label(generated, "8015E3A4", """    {
+        const u32 pp = ctx->gpr[3];
+        const u32 pp_phys = pp & 0x3FFFFFFFu;
+        u32 stream = 0u;
+        u32 stream_phys = 0u;
+        int bad = 0;
+
+        if (pp == 0u || pp_phys > 0x017FFFFCu) {
+            bad = 1;
+        } else {
+            stream = mem_read32(ctx, pp);
+            stream_phys = stream & 0x3FFFFFFFu;
+            if (stream == 0u || stream_phys >= 0x01800000u)
+                bad = 1;
+        }
+
+        if (bad) {
+            ctx->gpr[3] = 0u;
+            ctx->pc = ctx->lr & ~3u;
+            goto return_dispatch_8015AE80;
+        }
+    }
+""")
+
     _inject_after_label(generated, "80079E7C", """    if (moh_camera_override(ctx)) {
         ctx->pc = ctx->lr & ~3u;
         goto return_dispatch_80076E80;
@@ -280,10 +310,44 @@ def apply_gmfe69_generated_enhancements(generated: Path):
         (void)ctx->host_call(ctx, 0xFFFFF130u);
 """)
 
-    # GetCrosshairStatus is just lbz r3,0x215(r3); blr.  Let the host clear r3
-    # while fully ADS without bypassing or replacing the original HUD logic.
-    _inject_after_label(generated, "800DF23C", """    if (ctx->host_call)
-        (void)ctx->host_call(ctx, 0xFFFFF132u);
+    # Native PC crosshair is authoritative.
+    #
+    # GetCrosshairStatus:
+    #   800DF238  lbz r3,0x215(r3)
+    #   800DF23C  blr
+    #
+    # When the host PC crosshair is enabled:
+    #   - preserve the original object pointer
+    #   - query the PC layer
+    #   - clear the guest +0x215 crosshair flag itself
+    #   - return 0 without executing the original lbz
+    #
+    # Clearing the guest byte is important because some HUD paths cache/read
+    # the field directly instead of calling GetCrosshairStatus every draw.
+    _inject_after_label(generated, "800DF238", """    {
+        const u32 moh_crosshair_object = ctx->gpr[3];
+
+        if (ctx->host_call) {
+            /* sentinel: host changes r3 to zero when native PC crosshair
+             * owns the reticle. */
+            ctx->gpr[3] = 1u;
+            (void)ctx->host_call(ctx, 0xFFFFF132u);
+
+            if (ctx->gpr[3] == 0u) {
+                if (moh_crosshair_object >= 0x80000000u &&
+                    moh_crosshair_object <= 0x817FFDEAu) {
+                    mem_write8(ctx, moh_crosshair_object + 0x215u, 0u);
+                }
+
+                ctx->gpr[3] = 0u;
+                goto label_800DF23C;
+            }
+
+            /* Host did not request replacement: restore this pointer and
+             * execute original lbz normally. */
+            ctx->gpr[3] = moh_crosshair_object;
+        }
+    }
 """)
 
     # Frontend IStudio/UIS.  Its authored coordinate space is native 640x480;
@@ -331,11 +395,25 @@ def apply_gmfe69_generated_enhancements(generated: Path):
     _inject_after_label(generated, "80019794", """    moh_timing_set_gameplay(ctx, 0);
 """)
 
-    # Keep the original CScreen::Wait VBlank synchronization.  ModernGekko's
-    # native VI-frequency override supplies faster VBlanks; only advance MOH's
-    # virtual 60-Hz simulation clock after the original wait has completed.
+    # Keep the original CScreen::Wait VBlank synchronization.  The v5 late-frame
+    # bypass caused MOH's internal frame accounting to run at the wrong cadence.
+    # Advance the virtual timing only after the game's real wait has completed.
     _inject_after_label(generated, "8001B938", """    if (moh_timing_enabled()) {
         moh_timing_frame_advance();
+    }
+""")
+
+    # BeginUpdate divides the player's vertical correction by the frame delta
+    # at 0x800A310C.  That is fine for delta>=1 (slow frames), but for unlocked
+    # FPS delta<1 it amplifies stair/contact impulses (x2 at 120, x4 at 240).
+    # Undo only that amplification before the value is stored at 0x800A3110.
+    _inject_after_label(generated, "800A3110", """    moh_player_vertical_delta_fix(ctx);
+""")
+    # Present the completed gameplay frame immediately after the final CScreen::Flip
+    # XFB copy is issued.  Unlike global ImmediateXFB this arms only this one
+    # GXCopyDisp, so capture/initialization/intermediate copies are never shown.
+    _inject_after_label(generated, "8001BAD0", """    if (moh_timing_enabled()) {
+        moh_timing_arm_present(ctx);
     }
 """)
     _inject_after_label(generated, "8001B940", """    if (moh_timing_enabled()) {

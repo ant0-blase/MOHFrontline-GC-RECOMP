@@ -27,6 +27,11 @@ void ApplyDolphinSettings();
 void AdaptivePerformanceUpdate();
 void UpdateFrame();
 
+// GMFE69 direct-present bridge: arm exactly the final XFB copied by CScreen::Flip.
+void ArmGameplayPresent(u32 xfb_addr);
+bool ConsumeGameplayPresent(u32 xfb_addr);
+bool ConsumeVBlankPresentSuppression(u32 xfb_addr);
+
 void SetGameplayActive(bool active);
 bool IsGameplayActive();
 void SetMovieActive(bool active);
@@ -60,9 +65,11 @@ float GetAdsTargetX();
 float GetAdsTargetY();
 float GetAdsZOffset();
 bool ShouldHideAdsCrosshair();
+bool IsPcCrosshairEnabled();
 void SetCurrentWeaponType(int type);
 int GetCurrentWeaponType();
 
+void DrawCrosshair(float backbuffer_scale);
 void DrawSettingsUI(float backbuffer_scale);
 void DrawDebugUI(float backbuffer_scale);
 }
