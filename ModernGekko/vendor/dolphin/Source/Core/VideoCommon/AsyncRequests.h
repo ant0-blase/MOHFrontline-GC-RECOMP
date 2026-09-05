@@ -21,6 +21,12 @@ public:
   // Called from the Video thread.
   void PullEvents();
 
+  // Same drain path, but the video-thread caller has already observed the SPSC
+  // queue as non-empty.  There is only one consumer, so producers can add work
+  // but cannot invalidate that observation.  This avoids a second acquire-load
+  // on the overwhelmingly single-event path.
+  void PullEventsKnownPending();
+
   // Cheap hot-path probe for the FIFO loop. PullEvents() contains the full
   // event-drain path and therefore gets a sizeable stack frame/stack canary
   // even when the SPSC queue is empty. Keep the existing acquire load from

@@ -1113,6 +1113,58 @@ def _patch_final_burst_fastpaths(text: str) -> str:
     if "MOH_GMFE69_BURST_ADJACENT_CHUNK_FASTPATH" in text:
         return text
 
+    # Round11 direct-dispatch form. build_all_exec_module.py caches the
+    # selected image as a function pointer (s_active_dispatch/cached_dispatch)
+    # instead of re-running switch(image) for every native block. Preserve that
+    # form and add only the adjacent-chunk resolver used by the legacy postgen.
+    if "MultiImageDispatch cached_dispatch = 0;" in text:
+        old_direct = """        if (chunk < 0 || pc < cached_chunk_start || pc >= cached_chunk_end) {
+            chunk = multi_chunk_index(pc);
+            if (chunk < 0) break;
+            cached_chunk = chunk;
+            cached_chunk_start = s_chunk_ranges[(u32)chunk].start;
+            cached_chunk_end = s_chunk_ranges[(u32)chunk].end;
+            const u32 chunk_u = (u32)chunk;
+"""
+
+        new_direct = """        if (chunk < 0 || pc < cached_chunk_start || pc >= cached_chunk_end) {
+            int resolved_chunk = -1;
+
+            /* MOH_GMFE69_BURST_ADJACENT_CHUNK_FASTPATH */
+            if (chunk >= 0) {
+                const u32 next = (u32)chunk + 1u;
+                if (next < chain_state_count &&
+                    pc >= s_chunk_ranges[next].start &&
+                    pc < s_chunk_ranges[next].end) {
+                    resolved_chunk = (int)next;
+                } else if (chunk > 0) {
+                    const u32 prev = (u32)chunk - 1u;
+                    if (pc >= s_chunk_ranges[prev].start &&
+                        pc < s_chunk_ranges[prev].end) {
+                        resolved_chunk = (int)prev;
+                    }
+                }
+            }
+
+            if (resolved_chunk < 0)
+                resolved_chunk = multi_chunk_index(pc);
+
+            chunk = resolved_chunk;
+            if (chunk < 0) break;
+            cached_chunk = chunk;
+            cached_chunk_start = s_chunk_ranges[(u32)chunk].start;
+            cached_chunk_end = s_chunk_ranges[(u32)chunk].end;
+            /* MOH_GMFE69_BURST_GUARD_HOIST */
+            const u32 chunk_u = (u32)chunk;
+"""
+
+        count = text.count(old_direct)
+        if count != 1:
+            raise RuntimeError(
+                f"GMFE69 burst postgen: expected one round11 direct-dispatch body, found {count}"
+            )
+        return text.replace(old_direct, new_direct, 1)
+
     old = """    int cached_chunk = -1;
     u32 cached_chunk_start = 0u;
     u32 cached_chunk_end = 0u;
@@ -1217,9 +1269,21 @@ def _image_dispatch_cases(text: str) -> list[tuple[int, str]]:
             text,
         )
     ]
-    if not cases:
-        raise RuntimeError("GMFE69 export postgen: image dispatch cases not found")
-    return cases
+    if cases:
+        return cases
+
+    # Round11 replaces chassis_dispatch's switch with a function-pointer table.
+    table = re.search(
+        r"static const MultiImageDispatch\s+s_image_dispatch\[MODULE_IMAGE_COUNT\]\s*=\s*\{(.*?)\};",
+        text,
+        re.S,
+    )
+    if table:
+        indices = re.findall(r"\bmg_image_(\d+)_dispatch\s*,", table.group(1))
+        if indices:
+            return [(int(index), f"mg_image_{index}_dispatch") for index in indices]
+
+    raise RuntimeError("GMFE69 export postgen: image dispatch cases/table not found")
 
 
 def _final_burst(cases: list[tuple[int, str]]) -> str:
@@ -1312,6 +1376,9 @@ def apply_gmfe69_export_postgen(path: Path) -> None:
     path = Path(path)
     text = path.read_text()
     cases = _image_dispatch_cases(text)
+    direct_dispatch = (
+        "static MultiImageDispatch s_active_dispatch[MODULE_CHUNK_RANGE_COUNT];" in text
+    )
     state_anchor = "static void chassis_on_state_loaded(CPUState* ctx)\n"
     if state_anchor not in text:
         raise RuntimeError("GMFE69 export postgen: chassis_on_state_loaded anchor not found")
@@ -1323,14 +1390,32 @@ def apply_gmfe69_export_postgen(path: Path) -> None:
         end = text.find(state_anchor, start)
         if end < 0:
             raise RuntimeError("GMFE69 export postgen: malformed existing burst function")
-        # Replace only the burst function.
-        #
-        # Do NOT move `start` backwards to the /12 divider helper: the generated
-        # export places `chassis_dispatch()` between that helper and the burst.
-        # Moving `start` to the helper would therefore delete the normal
-        # dispatcher while s_desc still references it.
-        text = text[:start] + _final_burst(cases) + text[end:]
+        if direct_dispatch:
+            # Round11 already emitted the cached function-pointer burst. Do not
+            # replace it with _final_burst(), which is the legacy switch form.
+            burst = text[start:end]
+            marker = "/* MOH_GMFE69_BURST_POSTGEN: validated multi-image native burst. */"
+            if marker not in burst:
+                anchor = "{\n    multi_init_once();"
+                if anchor not in burst:
+                    raise RuntimeError(
+                        "GMFE69 export postgen: round11 burst initialization anchor not found"
+                    )
+                burst = burst.replace(
+                    anchor, "{\n    " + marker + "\n    multi_init_once();", 1
+                )
+            text = text[:start] + burst + text[end:]
+        else:
+            # Replace only the burst function.
+            #
+            # Do NOT move `start` backwards to the /12 divider helper: the generated
+            # export places `chassis_dispatch()` between that helper and the burst.
+            # Moving `start` to the helper would therefore delete the normal
+            # dispatcher while s_desc still references it.
+            text = text[:start] + _final_burst(cases) + text[end:]
     else:
+        if direct_dispatch:
+            raise RuntimeError("GMFE69 export postgen: round11 direct-dispatch burst not found")
         pos = text.find(state_anchor)
         text = text[:pos] + _final_burst(cases) + text[pos:]
 
@@ -1357,13 +1442,19 @@ def apply_gmfe69_export_postgen(path: Path) -> None:
     path.write_text(text)
 
     final = path.read_text()
-    required = (
+    required = [
         "MOH_GMFE69_BURST_POSTGEN",
         "cached_chunk_start",
-        "int dispatched = 0;",
         "chassis_div_u64_u32",
         "timebase_ratio == 12u",
         "chassis_dispatch_burst, /* unique-image chunks only */",
+        "MOH_GMFE69_BURST_ADJACENT_CHUNK_FASTPATH",
+        "MOH_GMFE69_BURST_GUARD_HOIST",
+    ]
+    required.append(
+        "const int dispatched = cached_dispatch(ctx, pc);"
+        if direct_dispatch
+        else "int dispatched = 0;"
     )
     for marker in required:
         if marker not in final:

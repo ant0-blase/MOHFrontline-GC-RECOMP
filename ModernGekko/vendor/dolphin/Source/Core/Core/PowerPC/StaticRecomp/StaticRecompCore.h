@@ -132,6 +132,7 @@ private:
   // is the StaticRecompCore*.
   static u64 HookExternalRead(CPUState* cpu, u32 ea, u8 size);
   static void HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 size);
+  static void HookExternalWriteSlow(CPUState* cpu, u32 ea, u64 value, u8 size);
   static u32 HookExternalRead32(CPUState* cpu, u32 ea, u8 rid);
   static void HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8 rid);
   static void* HookExternalPointer(CPUState* cpu, u32 ea, u32 size);

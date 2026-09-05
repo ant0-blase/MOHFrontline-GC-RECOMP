@@ -415,7 +415,7 @@ void FifoManager::RunGpuLoop()
             // function only when there is actual asynchronous work.
             auto* const async_requests = AsyncRequests::GetInstance();
             if (async_requests->HasPendingEvents())
-              async_requests->PullEvents();
+              async_requests->PullEventsKnownPending();
           }
 
           // fast skip remaining GPU time if fifo is empty

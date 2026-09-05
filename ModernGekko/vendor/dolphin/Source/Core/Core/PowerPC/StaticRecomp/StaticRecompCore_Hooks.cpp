@@ -135,12 +135,16 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
 
-  // Gather-pipe fast path: stores to the write-gather pipe page at effective
-  // 0xCC008000 go straight to GPFifo, mirroring the MMU's masked-write
-  // special case without an MMU round trip. Keying on the effective page is
-  // the same shortcut Dolphin's JITs take (optimizeGatherPipe). GPFifo
-  // maintains ppc_state.gather_pipe_ptr internally.
+#if defined(__GNUC__) || defined(__clang__)
+  // The generated module reaches this hook overwhelmingly for GX gather-pipe
+  // stores. Keep that path as the fall-through hot block and push the generic
+  // MMU/REL/locked-cache machinery into a separate cold function. Besides code
+  // layout, this keeps the large slow-path register/stack requirements out of
+  // the 3-4% perf hotspot.
+  if (__builtin_expect((ea & 0xFFFFF000u) == 0xCC008000u, 1))
+#else
   if ((ea & 0xFFFFF000) == 0xCC008000u)
+#endif
   {
     if (core->m_lockstep_verifier->m_ls_journaling)
       core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, static_cast<u32>(value), size});
@@ -168,6 +172,22 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
       return;
     }
   }
+
+  HookExternalWriteSlow(cpu, ea, value, size);
+}
+
+#if defined(_MSC_VER)
+#define STATICRECOMP_COLD_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define STATICRECOMP_COLD_NOINLINE __attribute__((noinline, cold))
+#else
+#define STATICRECOMP_COLD_NOINLINE
+#endif
+
+STATICRECOMP_COLD_NOINLINE void StaticRecompCore::HookExternalWriteSlow(
+    CPUState* cpu, u32 ea, u64 value, u8 size)
+{
+  auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
 
   if (!core->m_active_rel_sections.empty())
     ea = core->TranslateRelAddress(ea);
@@ -226,6 +246,8 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
     break;
   }
 }
+
+#undef STATICRECOMP_COLD_NOINLINE
 
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
 {

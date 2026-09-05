@@ -621,28 +621,72 @@ def write_tables(work: Path, images: list[ImageBuild], entry_point: int):
     return union_code, canonical, variants_per_chunk, smc
 
 
-def write_export(work: Path, images: list[ImageBuild]):
+def write_export(
+    work: Path,
+    images: list[ImageBuild],
+    canonical: list[tuple[int, int]],
+    variants_per_chunk: list[list[tuple[int, int]]],
+):
     p = work / "multi_module_export.c"
     decls = "\n".join(
         f"int mg_image_{image.index}_dispatch(CPUState* ctx, u32 address);" for image in images
     )
-    switches = "\n".join(
-        f"        case {image.index}u: return mg_image_{image.index}_dispatch(ctx, address);"
-        for image in images
+    dispatch_entries = "\n".join(
+        f"    mg_image_{image.index}_dispatch," for image in images
     )
-    burst_switches = "\n".join(
-        f"            case {image.index}u: dispatched = mg_image_{image.index}_dispatch(ctx, pc); break;"
-        for image in images
+
+    # MOH_GMFE69_DIRECT_CHUNK_DISPATCH
+    # The chassis has already resolved the canonical chunk and selected its
+    # executable-image variant.  Calling mg_image_N_dispatch() here makes the
+    # generated image perform a second address->chunk dispatch on every native
+    # block.  Build a parallel table that points straight at the generated C
+    # chunk entry instead.  A safe image-level fallback remains available.
+    image_by_index = {image.index: image for image in images}
+    chunk_declarations: set[str] = set()
+    variant_chunk_symbols: list[str] = []
+    for (start, end), variants in zip(canonical, variants_per_chunk, strict=True):
+        for _runtime_hash, image_index in variants:
+            image = image_by_index[image_index]
+            owner = next(
+                (a for a, b in image.chunk_ranges if a <= start and end <= b),
+                None,
+            )
+            if owner is None:
+                raise ValueError(
+                    f"image {image_index} has no generated chunk for "
+                    f"0x{start:08X}-0x{end:08X}"
+                )
+            symbol = f"mg_img{image_index}_func_{owner:08X}"
+            chunk_declarations.add(symbol)
+            variant_chunk_symbols.append(symbol)
+
+    chunk_decls = "\n".join(
+        f"void {symbol}(CPUState* ctx);"
+        for symbol in sorted(chunk_declarations)
+    )
+    variant_chunk_entries = "\n".join(
+        f"    {symbol}," for symbol in variant_chunk_symbols
     )
     p.write_text(
-        f'''#include "StaticRecompABI.h"\n#include <stdio.h>\n\n{decls}\n\n'''
+        f'''#include "StaticRecompABI.h"\n#include <stdio.h>\n\n{decls}\n{chunk_decls}\n\n'''
         '''#include "module_tables.inc"\n\n'''
+        f'''#define MODULE_IMAGE_COUNT {len(images)}u\n'''
+        '''typedef int (*MultiImageDispatch)(CPUState*, u32);\n'''
+        '''typedef void (*MultiChunkDispatch)(CPUState*);\n'''
+        f'''static const MultiImageDispatch s_image_dispatch[MODULE_IMAGE_COUNT] = {{\n{dispatch_entries}\n}};\n\n'''
+        f'''static const MultiChunkDispatch s_variant_chunk_dispatch[] = {{\n{variant_chunk_entries}\n}};\n\n'''
         '''#define MULTI_INVALID_IMAGE 0xFFFFFFFFu\n'''
         '''static u32 s_active_image[MODULE_CHUNK_RANGE_COUNT];\n'''
+        '''static MultiImageDispatch s_active_dispatch[MODULE_CHUNK_RANGE_COUNT];\n'''
+        '''static MultiChunkDispatch s_active_chunk_dispatch[MODULE_CHUNK_RANGE_COUNT];\n'''
         '''static int s_initialized = 0;\n\n'''
         '''static void multi_init_once(void)\n{\n'''
         '''    if (s_initialized) return;\n'''
-        '''    for (u32 i = 0; i < MODULE_CHUNK_RANGE_COUNT; ++i) s_active_image[i] = MULTI_INVALID_IMAGE;\n'''
+        '''    for (u32 i = 0; i < MODULE_CHUNK_RANGE_COUNT; ++i) {\n'''
+        '''        s_active_image[i] = MULTI_INVALID_IMAGE;\n'''
+        '''        s_active_dispatch[i] = 0;\n'''
+        '''        s_active_chunk_dispatch[i] = 0;\n'''
+        '''    }\n'''
         '''    s_initialized = 1;\n}\n\n'''
         '''static int multi_chunk_index(u32 address)\n{\n'''
         '''    const u32 delta = address - MULTI_CHUNK_PAGE_BASE;\n'''
@@ -667,6 +711,8 @@ def write_export(work: Path, images: list[ImageBuild]):
         '''        if (s_variant_hashes[i].hash == runtime_hash) {\n'''
         '''            const u32 old_image = s_active_image[chunk_index];\n'''
         '''            s_active_image[chunk_index] = s_variant_hashes[i].image;\n'''
+        '''            s_active_dispatch[chunk_index] = s_image_dispatch[s_active_image[chunk_index]];\n'''
+        '''            s_active_chunk_dispatch[chunk_index] = s_variant_chunk_dispatch[i];\n'''
         '''            if (old_image != s_active_image[chunk_index]) {\n'''
         '''                fprintf(stderr, "[staticrecomp] multi-image chunk %u -> image %u [0x%08X,0x%08X)\\n",\n'''
         '''                        chunk_index, s_active_image[chunk_index],\n'''
@@ -676,6 +722,8 @@ def write_export(work: Path, images: list[ImageBuild]):
         '''        }\n'''
         '''    }\n'''
         '''    s_active_image[chunk_index] = MULTI_INVALID_IMAGE;\n'''
+        '''    s_active_dispatch[chunk_index] = 0;\n'''
+        '''    s_active_chunk_dispatch[chunk_index] = 0;\n'''
         '''    return 0;\n}\n\n'''
         '''#if defined(__GNUC__) || defined(__clang__)\n'''
         '''__attribute__((noinline))\n'''
@@ -687,10 +735,9 @@ def write_export(work: Path, images: list[ImageBuild]):
         '''    multi_init_once();\n'''
         '''    const int chunk = multi_chunk_index(address);\n'''
         '''    if (chunk < 0) return 0;\n'''
-        '''    switch (s_active_image[(u32)chunk]) {\n'''
-        f'''{switches}\n'''
-        '''        default: return 0;\n'''
-        '''    }\n}\n\n'''
+        '''    MultiImageDispatch dispatch = s_active_dispatch[(u32)chunk];\n'''
+        '''    return dispatch ? dispatch(ctx, address) : 0;\n'''
+        '''}\n\n'''
         '''static u32 chassis_dispatch_burst(\n'''
         '''    CPUState* ctx,\n'''
         '''    u32 address,\n'''
@@ -707,7 +754,10 @@ def write_export(work: Path, images: list[ImageBuild]):
         '''    int cached_chunk = -1;\n'''
         '''    u32 cached_chunk_start = 0u;\n'''
         '''    u32 cached_chunk_end = 0u;\n'''
+        '''    MultiImageDispatch cached_dispatch = 0;\n'''
+        '''    MultiChunkDispatch cached_chunk_dispatch = 0;\n'''
         '''    ctx->pc = address;\n'''
+        '''    ctx->downcount = 0;\n'''
         '''    while (blocks < 64u && total_cycles < cycle_budget) {\n'''
         '''        const u32 pc = ctx->pc;\n'''
         '''        int chunk = cached_chunk;\n'''
@@ -717,21 +767,30 @@ def write_export(work: Path, images: list[ImageBuild]):
         '''            cached_chunk = chunk;\n'''
         '''            cached_chunk_start = s_chunk_ranges[(u32)chunk].start;\n'''
         '''            cached_chunk_end = s_chunk_ranges[(u32)chunk].end;\n'''
+        '''            const u32 chunk_u = (u32)chunk;\n'''
+        '''            /* All burst-safety state is chunk-granular and immutable for\n'''
+        '''             * the duration of one native burst. Validate it only when the\n'''
+        '''             * guest PC actually crosses into another generated chunk.\n'''
+        '''             * MOH commonly executes many chained blocks inside the same\n'''
+        '''             * 16 KiB chunk, so re-reading these tables per block was pure\n'''
+        '''             * dispatcher overhead in perf. */\n'''
+        '''            if (chunk_u >= chain_state_count || chain_state[chunk_u] == 0u) break;\n'''
+        '''            const u32 begin = s_variant_offsets[chunk_u];\n'''
+        '''            const u32 end = s_variant_offsets[chunk_u + 1u];\n'''
+        '''            /* Never burst through an address range shared by multiple executable images. */\n'''
+        '''            if (end - begin != 1u) break;\n'''
+        '''            cached_dispatch = s_active_dispatch[chunk_u];\n'''
+        '''            cached_chunk_dispatch = s_active_chunk_dispatch[chunk_u];\n'''
+        '''            if (!cached_chunk_dispatch && !cached_dispatch) break;\n'''
         '''        }\n'''
-        '''        if ((u32)chunk >= chain_state_count || chain_state[(u32)chunk] == 0u) break;\n'''
-        '''        const u32 begin = s_variant_offsets[(u32)chunk];\n'''
-        '''        const u32 end = s_variant_offsets[(u32)chunk + 1u];\n'''
-        '''        /* Never burst through an address range shared by multiple executable images. */\n'''
-        '''        if (end - begin != 1u) break;\n'''
-        '''        const u32 image = s_active_image[(u32)chunk];\n'''
-        '''        if (image == MULTI_INVALID_IMAGE) break;\n'''
-        '''        ctx->downcount = 0;\n'''
-        '''        int dispatched = 0;\n'''
-        '''        switch (image) {\n'''
-        f'''{burst_switches}\n'''
-        '''            default: break;\n'''
+        '''        if (cached_chunk_dispatch) {\n'''
+        '''            /* MOH_GMFE69_DIRECT_CHUNK_DISPATCH: skip image-level dolrecomp_call. */\n'''
+        '''            ctx->pc = pc;\n'''
+        '''            cached_chunk_dispatch(ctx);\n'''
+        '''        } else {\n'''
+        '''            const int dispatched = cached_dispatch(ctx, pc);\n'''
+        '''            if (!dispatched) break;\n'''
         '''        }\n'''
-        '''        if (!dispatched) break;\n'''
         '''        const s64 raw_charge = -ctx->downcount;\n'''
         '''        const u64 charge = raw_charge > 0 ? (u64)raw_charge : 1u;\n'''
         '''        total_cycles += charge;\n'''
@@ -749,6 +808,10 @@ def write_export(work: Path, images: list[ImageBuild]):
         '''                tb_delta = chassis_div_u64_u32(tb_cycles, timebase_ratio);\n'''
         '''            ctx->timebase = timebase_origin + tb_delta;\n'''
         '''        }\n'''
+        '''        /* The previous iteration already leaves downcount neutral for\n'''
+        '''         * the next native block. Keeping the reset here (rather than both\n'''
+        '''         * before and after dispatch) removes one hot CPUState store per\n'''
+        '''         * chained block without changing charge accounting. */\n'''
         '''        ctx->downcount = 0;\n'''
         '''        if (ctx->exception) break;\n'''
         '''    }\n'''
@@ -934,7 +997,7 @@ def main() -> int:
 
     main_image = next((x for x in images if x.source_rel == "sys/main.dol"), images[0])
     union_code, canonical, variants, smc = write_tables(work, images, main_image.dol.entry)
-    export_source = write_export(work, images)
+    export_source = write_export(work, images, canonical, variants)
     if args.game_id == "GMFE69":
         apply_gmfe69_export_postgen(export_source)
 
