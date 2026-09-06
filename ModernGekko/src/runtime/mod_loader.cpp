@@ -27,6 +27,73 @@ namespace moderngekko {
 namespace {
 constexpr std::uint32_t MAX_ITEMS = 1u << 20;
 #if defined(MODERNGEKKO_MOH_PC_LAYER)
+std::unordered_map<std::uint32_t, std::string>
+    loaded_font_files;
+
+std::unordered_map<std::uint32_t, std::string>
+    cfont_files;
+
+std::string NormalizePS3FontAssetName(
+    std::string name)
+{
+  const auto slash =
+      name.find_last_of(
+          "/\\:");
+
+  if (slash !=
+      std::string::npos)
+  {
+    name.erase(
+        0,
+        slash + 1);
+  }
+
+  std::transform(
+      name.begin(),
+      name.end(),
+      name.begin(),
+      [](unsigned char c)
+      {
+        return static_cast<char>(
+            std::tolower(c));
+      });
+
+  if (name.ends_with(
+          ".gfn"))
+  {
+    name.replace(
+        name.size() - 4,
+        4,
+        ".sfn");
+  }
+
+  return name;
+}
+
+std::string CanonicalKnownPS3FontForGCAsset(const std::string& gc_name)
+{
+  const std::string font = NormalizePS3FontAssetName(gc_name);
+
+  if (font == "popupdisplay.sfn" ||
+      font == "objfont.sfn" ||
+      font == "subtitlefont.sfn" ||
+      font == "pausescreenfont.sfn" ||
+      font == "ddayintro.sfn" ||
+      font == "comicfont.sfn")
+  {
+    return font;
+  }
+
+  if (font == "upcomicfont.sfn")
+    return "comicfont.sfn";
+
+  if (font.starts_with("mohgamefont_") && font.ends_with(".sfn"))
+    return "mohgamefont_72.sfn";
+
+  return {};
+}
+
+
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_ON = 0xFFFFF100u;
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_OFF = 0xFFFFF101u;
 constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_ENTER = 0xFFFFF110u;
@@ -849,6 +916,8 @@ DiscoverModSources(const std::vector<std::filesystem::path> &directories,
 
 void ModManager::Unload() {
 #if defined(MODERNGEKKO_MOH_PC_LAYER)
+  loaded_font_files.clear();
+  cfont_files.clear();
 #endif
   for (auto it = m_impl->mods.rbegin(); it != m_impl->mods.rend(); ++it) {
     if ((*it) && (*it)->loaded && (*it)->descriptor &&
@@ -1157,18 +1226,65 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
 
   if (address == 0xFFFFF147u)
   {
-    // Compatibility no-op: 44fd MohPcLayer has no font metadata/frame API.
+    // 44fd renderer keeps a short host-side temporal hold.
     return true;
   }
   // Metadata calls are injected at ELF-verified load/constructor boundaries.
   if (address == 0xFFFFF143u)
   {
-    // Compatibility no-op: 44fd MohPcLayer has no font metadata/frame API.
+    std::string name;
+
+    if (IsMem1Address(state->gpr[3]))
+    {
+      loaded_font_files.erase(state->gpr[3]);
+
+      if (ReadGuestCString(state, state->gpr[0], &name))
+      {
+        const std::string font =
+            CanonicalKnownPS3FontForGCAsset(name);
+
+        if (!font.empty())
+        {
+          loaded_font_files[state->gpr[3]] = font;
+
+          static unsigned font_load_logs = 0;
+          if (font_load_logs < 32)
+          {
+            ++font_load_logs;
+            std::fprintf(
+                stderr,
+                "[moh-ps3-font] verified font: GC=%s -> PS3=%s\n",
+                name.c_str(),
+                font.c_str());
+          }
+        }
+      }
+    }
+
     return true;
   }
-  if (address == 0xFFFFF144u || address == 0xFFFFF145u)
+  if (address == 0xFFFFF144u ||
+      address == 0xFFFFF145u)
   {
-    // Compatibility no-op: 44fd MohPcLayer has no font metadata/frame API.
+    cfont_files.erase(
+        state->gpr[3]);
+
+    if (address ==
+        0xFFFFF144u)
+    {
+      const auto it =
+          loaded_font_files.find(
+              state->gpr[0]);
+
+      if (it !=
+          loaded_font_files.end())
+      {
+        cfont_files[
+            state->gpr[3]] =
+            it->second;
+      }
+    }
+
     return true;
   }
   if (address == 0xFFFFF146u)
@@ -1216,72 +1332,161 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
   if (address == MOH_HOSTCALL_PS3_FONT_DRAW ||
       address == MOH_HOSTCALL_PS3_FONT_CENTERED)
   {
-    // r0 is a private success return for the injected CFont hook.
     state->gpr[0] = 0u;
 
-    if (!MohPcLayer::IsGameplayActive() ||
-        !MohPcLayer::IsPS3FontBridgeReady())
+    std::string exact_font;
+
+    const auto font_it =
+        cfont_files.find(
+            state->gpr[3]);
+
+    if (font_it !=
+        cfont_files.end())
+    {
+      exact_font =
+          font_it->second;
+    }
+
+    if (exact_font.empty())
+    {
+      std::uint32_t pc =
+          state->lr;
+
+      std::uint32_t sp =
+          state->gpr[1];
+
+      for (unsigned depth = 0;
+           depth < 12;
+           ++depth)
+      {
+        if ((pc >= 0x800BCE58u &&
+             pc < 0x800BD590u) ||
+            (pc >= 0x800BD590u &&
+             pc < 0x800BD864u))
+        {
+          exact_font =
+              "mohgamefont_72.sfn";
+          break;
+        }
+
+        if (!IsMem1Address(sp) ||
+            (sp & 3u) ||
+            sp > 0x817FFFF7u)
+        {
+          break;
+        }
+
+        const std::uint32_t parent =
+            ReadGuestU32(
+                state,
+                sp);
+
+        if (parent <= sp ||
+            !IsMem1Address(parent) ||
+            parent > 0x817FFFF7u)
+        {
+          break;
+        }
+
+        sp =
+            parent;
+
+        pc =
+            ReadGuestU32(
+                state,
+                sp + 4u);
+      }
+    }
+
+    if (exact_font.empty())
     {
       return true;
     }
 
-    const double x =
+    if (!MohPcLayer::
+            IsPS3FontBridgeReady(
+                exact_font.c_str()))
+    {
+      return true;
+    }
+
+    const bool centered =
+        address ==
+        MOH_HOSTCALL_PS3_FONT_CENTERED;
+
+    const double f1 =
         state->fpr[1];
 
-    const double y =
+    const double f2 =
         state->fpr[2];
 
-    if (!std::isfinite(x) ||
-        !std::isfinite(y))
+    if (!std::isfinite(f1) ||
+        (!centered &&
+         !std::isfinite(f2)))
     {
       return true;
     }
 
-    std::string text;
+    std::string text_value;
     int source_reg = -1;
 
     if (!FindGuestFontText(
             state,
-            &text,
+            &text_value,
             &source_reg))
     {
       return true;
     }
 
+    const float draw_x =
+        centered ?
+            320.0f :
+            static_cast<float>(
+                f1);
+
+    const float draw_y =
+        centered ?
+            static_cast<float>(
+                f1) :
+            static_cast<float>(
+                f2);
+
+    constexpr std::uint32_t rgba =
+        0xFFFFFFFFu;
+
     static unsigned log_count = 0;
 
-    if (log_count < 16)
+    if (log_count < 48)
     {
       ++log_count;
 
       std::fprintf(
           stderr,
-          "[moh-ps3-font] CFont capture "
-          "r%d=%08X x=%.2f y=%.2f centered=%d text=\"%s\"\\n",
+          "[moh-ps3-font] verified capture "
+          "font=%s r%d=%08X x=%.2f y=%.2f centered=%d text=\"%s\"\n",
+          exact_font.c_str(),
           source_reg,
           state->gpr[source_reg],
-          x,
-          y,
-          address ==
-              MOH_HOSTCALL_PS3_FONT_CENTERED ?
-              1 :
-              0,
-          text.c_str());
+          draw_x,
+          draw_y,
+          centered ? 1 : 0,
+          text_value.c_str());
     }
 
-    const bool ps3_font_accepted =
-      MohPcLayer::QueuePS3FontDraw(
-        text.c_str(),
-        static_cast<float>(x),
-        static_cast<float>(y),
-        address ==
-            MOH_HOSTCALL_PS3_FONT_CENTERED);
+    const bool accepted =
+        MohPcLayer::
+            QueuePS3FontDraw(
+                text_value.c_str(),
+                draw_x,
+                draw_y,
+                centered,
+                exact_font.c_str(),
+                rgba);
 
-    // Tell guest hook to suppress only the old GameCube CFont draw.
     state->gpr[0] =
-      ps3_font_accepted ?
-          1u :
-          0u;
+        accepted ?
+            1u :
+            0u;
 
     return true;
   }

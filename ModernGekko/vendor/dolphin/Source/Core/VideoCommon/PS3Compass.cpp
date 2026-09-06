@@ -10,6 +10,7 @@
 
 #include "Common/Hash.h"
 #include "VideoCommon/Assets/CustomTextureData.h"
+#include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3TextureDecoder.h"
 #include "VideoCommon/TextureInfo.h"
@@ -69,6 +70,40 @@ std::string Filename(std::string_view path)
   return Lower(std::move(filename));
 }
 
+
+std::string StemKey(
+    std::string_view path)
+{
+  std::string filename =
+      Filename(path);
+
+  const auto dot =
+      filename.find_last_of('.');
+
+  if (dot !=
+      std::string::npos)
+  {
+    filename.resize(dot);
+  }
+
+  std::string key;
+  key.reserve(
+      filename.size());
+
+  for (unsigned char c :
+       filename)
+  {
+    if (std::isalnum(c))
+    {
+      key.push_back(
+          static_cast<char>(
+              std::tolower(c)));
+    }
+  }
+
+  return key;
+}
+
 std::string CanonicalPS3Filename(std::string_view guest_name)
 {
   std::string filename = Filename(guest_name);
@@ -101,29 +136,151 @@ const PS3RemasterAssets::AssetInfo* FindBestAsset(std::string_view guest_name)
   if (!PS3RemasterAssets::IsReady())
     return nullptr;
 
-  const std::string wanted_filename = CanonicalPS3Filename(guest_name);
-  if (!wanted_filename.ends_with(".ssh"))
-    return nullptr;
+  const std::string wanted_filename =
+      CanonicalPS3Filename(
+          guest_name);
 
-  const std::string wanted_path = CanonicalGuestPath(guest_name);
-  const PS3RemasterAssets::AssetInfo* best = nullptr;
+  if (!wanted_filename.ends_with(
+          ".ssh"))
+  {
+    return nullptr;
+  }
+
+  const std::string wanted_path =
+      CanonicalGuestPath(
+          guest_name);
+
+  const PS3RemasterAssets::AssetInfo*
+      best = nullptr;
+
   std::size_t best_score = 0;
 
-  for (const auto& asset : PS3RemasterAssets::GetAssets())
+  // Pass 1: exact basename. This remains authoritative.
+  for (const auto& asset :
+       PS3RemasterAssets::GetAssets())
   {
-    if (Lower(asset.filename) != wanted_filename)
-      continue;
-
-    const std::size_t score = CommonSuffixScore(wanted_path, Normalize(asset.relative_path));
-    if (!best || score > best_score)
+    if (Lower(
+            asset.filename) !=
+        wanted_filename)
     {
+      continue;
+    }
+
+    const std::size_t score =
+        CommonSuffixScore(
+            wanted_path,
+            Normalize(
+                asset.relative_path));
+
+    if (!best ||
+        score >
+            best_score)
+    {
+      best =
+          &asset;
+
+      best_score =
+          score;
+    }
+  }
+
+  if (best)
+    return best;
+
+  // Pass 2: safe spelling normalization only.
+  // Examples: health_bar.gsh <-> HealthBar.ssh,
+  // weapon-icon.gsh <-> weapon_icon.ssh.
+  const std::string wanted_stem =
+      StemKey(
+          wanted_filename);
+
+  if (wanted_stem.empty())
+    return nullptr;
+
+  for (const auto& asset :
+       PS3RemasterAssets::GetAssets())
+  {
+    const std::string asset_name =
+        Lower(
+            asset.filename);
+
+    if (!asset_name.ends_with(
+            ".ssh") ||
+        StemKey(
+            asset_name) !=
+            wanted_stem)
+    {
+      continue;
+    }
+
+    const std::size_t score =
+        CommonSuffixScore(
+            wanted_path,
+            Normalize(
+                asset.relative_path));
+
+    if (!best ||
+        score >
+            best_score)
+    {
+      best =
+          &asset;
+
+      best_score =
+          score;
+    }
+  }
+
+
+  if (best)
+    return best;
+
+  // menu substring fallback: Main_Master -> main, Options_TXT -> options, etc.
+  const std::string wanted_key = StemKey(wanted_filename);
+
+  if (wanted_key.size() >= 5)
+  {
+    for (const auto& asset : PS3RemasterAssets::GetAssets())
+    {
+      const std::string asset_name = Lower(asset.filename);
+      if (!asset_name.ends_with(".ssh"))
+        continue;
+
+      const std::string asset_key = StemKey(asset_name);
+      if (asset_key.size() < 5)
+        continue;
+
+      const bool related =
+          wanted_key.find(asset_key) != std::string::npos ||
+          asset_key.find(wanted_key) != std::string::npos;
+
+      if (!related)
+        continue;
+
+      const std::string relative = Normalize(asset.relative_path);
+      const bool menuish =
+          relative.find("menu") != std::string::npos ||
+          relative.find("pause") != std::string::npos ||
+          relative.find("frontend") != std::string::npos ||
+          relative.find("_usa") != std::string::npos;
+
+      if (!menuish)
+        continue;
+
       best = &asset;
-      best_score = score;
+      std::fprintf(
+          stderr,
+          "[moh-ps3-texture] menu substring fallback: %.*s -> %s\n",
+          static_cast<int>(guest_name.size()),
+          guest_name.data(),
+          relative.c_str());
+      break;
     }
   }
 
   return best;
 }
+
 
 std::shared_ptr<VideoCommon::CustomTextureData> DecodeResource(Resource* resource)
 {
@@ -176,24 +333,86 @@ std::shared_ptr<VideoCommon::CustomTextureData> DecodeResource(Resource* resourc
 
 int NameIndex(std::string_view name)
 {
-  const auto* asset = FindBestAsset(name);
+  const auto* asset =
+      FindBestAsset(
+          name);
+
   if (!asset)
+  {
+    static unsigned miss_logs = 0;
+
+    if (miss_logs < 160 &&
+        Filename(name).ends_with(
+            ".gsh"))
+    {
+      ++miss_logs;
+
+      std::fprintf(
+          stderr,
+          "[moh-ps3-texture] no PS3 match: guest=%.*s stem=%s\\n",
+          static_cast<int>(
+              name.size()),
+          name.data(),
+          StemKey(name)
+              .c_str());
+    }
+
     return -1;
+  }
 
-  const std::string key = Normalize(asset->relative_path);
+  const std::string key =
+      Normalize(
+          asset->relative_path);
 
-  std::scoped_lock lock(mutex);
-  if (const auto it = resource_ids.find(key); it != resource_ids.end())
+  std::scoped_lock lock(
+      mutex);
+
+  if (const auto it =
+          resource_ids.find(
+              key);
+      it !=
+          resource_ids.end())
+  {
     return it->second;
+  }
 
-  const int id = next_resource_id++;
+  const int id =
+      next_resource_id++;
+
   Resource resource;
-  resource.filename = asset->filename;
-  resource.relative_path = key;
-  resources.emplace(id, std::move(resource));
-  resource_ids.emplace(key, id);
+
+  resource.filename =
+      asset->filename;
+
+  resource.relative_path =
+      key;
+
+  resources.emplace(
+      id,
+      std::move(resource));
+
+  resource_ids.emplace(
+      key,
+      id);
+
+  static unsigned match_logs = 0;
+
+  if (match_logs < 160)
+  {
+    ++match_logs;
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3-texture] map guest=%.*s -> PS3=%s\\n",
+        static_cast<int>(
+            name.size()),
+        name.data(),
+        key.c_str());
+  }
+
   return id;
 }
+
 
 void Register(int index, u32 address, u32 width, u32 height, u32 format, std::vector<u8> original,
               u32 palette_format, std::vector<u8> palette)
@@ -229,6 +448,10 @@ void Register(int index, u32 address, u32 width, u32 height, u32 format, std::ve
 
 std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
 {
+  if (!MohPcLayer::IsPS3TextureReplacementEnabled())
+    return nullptr;
+
+
   if (info.IsFromTmem())
     return nullptr;
 
