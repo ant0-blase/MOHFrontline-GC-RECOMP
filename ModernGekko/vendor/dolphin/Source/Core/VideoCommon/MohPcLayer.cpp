@@ -200,7 +200,7 @@ struct State
   std::atomic<int> audio_volume{100};
   std::atomic<bool> fill_audio_gaps{true};
   std::atomic<bool> preserve_audio_pitch{true};
-  std::atomic<int> requested_fps{0}; // -1 original, 0 unlimited, >0 target.
+  std::atomic<int> requested_fps{60}; // 60/120 fixed modes only.
   std::atomic<bool> fov_override{false};
   std::atomic<float> fov{90.0f};
   std::atomic<bool> weapon_follow{true};
@@ -603,23 +603,17 @@ void ApplyFov()
 
 void ApplyFPS()
 {
-  const int fps = s.requested_fps.load();
-  if (fps < 0)
-  {
-    UnsetEnv("MOH_TIMING_PATCH");
-    UnsetEnv("MOH_FPS_TARGET");
-    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK_ENABLE, false);
-    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK, 1.0f);
-    return;
-  }
+  const int fps = s.requested_fps.load(std::memory_order_relaxed) == 120 ? 120 : 60;
+  s.requested_fps.store(fps, std::memory_order_relaxed);
+  s.adaptive_fps.store(false, std::memory_order_relaxed);
+  s.adaptive_profile.store(0, std::memory_order_relaxed);
+
   SetEnv("MOH_TIMING_PATCH", "1");
-  if (fps == 0)
-    SetEnv("MOH_FPS_TARGET", "unlimited");
-  else
-    SetEnv("MOH_FPS_TARGET", std::to_string(fps));
-  const double requested = fps == 0 ? 1000.0 : std::max(fps, 1);
+  SetEnv("MOH_FPS_TARGET", std::to_string(fps));
+  UnsetEnv("MOH_ADAPTIVE_PROFILE");
+
   Config::SetCurrent(Config::MAIN_VI_OVERCLOCK,
-                     static_cast<float>(requested / NATIVE_VPS));
+                     static_cast<float>(static_cast<double>(fps) / NATIVE_VPS));
   Config::SetCurrent(Config::MAIN_PRECISION_FRAME_TIMING, true);
   Config::SetCurrent(Config::GFX_VSYNC, false);
 }
@@ -818,9 +812,9 @@ void LoadSettings()
     else if (key == "audio_volume") s.audio_volume = std::clamp(as_i(), 0, 100);
     else if (key == "fill_audio_gaps") s.fill_audio_gaps = as_i() != 0;
     else if (key == "preserve_audio_pitch") s.preserve_audio_pitch = as_i() != 0;
-    else if (key == "fps") s.requested_fps = as_i();
+    else if (key == "fps") s.requested_fps = as_i() == 120 ? 120 : 60;
     else if (key == "fov_enabled") s.fov_override = as_i() != 0;
-    else if (key == "fov") s.fov = std::clamp(as_f(), 20.0f, 150.0f);
+    else if (key == "fov") s.fov = std::clamp(as_f(), 20.0f, 105.0f);
     else if (key == "weapon_follow") s.weapon_follow = as_i() != 0;
     else if (key == "weapon_fov") s.weapon_fov = std::clamp(as_f(), 20.0f, 150.0f);
     else if (key == "aspect_mode") s.aspect_mode = std::clamp(as_i(), 0, 6);
@@ -1072,7 +1066,7 @@ void SyncFromEnvironment()
   if (const char* fov = std::getenv("MOH_FOV_DEGREES"))
   {
     s.fov_override = true;
-    s.fov = static_cast<float>(std::clamp(std::atof(fov), 20.0, 150.0));
+    s.fov = static_cast<float>(std::clamp(std::atof(fov), 20.0, 105.0));
   }
   if (const char* wfov = std::getenv("MOH_WEAPON_FOV_DEGREES"))
   {
@@ -1506,59 +1500,7 @@ bool ConsumeVBlankPresentSuppression(u32 xfb_addr)
 
 void AdaptivePerformanceUpdate()
 {
-  // Fixed VI is the default for the FPS unlock.
-  //
-  // Do NOT continuously retune VI from measured emulation speed unless the
-  // user explicitly enabled an adaptive profile. The previous unconditional
-  // follower changed MAIN_VI_OVERCLOCK every 250 ms and could create a
-  // feedback loop (for example 120 -> 80 -> 50 -> 100 Hz) while audio/CoreTiming
-  // tried to remain at real-time speed.
-  if (!s.initialized.load() || !s.gameplay.load())
-    return;
-
-  if (!s.adaptive_fps.load(std::memory_order_relaxed))
-    return;
-
-  const int requested_fps = s.requested_fps.load();
-  if (requested_fps < 0)
-    return;
-
-  using clock = std::chrono::steady_clock;
-  static auto last_adjust = clock::now();
-  const auto now = clock::now();
-  if (now - last_adjust < std::chrono::milliseconds(250))
-    return;
-  last_adjust = now;
-
-  const auto& perf = Core::System::GetInstance().GetPerfMetrics();
-  const double speed = std::clamp(perf.GetSpeed(), 0.25, 1.25);
-  const double max_speed = std::clamp(perf.GetMaxSpeed(), 0.25, 4.0);
-  const double target_hz = requested_fps == 0 ? 1000.0 : static_cast<double>(requested_fps);
-  double current_hz = static_cast<double>(Config::Get(Config::MAIN_VI_OVERCLOCK)) * NATIVE_VPS;
-  current_hz = std::clamp(current_hz, 20.0, target_hz);
-
-  double next_hz = current_hz;
-  if (speed < 0.985)
-  {
-    // One proportional correction is enough to turn 110/120 (~91.7%) into
-    // an ~110-Hz VI while keeping the guest clock/audio at full speed.
-    next_hz = current_hz * std::clamp(speed * 0.997, 0.70, 0.995);
-  }
-  else if (speed > 0.997 && current_hz + 0.25 < target_hz)
-  {
-    // Use measured headroom when available, but climb slowly to avoid hunting.
-    const double headroom_gain = std::clamp(max_speed * 0.985, 1.005, 1.08);
-    next_hz = current_hz * headroom_gain;
-  }
-
-  // Never jump below 20 Hz from a transient stall; normal 56/82/110-style
-  // drops are preserved as real frame rates while game/audio timing stays 1x.
-  next_hz = std::clamp(next_hz, 20.0, target_hz);
-  if (std::abs(next_hz - current_hz) >= 0.20)
-  {
-    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK,
-                       static_cast<float>(next_hz / NATIVE_VPS));
-  }
+  // Intentionally disabled: fixed 60/120 FPS locks only.
 }
 
 void UpdateFrame()
@@ -1682,26 +1624,26 @@ void DrawSettingsUI(float backbuffer_scale)
     {
       if (ImGui::BeginTabItem("Graphics"))
       {
-        int fps = s.requested_fps.load();
-        const char* fps_items[] = {"Original", "60", "90", "120", "144", "165", "240", "Unlimited"};
-        const int fps_values[] = {-1, 60, 90, 120, 144, 165, 240, 0};
-        int fps_idx = 0;
-        for (int i = 0; i < 8; ++i) if (fps_values[i] == fps) fps_idx = i;
-        if (ImGui::Combo("FPS target", &fps_idx, fps_items, 8))
+        int fps = s.requested_fps.load(std::memory_order_relaxed) == 120 ? 120 : 60;
+        const char* fps_items[] = {"60 FPS", "120 FPS"};
+        const int fps_values[] = {60, 120};
+        int fps_idx = fps == 120 ? 1 : 0;
+        if (ImGui::Combo("Frame rate", &fps_idx, fps_items, 2))
         {
-          s.requested_fps = fps_values[fps_idx];
+          s.requested_fps.store(fps_values[fps_idx], std::memory_order_relaxed);
           ApplyFPS();
         }
-        ImGui::TextDisabled("FPS target is a ceiling; gameplay VI follows sustainable speed, audio stays real-time");
+        ImGui::TextDisabled("Fixed 60/120 FPS lock - adaptive/unlimited removed");
 
-        bool fov_on = s.fov_override.load();
+bool fov_on = s.fov_override.load();
         if (ImGui::Checkbox("Custom world FOV", &fov_on))
         {
           s.fov_override = fov_on;
           ApplyFov();
         }
-        float fov = s.fov.load();
-        if (fov_on && ImGui::SliderFloat("World FOV", &fov, 50.0f, 130.0f, "%.1f deg"))
+        float fov = std::clamp(s.fov.load(), 50.0f, 105.0f);
+        s.fov.store(fov, std::memory_order_relaxed);
+        if (fov_on && ImGui::SliderFloat("World FOV", &fov, 50.0f, 105.0f, "%.1f deg"))
         {
           s.fov = fov;
           ApplyFov();
