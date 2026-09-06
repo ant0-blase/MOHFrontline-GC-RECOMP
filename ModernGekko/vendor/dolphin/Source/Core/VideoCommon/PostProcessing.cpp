@@ -434,6 +434,7 @@ void PostProcessing::RecompileShader()
   // and pipelines even if there might not be need to.
 
   m_default_pipeline.reset();
+  m_moh_passthrough_pipeline.reset();
   m_pipeline.reset();
   m_default_pixel_shader.reset();
   m_pixel_shader.reset();
@@ -447,9 +448,36 @@ void PostProcessing::RecompileShader()
   CompilePipeline();
 }
 
+void PostProcessing::RecompileShaderFromCurrentConfig()
+{
+  // Same rebuild as RecompileShader(), except CompilePixelShader(false)
+  // preserves the PostProcessingConfiguration explicitly prepared by the
+  // caller. This is required by MOH's gameplay-only pre-HUD compositor:
+  // its shader must not be replaced by the global Presenter shader.
+
+  m_default_pipeline.reset();
+  m_pipeline.reset();
+
+  m_default_pixel_shader.reset();
+  m_pixel_shader.reset();
+
+  m_default_vertex_shader.reset();
+  m_vertex_shader.reset();
+
+  if (!CompilePixelShader(false))
+    return;
+
+  if (!CompileVertexShader())
+    return;
+
+  CompilePipeline();
+}
+
+
 void PostProcessing::RecompilePipeline()
 {
   m_default_pipeline.reset();
+  m_moh_passthrough_pipeline.reset();
   m_pipeline.reset();
   CompilePipeline();
 }
@@ -858,6 +886,92 @@ struct BuiltinUniforms
   float hdr_sdr_white_nits;
 };
 
+void PostProcessing::BlitFromTextureDefault(
+    const MathUtil::Rectangle<int>& dst,
+    const MathUtil::Rectangle<int>& src,
+    const AbstractTexture* src_tex,
+    int src_layer)
+{
+  if (!src_tex ||
+      !g_gfx ||
+      !g_gfx->GetCurrentFramebuffer())
+  {
+    return;
+  }
+
+  if (g_gfx->GetCurrentFramebuffer()
+          ->GetColorFormat() !=
+      m_framebuffer_format)
+  {
+    m_framebuffer_format =
+        g_gfx->GetCurrentFramebuffer()
+            ->GetColorFormat();
+
+    RecompilePipeline();
+  }
+
+  if (!m_moh_passthrough_pipeline ||
+      m_default_uniform_staging_buffer.empty())
+  {
+    return;
+  }
+
+  src_layer =
+      std::max(
+          src_layer,
+          0);
+
+  g_gfx->SetSamplerState(
+      0,
+      RenderState::GetLinearSamplerState());
+
+  g_gfx->SetSamplerState(
+      1,
+      RenderState::GetPointSamplerState());
+
+  g_gfx->SetTexture(
+      0,
+      src_tex);
+
+  g_gfx->SetTexture(
+      1,
+      src_tex);
+
+  const MathUtil::Rectangle<int>
+      present_rect =
+          g_presenter
+              ->GetTargetRectangle();
+
+  FillUniformBuffer(
+      src,
+      src_tex,
+      src_layer,
+      g_gfx->GetCurrentFramebuffer()
+          ->GetRect(),
+      present_rect,
+      m_default_uniform_staging_buffer.data(),
+      false,
+      false);
+
+  g_vertex_manager
+      ->UploadUtilityUniforms(
+          m_default_uniform_staging_buffer.data(),
+          static_cast<u32>(
+              m_default_uniform_staging_buffer.size()));
+
+  g_gfx->SetViewportAndScissor(
+      g_gfx->ConvertFramebufferRectangle(
+          dst,
+          g_gfx->GetCurrentFramebuffer()));
+
+  g_gfx->SetPipeline(
+      m_moh_passthrough_pipeline.get());
+
+  g_gfx->Draw(
+      0,
+      3);
+}
+
 size_t PostProcessing::CalculateUniformsSize(bool user_post_process) const
 {
   // Allocate a vec4 for each uniform to simplify allocation.
@@ -958,7 +1072,7 @@ void PostProcessing::FillUniformBuffer(const MathUtil::Rectangle<int>& src,
   m_config.SetDirty(false);
 }
 
-bool PostProcessing::CompilePixelShader()
+bool PostProcessing::CompilePixelShader(bool reload_from_active_config)
 {
   m_default_pixel_shader.reset();
   m_pixel_shader.reset();
@@ -979,7 +1093,9 @@ bool PostProcessing::CompilePixelShader()
     m_default_uniform_staging_buffer.resize(0);
   }
 
-  m_config.LoadShader(g_ActiveConfig.sPostProcessingShader);
+  if (reload_from_active_config)
+    m_config.LoadShader(
+        g_ActiveConfig.sPostProcessingShader);
   m_pixel_shader = g_gfx->CreateShaderFromSource(
       ShaderStage::Pixel, GetHeader(true) + m_config.GetShaderCode() + GetFooter(),
       m_config.GetShaderIncluder(),
@@ -1052,6 +1168,34 @@ bool PostProcessing::CompilePipeline()
   // We continue even if it failed, it will be skipped later on
   if (config.pixel_shader)
     m_default_pipeline = g_gfx->CreatePipeline(config);
+
+  // Always keep a default/fixed pipeline which targets the REAL final
+  // framebuffer rather than the RGBA16F intermediary selected for a user
+  // post-process shader.
+  if (m_default_vertex_shader &&
+      m_default_pixel_shader)
+  {
+    AbstractPipelineConfig passthrough = config;
+
+    passthrough.vertex_shader =
+        m_default_vertex_shader.get();
+
+    passthrough.geometry_shader =
+        UseGeometryShaderForPostProcess(false) ?
+            g_shader_cache->GetTexcoordGeometryShader() :
+            nullptr;
+
+    passthrough.pixel_shader =
+        m_default_pixel_shader.get();
+
+    passthrough.framebuffer_state =
+        RenderState::GetColorFramebufferState(
+            m_framebuffer_format);
+
+    m_moh_passthrough_pipeline =
+        g_gfx->CreatePipeline(
+            passthrough);
+  }
 
   config.vertex_shader = m_vertex_shader.get();
   config.geometry_shader = UseGeometryShaderForPostProcess(false) ?

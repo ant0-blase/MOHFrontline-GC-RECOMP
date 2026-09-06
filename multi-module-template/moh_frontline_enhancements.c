@@ -81,6 +81,11 @@ static int s_hud_logged;
 #define MOH_HOSTCALL_ADS_STATE        0xFFFFF131u
 #define MOH_HOSTCALL_FRAME_PRESENT     0xFFFFF133u
 
+#define MOH_HOSTCALL_SCENE_POSTPROCESS 0xFFFFF150u
+
+#define MOH_HOSTCALL_PS3_FONT_DRAW      0xFFFFF160u
+#define MOH_HOSTCALL_PS3_FONT_CENTERED  0xFFFFF161u
+
 static int env_enabled(const char* name)
 {
     const char* value = getenv(name);
@@ -127,10 +132,25 @@ static void refresh_config(void)
         s_hud_safe_width = 1.0;
     if (!(s_fov_degrees >= 0.0 && s_fov_degrees < 179.0))
         s_fov_degrees = 0.0;
+    if (s_fov_degrees > 104.0)
+    {
+        static int render_only_fov_cap_logged;
+        if (!render_only_fov_cap_logged)
+        {
+            render_only_fov_cap_logged = 1;
+            fprintf(stderr,
+                    "[moh-enh] render-only FOV: %.2f requested; "
+                    "limiting 4:3 reference FOV to 104.0 (stock CPU culling)\n",
+                    s_fov_degrees);
+        }
+        s_fov_degrees = 104.0;
+    }
     if (!(s_weapon_fov_degrees >= 20.0 && s_weapon_fov_degrees < 179.0))
         s_weapon_fov_degrees = -1.0;
     if (!(s_ads_world_fov >= 35.0 && s_ads_world_fov <= 120.0))
         s_ads_world_fov = 72.0;
+    if (s_ads_world_fov > 104.0)
+        s_ads_world_fov = 104.0;
     if (!(s_ads_weapon_fov >= 35.0 && s_ads_weapon_fov <= 120.0))
         s_ads_weapon_fov = 68.0;
 
@@ -251,6 +271,55 @@ static void moh_reference_fov_tangents(double fov_degrees,
     *out_x = native_tan_x * aspect_scale;
     *out_y = native_tan_x / MOH_NATIVE_ASPECT;
 }
+
+int moh_wide_fov_force_skybox_faces(void)
+{
+    static int logged;
+    static double cached_ref_fov = -1.0;
+    static double cached_aspect = -1.0;
+    static double cached_real_hfov = 0.0;
+
+    /*
+     * CSkyBox::Draw has its own six-face selector, independent from CFrustum
+     * and CCompartment. With Hor+, 105 deg in the PC menu (native 4:3
+     * reference) is about 120.16 deg real horizontal at 16:9. The original
+     * console selector can then reject a side/top skybox face that is visible.
+     *
+     * Force all six SKYBOX faces only for a wide real hFOV. This does NOT
+     * widen world visibility, PVS, or the CPU frustum.
+     */
+    if (!s_camera_enabled || !s_gameplay_active || s_fov_degrees <= 0.0)
+        return 0;
+
+    if (fabs(cached_ref_fov - s_fov_degrees) > 0.000001 ||
+        fabs(cached_aspect - s_aspect) > 0.000001)
+    {
+        double tan_x;
+        double tan_y;
+
+        moh_reference_fov_tangents(s_fov_degrees, s_aspect, &tan_x, &tan_y);
+        (void)tan_y;
+
+        cached_ref_fov = s_fov_degrees;
+        cached_aspect = s_aspect;
+        cached_real_hfov = atan(tan_x) * (360.0 / MOH_PI);
+    }
+
+    if (cached_real_hfov < 90.0)
+        return 0;
+
+    if (!logged)
+    {
+        logged = 1;
+        fprintf(stderr,
+                "[moh-enh] wide-FOV skybox selector bypass: "
+                "ref=%.2f real-h=%.2f aspect=%.6f (no CPU frustum overscan)\n",
+                s_fov_degrees, cached_real_hfov, s_aspect);
+    }
+
+    return 1;
+}
+
 
 int moh_camera_override(CPUState* ctx)
 {
@@ -618,6 +687,15 @@ void moh_hud_begin(CPUState* ctx)
     if (s_hud_draw_depth++ != 0u)
         return;
 
+    /*
+     * Exact gameplay 3D -> HUD boundary.
+     *
+     * Do NOT put this in moh_ui_begin(): frontend/menu/VP6 must never receive
+     * MOHFrontlineEnhanced.
+     */
+    if (ctx && ctx->host_call)
+        (void)ctx->host_call(ctx, MOH_HOSTCALL_SCENE_POSTPROCESS);
+
     s_hud_hide_guest_crosshair = moh_query_hide_guest_crosshair(ctx);
 
     if (!moh_hud_compute_scales(&x_scale, &y_scale))
@@ -784,6 +862,49 @@ void moh_hud_poly_end(CPUState* ctx)
     s_hud_poly_count = 0u;
 }
 
+static void moh_ps3_font_submit(
+    CPUState* ctx,
+    u32 token)
+{
+    u32 saved_r0;
+    int replacement_ready;
+
+    if (!ctx ||
+        !ctx->host_call ||
+        s_hud_draw_depth == 0u)
+    {
+        return;
+    }
+
+    /*
+     * Host reads the untouched CFont registers itself and returns success in
+     * r0. Preserve r0 because this hook lives inside the original function.
+     */
+    saved_r0 = ctx->gpr[0];
+    ctx->gpr[0] = 0u;
+
+    (void)ctx->host_call(
+        ctx,
+        token);
+
+    replacement_ready =
+        ctx->gpr[0] == 1u;
+
+    ctx->gpr[0] =
+        saved_r0;
+
+    if (replacement_ready)
+    {
+        /*
+         * Host has copied the text/position and will draw the actual PS3 SFNH
+         * glyphs in OnScreenUI. Move only this old GC CFont draw outside the
+         * viewport, avoiding double text without changing layout/state.
+         */
+        ctx->fpr[1] = -32768.0;
+        ctx->fpr[2] = -32768.0;
+    }
+}
+
 void moh_hud_text_position_override(CPUState* ctx)
 {
     const double center_x = 320.0;
@@ -794,6 +915,10 @@ void moh_hud_text_position_override(CPUState* ctx)
 
     ctx->fpr[1] = center_x + (ctx->fpr[1] - center_x) * s_hud_root_x_scale;
     ctx->fpr[2] = center_y + (ctx->fpr[2] - center_y) * s_hud_root_y_scale;
+    moh_ps3_font_submit(
+        ctx,
+        MOH_HOSTCALL_PS3_FONT_DRAW);
+
 }
 
 void moh_hud_centered_text_position_override(CPUState* ctx)
@@ -806,6 +931,10 @@ void moh_hud_centered_text_position_override(CPUState* ctx)
     /* DrawTextCentered computes horizontal centring internally; its only float
      * argument is the vertical position. */
     ctx->fpr[1] = center_y + (ctx->fpr[1] - center_y) * s_hud_root_y_scale;
+    moh_ps3_font_submit(
+        ctx,
+        MOH_HOSTCALL_PS3_FONT_CENTERED);
+
 }
 
 void moh_ui_font_scale_override(CPUState* ctx)

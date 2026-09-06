@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 int moh_camera_override(CPUState* ctx);
+int moh_wide_fov_force_skybox_faces(void);
 int moh_weapon_projection_override(CPUState* ctx);
 void moh_ui_prepare(CPUState* ctx);
 void moh_ui_matrix_override(CPUState* ctx);

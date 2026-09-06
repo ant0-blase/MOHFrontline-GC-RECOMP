@@ -3,6 +3,7 @@
 
 #include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/PS3RemasterAssets.h"
+#include "VideoCommon/PS3FontParser.h"
 
 #include "Common/Config/Config.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -15,6 +16,11 @@
 #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
 #include "InputCommon/ControllerEmu/StickGate.h"
 #include "InputCommon/InputConfig.h"
+#include "VideoCommon/AbstractGfx.h"
+#include "VideoCommon/AbstractTexture.h"
+#include "VideoCommon/AsyncRequests.h"
+#include "VideoCommon/Fifo.h"
+#include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/PostProcessing.h"
 #include "VideoCommon/Present.h"
@@ -28,6 +34,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
+#include <mutex>
+#include <vector>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -192,6 +201,20 @@ struct State
   std::atomic<bool> gfx_film_grain{false};
   std::atomic<float> gfx_film_grain_strength{0.015f};
   std::atomic<bool> movie_active{false};
+
+  // Keep movie bypass alive for a few Presents after VP6 marks itself OFF.
+  // Frontline can toggle the movie state before the final XFB reaches Presenter.
+  std::atomic<int> movie_bypass_frames{0};
+
+  // Dedicated EFB postprocessor and immutable copy of the completed 3D scene.
+  std::unique_ptr<VideoCommon::PostProcessing> scene_post_processor;
+  std::unique_ptr<AbstractTexture> scene_post_source;
+  std::string scene_post_shader;
+
+  std::atomic<bool> scene_postprocess_done{false};
+  std::atomic<bool> scene_postprocess_busy{false};
+
+  bool scene_postprocess_logged = false;
   std::atomic<float> hud_scale{1.0f};
   std::atomic<float> hud_safe_width{1.0f};
   std::atomic<float> gamepad_sensitivity{1.0f};
@@ -227,6 +250,25 @@ struct State
 };
 
 State s;
+
+struct PS3FontDrawRequest
+{
+  std::string text;
+  float x = 0.0f;
+  float y = 0.0f;
+  bool centered = false;
+};
+
+std::mutex s_ps3_font_draw_mutex;
+std::vector<PS3FontDrawRequest>
+    s_ps3_font_draw_requests;
+
+std::unique_ptr<AbstractTexture>
+    s_ps3_font_gpu_texture;
+
+std::string
+    s_ps3_font_gpu_key;
+
 
 bool EnvTrue(const char* name, bool fallback)
 {
@@ -443,79 +485,66 @@ void UpdateAdsAnimation()
 
 void UpdateEnhancedPostProcess()
 {
-  const bool enabled = s.enhanced_graphics.load();
-  const std::string desired = enabled ? "MOHFrontlineEnhanced" : s.original_post_shader;
-  if (s.applied_post_shader != desired)
+  const bool enabled =
+      s.enhanced_graphics.load(
+          std::memory_order_relaxed);
+
+  // v6.5:
+  //
+  // MOHFrontlineEnhanced must never live in Presenter's final-XFB
+  // PostProcessing instance. Otherwise a menu, loading frame or VP6 path
+  // which misses one of our bypass branches can still receive bloom /
+  // tonemap / sharpening.
+  //
+  // Enhanced mode therefore means:
+  //
+  //   Presenter final shader = NONE
+  //   F150 scene processor    = MOHFrontlineEnhanced
+  //
+  // Turning Enhanced mode off restores the user's original Dolphin shader.
+  std::string desired;
+
+  if (!enabled)
   {
-    Config::SetCurrent(Config::GFX_ENHANCE_POST_SHADER, desired);
-    s.applied_post_shader = desired;
-    std::fprintf(stderr, "[moh-gfx] enhanced graphics %s (shader=%s)\n",
-                 enabled ? "ON" : "OFF", desired.empty() ? "original" : desired.c_str());
+    desired =
+        s.original_post_shader;
+
+    // Never restore a stale MOH shader from a previous experimental build.
+    if (desired ==
+        "MOHFrontlineEnhanced")
+    {
+      desired.clear();
+    }
   }
 
-  if (!enabled || !g_presenter || !g_presenter->GetPostProcessor())
-    return;
-  auto* config = g_presenter->GetPostProcessor()->GetConfig();
-  if (!config || config->GetShader() != "MOHFrontlineEnhanced")
-    return;
+  if (s.applied_post_shader !=
+      desired)
+  {
+    Config::SetCurrent(
+        Config::GFX_ENHANCE_POST_SHADER,
+        desired);
 
-  SetPostOptionBool(config, "MASTER_ENABLE", true);
-  SetPostOptionBool(config, "BLOOM_ENABLE", s.gfx_bloom.load());
-  SetPostOptionFloat(config, "BLOOM_INTENSITY", s.gfx_bloom_intensity.load());
-  SetPostOptionFloat(config, "BLOOM_THRESHOLD", s.gfx_bloom_threshold.load());
-  SetPostOptionBool(config, "TONEMAP_ENABLE", s.gfx_tonemap.load());
-  SetPostOptionFloat(config, "EXPOSURE", s.gfx_exposure.load());
-  SetPostOptionFloat(config, "CONTRAST", s.gfx_contrast.load());
-  SetPostOptionFloat(config, "SATURATION", s.gfx_saturation.load());
-  SetPostOptionBool(config, "SHARPEN_ENABLE", s.gfx_sharpen.load());
-  SetPostOptionFloat(config, "SHARPEN_STRENGTH", s.gfx_sharpen_strength.load());
-  SetPostOptionBool(config, "DOF_ENABLE", s.gfx_dof.load());
-  const float dof = s.gfx_dof_ads_only.load() ?
-                        s.gfx_dof_strength.load() * s.ads_blend.load() :
-                        s.gfx_dof_strength.load();
-  SetPostOptionFloat(config, "DOF_STRENGTH", dof);
-  // Lighting/material response is now calculated on actual 3D geometry.
-  // Do not run the old screen-space approximations over HUD/fonts when the
-  // PS3 engine renderer is active.
-  const bool ps3_engine_materials =
-      EnvTrue("MOH_PS3_RENDERER_ACTIVE", false);
+    s.applied_post_shader =
+        desired;
+  }
 
-  SetPostOptionBool(
-      config,
-      "LIGHTING_ENABLE",
-      s.gfx_enhanced_lighting.load() &&
-          !ps3_engine_materials);
+  static int s_logged_state = -1;
 
-  SetPostOptionFloat(
-      config,
-      "LIGHTING_STRENGTH",
-      s.gfx_lighting_strength.load());
+  const int state =
+      enabled ? 1 : 0;
 
-  SetPostOptionBool(
-      config,
-      "SSAO_ENABLE",
-      s.gfx_ssao.load() &&
-          !ps3_engine_materials);
+  if (s_logged_state != state)
+  {
+    s_logged_state =
+        state;
 
-  SetPostOptionFloat(
-      config,
-      "SSAO_STRENGTH",
-      s.gfx_ssao_strength.load());
-
-  SetPostOptionBool(
-      config,
-      "CONTACT_SHADOW_ENABLE",
-      s.gfx_contact_shadows.load() &&
-          !ps3_engine_materials);
-
-  SetPostOptionFloat(
-      config,
-      "CONTACT_SHADOW_STRENGTH",
-      s.gfx_contact_shadow_strength.load());
-  SetPostOptionBool(config, "VIGNETTE_ENABLE", s.gfx_vignette.load());
-  SetPostOptionFloat(config, "VIGNETTE_STRENGTH", s.gfx_vignette_strength.load());
-  SetPostOptionBool(config, "FILM_GRAIN_ENABLE", s.gfx_film_grain.load());
-  SetPostOptionFloat(config, "FILM_GRAIN_STRENGTH", s.gfx_film_grain_strength.load());
+    std::fprintf(
+        stderr,
+        "[moh-gfx] enhanced graphics %s: "
+        "GLOBAL final post shader DISABLED; "
+        "MOH shader reserved for gameplay 3D F150 only\n",
+        enabled ? "ON" : "OFF");
+  }
 }
 
 void ApplyAspect(int mode)
@@ -1112,6 +1141,357 @@ void SyncFromEnvironment()
   if (EnvTrue("MOH_ASPECT_AUTO", false)) s.aspect_mode = 1;
 }
 
+
+bool CopyScenePostOptions(
+    VideoCommon::PostProcessingConfiguration* source,
+    VideoCommon::PostProcessingConfiguration* destination)
+{
+  if (!source ||
+      !destination)
+  {
+    return false;
+  }
+
+  if (source->GetShader() !=
+          "MOHFrontlineEnhanced" ||
+      destination->GetShader() !=
+          "MOHFrontlineEnhanced")
+  {
+    return false;
+  }
+
+  destination->GetOptions() =
+      source->GetOptions();
+
+  destination->SetDirty(true);
+
+  return true;
+}
+
+bool RunScenePostProcessOnGpu()
+{
+  if (!g_gfx ||
+      !g_framebuffer_manager ||
+      !g_presenter ||
+      !g_presenter->GetPostProcessor())
+  {
+    return false;
+  }
+
+  if (!g_gfx->SupportsUtilityDrawing())
+    return false;
+
+  auto* presenter_post =
+      g_presenter->GetPostProcessor();
+
+  auto* presenter_config =
+      presenter_post->GetConfig();
+
+
+
+  AbstractTexture* efb =
+      g_framebuffer_manager
+          ->GetEFBColorTexture();
+
+  if (!efb)
+    return false;
+
+  const MathUtil::Rectangle<int>
+      efb_rect =
+          efb->GetRect();
+
+  AbstractTexture* resolved =
+      g_framebuffer_manager
+          ->ResolveEFBColorTexture(
+              efb_rect);
+
+  if (!resolved)
+    return false;
+
+  if (!s.scene_post_processor)
+  {
+    s.scene_post_processor =
+        std::make_unique<
+            VideoCommon::PostProcessing>();
+
+    if (!s.scene_post_processor
+             ->Initialize(
+                 efb->GetFormat()))
+    {
+      s.scene_post_processor.reset();
+      return false;
+    }
+
+    s.scene_post_shader =
+        s.scene_post_processor
+            ->GetConfig()
+            ->GetShader();
+  }
+
+
+
+  // v6.5 dedicated F150 scene configuration.
+  //
+  // Do not read the Presenter shader/config here. Presenter intentionally
+  // has NO MOH post shader.
+  auto* scene_config =
+      s.scene_post_processor
+          ->GetConfig();
+
+  if (!scene_config)
+    return false;
+
+  constexpr const char* scene_shader =
+      "MOHFrontlineEnhanced";
+
+  if (scene_config->GetShader() !=
+      scene_shader)
+  {
+    scene_config->LoadShader(
+        scene_shader);
+
+    s.scene_post_processor->RecompileShaderFromCurrentConfig();
+
+    s.scene_post_shader =
+        scene_config->GetShader();
+
+    std::fprintf(
+        stderr,
+        "[moh-gfx] dedicated gameplay-3D shader loaded: %s\n",
+        s.scene_post_shader.c_str());
+  }
+
+  if (scene_config->GetShader() !=
+      scene_shader)
+  {
+    std::fprintf(
+        stderr,
+        "[moh-gfx] ERROR: dedicated gameplay-3D shader failed: %s\n",
+        scene_config->GetShader().c_str());
+
+    return false;
+  }
+
+  // Copy the PC graphics settings DIRECTLY to the dedicated scene pass.
+  // Bloom values remain untouched.
+  SetPostOptionBool(
+      scene_config,
+      "MASTER_ENABLE",
+      true);
+
+  SetPostOptionBool(
+      scene_config,
+      "BLOOM_ENABLE",
+      s.gfx_bloom.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "BLOOM_INTENSITY",
+      s.gfx_bloom_intensity.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "BLOOM_THRESHOLD",
+      s.gfx_bloom_threshold.load());
+
+  SetPostOptionBool(
+      scene_config,
+      "TONEMAP_ENABLE",
+      s.gfx_tonemap.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "EXPOSURE",
+      s.gfx_exposure.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "CONTRAST",
+      s.gfx_contrast.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "SATURATION",
+      s.gfx_saturation.load());
+
+  SetPostOptionBool(
+      scene_config,
+      "SHARPEN_ENABLE",
+      s.gfx_sharpen.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "SHARPEN_STRENGTH",
+      s.gfx_sharpen_strength.load());
+
+  SetPostOptionBool(
+      scene_config,
+      "DOF_ENABLE",
+      s.gfx_dof.load());
+
+  const float scene_dof =
+      s.gfx_dof_ads_only.load() ?
+          s.gfx_dof_strength.load() *
+              s.ads_blend.load() :
+          s.gfx_dof_strength.load();
+
+  SetPostOptionFloat(
+      scene_config,
+      "DOF_STRENGTH",
+      scene_dof);
+
+  const bool engine_materials =
+      EnvTrue(
+          "MOH_PS3_RENDERER_ACTIVE",
+          false);
+
+  SetPostOptionBool(
+      scene_config,
+      "LIGHTING_ENABLE",
+      s.gfx_enhanced_lighting.load() &&
+          !engine_materials);
+
+  SetPostOptionFloat(
+      scene_config,
+      "LIGHTING_STRENGTH",
+      s.gfx_lighting_strength.load());
+
+  SetPostOptionBool(
+      scene_config,
+      "SSAO_ENABLE",
+      s.gfx_ssao.load() &&
+          !engine_materials);
+
+  SetPostOptionFloat(
+      scene_config,
+      "SSAO_STRENGTH",
+      s.gfx_ssao_strength.load());
+
+  SetPostOptionBool(
+      scene_config,
+      "CONTACT_SHADOW_ENABLE",
+      s.gfx_contact_shadows.load() &&
+          !engine_materials);
+
+  SetPostOptionFloat(
+      scene_config,
+      "CONTACT_SHADOW_STRENGTH",
+      s.gfx_contact_shadow_strength.load());
+
+  SetPostOptionBool(
+      scene_config,
+      "VIGNETTE_ENABLE",
+      s.gfx_vignette.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "VIGNETTE_STRENGTH",
+      s.gfx_vignette_strength.load());
+
+  SetPostOptionBool(
+      scene_config,
+      "FILM_GRAIN_ENABLE",
+      s.gfx_film_grain.load());
+
+  SetPostOptionFloat(
+      scene_config,
+      "FILM_GRAIN_STRENGTH",
+      s.gfx_film_grain_strength.load());
+
+
+  TextureConfig source_config =
+      resolved->GetConfig();
+
+  // The snapshot is sampled only. It must never be the same Vulkan image as
+  // the EFB render target.
+  source_config.flags = 0;
+  source_config.samples = 1;
+
+  if (!s.scene_post_source ||
+      !(s.scene_post_source
+            ->GetConfig() ==
+        source_config))
+  {
+    s.scene_post_source =
+        g_gfx->CreateTexture(
+            source_config,
+            "MOH Frontline completed 3D scene");
+
+    if (!s.scene_post_source)
+      return false;
+  }
+
+  g_gfx->BeginUtilityDrawing();
+
+  const auto copy_rect =
+      resolved->GetRect();
+
+  const u32 layers =
+      std::min(
+          resolved->GetLayers(),
+          s.scene_post_source
+              ->GetLayers());
+
+  for (u32 layer = 0;
+       layer < layers;
+       ++layer)
+  {
+    s.scene_post_source
+        ->CopyRectangleFromTexture(
+            resolved,
+            copy_rect,
+            layer,
+            0,
+            copy_rect,
+            layer,
+            0);
+  }
+
+  // Vulkan: TRANSFER_DST -> SHADER_READ_ONLY.
+  s.scene_post_source
+      ->FinishedRendering();
+
+  // Destination is the real EFB. HUD/font GX draws continue here afterwards.
+  g_framebuffer_manager
+      ->BindEFBFramebuffer();
+
+  s.scene_post_processor
+      ->BlitFromTexture(
+          efb_rect,
+          s.scene_post_source
+              ->GetRect(),
+          s.scene_post_source.get());
+
+  g_framebuffer_manager
+      ->FlagPeekCacheAsOutOfDate();
+
+  g_gfx->EndUtilityDrawing();
+
+  if (!s.scene_postprocess_logged)
+  {
+    s.scene_postprocess_logged = true;
+
+    std::fprintf(
+        stderr,
+        "[moh-gfx] scene-only postprocess active: "
+        "GAMEPLAY 3D -> MOHFrontlineEnhanced -> HUD/fonts -> XFB\n");
+  }
+
+  return true;
+}
+
+void ReleaseScenePostProcessOnGpu()
+{
+  s_ps3_font_gpu_texture.reset();
+  s_ps3_font_gpu_key.clear();
+
+  s.scene_post_source.reset();
+  s.scene_post_processor.reset();
+
+  s.scene_post_shader.clear();
+  s.scene_postprocess_logged = false;
+}
+
 } // namespace
 
 void Initialize()
@@ -1147,6 +1527,34 @@ void Shutdown()
 {
   if (!s.initialized.exchange(false))
     return;
+
+  s.scene_postprocess_done.store(
+      false,
+      std::memory_order_relaxed);
+
+  s.scene_postprocess_busy.store(
+      false,
+      std::memory_order_relaxed);
+
+  if ((s.scene_post_source ||
+       s.scene_post_processor ||
+       s_ps3_font_gpu_texture) &&
+      g_gfx)
+  {
+    Core::System::GetInstance()
+        .GetFifo()
+        .SyncGPUForRegisterAccess();
+
+    AsyncRequests::GetInstance()
+        ->PushBlockingEvent(
+            [] {
+              ReleaseScenePostProcessOnGpu();
+            });
+  }
+  else
+  {
+    ReleaseScenePostProcessOnGpu();
+  }
 
   PS3RemasterAssets::Shutdown();
   SaveSettings();
@@ -1212,6 +1620,30 @@ void ApplyDolphinSettings()
 void SetGameplayActive(bool active)
 {
   s.gameplay = active;
+
+  if (active)
+  {
+    // v6.2:
+    //
+    // Frontline finishes several startup VP6 sequences immediately before
+    // entering gameplay. The old sticky movie guard can therefore still be
+    // 3-4 Presents long when the first HUD/F150 boundary arrives.
+    //
+    // Once GAMEPLAY_ENTER has fired there is no startup movie frame left to
+    // protect. Clear the stale VP6 guard so the 3D scene prepass can execute
+    // before the first HUD draw.
+    s.movie_bypass_frames.store(
+        0,
+        std::memory_order_relaxed);
+
+    s.scene_postprocess_done.store(
+        false,
+        std::memory_order_relaxed);
+
+    std::fprintf(
+        stderr,
+        "[moh-gfx] gameplay entered: stale VP6 postprocess guard cleared\\n");
+  }
   s.rel_x = 0.0;
   s.rel_y = 0.0;
   s.last_abs_x = -1.0;
@@ -1235,6 +1667,22 @@ void SetGameplayActive(bool active)
 void SetMovieActive(bool active)
 {
   const bool previous = s.movie_active.exchange(active);
+
+  if (active)
+  {
+    s.movie_bypass_frames.store(
+        4,
+        std::memory_order_relaxed);
+  }
+  else if (previous)
+  {
+    s.movie_bypass_frames.store(
+        std::max(
+            s.movie_bypass_frames.load(
+                std::memory_order_relaxed),
+            3),
+        std::memory_order_relaxed);
+  }
   if (previous == active)
     return;
 
@@ -1278,6 +1726,231 @@ void SetMovieActive(bool active)
 bool IsGameplayActive() { return s.gameplay.load(); }
 bool IsSettingsOpen() { return s.settings_open.load(); }
 bool IsDebugOpen() { return s.debug_open.load(); }
+
+void SetGameplayDetected(bool active)
+{
+  const bool previous =
+      s.gameplay.exchange(
+          active,
+          std::memory_order_acq_rel);
+
+  if (active)
+  {
+    // The GameCube gameplay loop is authoritative. Any delayed VP6 guard
+    // belongs to the preceding movie/frontend frame and must not suppress
+    // the first actual gameplay scene.
+    s.movie_bypass_frames.store(
+        0,
+        std::memory_order_release);
+
+    s.scene_postprocess_done.store(
+        false,
+        std::memory_order_release);
+
+    if (!previous)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-gfx] ELF gameplay detector ON: "
+          "camera/VI gameplay path -> scene postprocess armed\n");
+    }
+  }
+  else
+  {
+    s.scene_postprocess_done.store(
+        false,
+        std::memory_order_release);
+
+    if (previous)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-gfx] ELF gameplay detector OFF: "
+          "menu/movie/frontend -> postprocess disabled\n");
+    }
+  }
+}
+
+void PreprocessSceneBefore2D()
+{
+
+  static bool s_final_policy_logged = false;
+
+  if (!s_final_policy_logged)
+  {
+    s_final_policy_logged = true;
+
+    std::fprintf(
+        stderr,
+        "[moh-gfx] menu/VP6 final postprocess bypass ACTIVE\n");
+  }
+
+
+  static bool s_f150_logged = false;
+
+  if (!s_f150_logged)
+  {
+    s_f150_logged = true;
+
+    std::fprintf(
+        stderr,
+        "[moh-gfx] pre-HUD F150 scene request received\\n");
+  }
+
+  if (!s.initialized.load(
+          std::memory_order_relaxed) ||
+      !s.enhanced_graphics.load(
+          std::memory_order_relaxed) ||
+      !s.gameplay.load(
+          std::memory_order_acquire) ||
+      s.movie_active.load(
+          std::memory_order_acquire))
+  {
+    return;
+  }
+
+  if (s.scene_postprocess_done.load(
+          std::memory_order_acquire))
+  {
+    return;
+  }
+
+  bool expected = false;
+
+  if (!s.scene_postprocess_busy
+           .compare_exchange_strong(
+               expected,
+               true,
+               std::memory_order_acq_rel))
+  {
+    return;
+  }
+
+  // Finish all GX world/viewmodel/character work before snapshotting the EFB.
+  Core::System::GetInstance()
+      .GetFifo()
+      .SyncGPUForRegisterAccess();
+
+  // v6.8.1 - F150 CPU/GPU ordering barrier.
+  //
+  // F150 is emitted at the real GAMEPLAY 3D -> HUD transition.
+  // The recomp CPU is already there, but in DualCore the Dolphin GPU thread
+  // can still be finishing GX commands previously emitted for world, actors
+  // and weapon.
+  //
+  // Drain those commands BEFORE asking the video thread to process the EFB.
+  {
+    auto& system =
+        Core::System::GetInstance();
+
+    auto& fifo =
+        system.GetFifo();
+
+    if (system.IsDualCoreMode())
+    {
+      fifo.RunGpu();
+      fifo.FlushGpu();
+    }
+    else
+    {
+      fifo.SyncGPUForRegisterAccess();
+    }
+  }
+
+  static bool s_f150_gpu_order_logged =
+      false;
+
+  if (!s_f150_gpu_order_logged)
+  {
+    s_f150_gpu_order_logged =
+        true;
+
+    std::fprintf(
+        stderr,
+        "[moh-gfx] F150 CPU/GPU ordering ACTIVE: "
+        "GAMEPLAY GX drained before scene postprocess\n");
+  }
+
+  const bool success =
+      AsyncRequests::GetInstance()
+          ->PushBlockingEvent(
+              [] {
+                return RunScenePostProcessOnGpu();
+              });
+
+  if (success)
+  {
+    s.scene_postprocess_done.store(
+        true,
+        std::memory_order_release);
+  }
+
+  s.scene_postprocess_busy.store(
+      false,
+      std::memory_order_release);
+}
+
+bool ShouldBypassFinalPostProcess()
+{
+  if (!s.initialized.load(
+          std::memory_order_relaxed))
+  {
+    return false;
+  }
+
+  if (!s.enhanced_graphics.load(
+          std::memory_order_relaxed))
+  {
+    return false;
+  }
+
+  // VP6/FMVs are NEVER post-processed.
+  if (s.movie_active.load(
+          std::memory_order_relaxed) ||
+      s.movie_bypass_frames.load(
+          std::memory_order_relaxed) > 0)
+  {
+    return true;
+  }
+
+  // Frontend/menu/loading screens are NEVER post-processed.
+  if (!s.gameplay.load(
+          std::memory_order_relaxed))
+  {
+    return true;
+  }
+
+  // Gameplay:
+  //
+  // If the pre-HUD F150 scene pass succeeded this frame, the 3D has already
+  // received MOHFrontlineEnhanced. Final XFB must therefore be DEFAULT so
+  // HUD/fonts remain clean.
+  //
+  // If F150 failed, return false as fail-safe so Enhanced is not lost.
+  return s.scene_postprocess_done.load(
+      std::memory_order_acquire);
+}
+
+void NotifyFinalPostProcessComplete()
+{
+  s.scene_postprocess_done.store(
+      false,
+      std::memory_order_release);
+
+  int frames =
+      s.movie_bypass_frames.load(
+          std::memory_order_relaxed);
+
+  while (frames > 0 &&
+         !s.movie_bypass_frames
+              .compare_exchange_weak(
+                  frames,
+                  frames - 1,
+                  std::memory_order_relaxed))
+  {
+  }
+}
+
 bool WantsRelativeMouse()
 {
   return s.input_enabled.load() && s.gameplay.load() && !s.settings_open.load();
@@ -1558,6 +2231,686 @@ bool IsPcCrosshairEnabled()
 }
 void SetCurrentWeaponType(int type) { s.current_weapon_type = type; }
 int GetCurrentWeaponType() { return s.current_weapon_type.load(); }
+
+bool IsPS3FontBridgeReady()
+{
+  if (!EnvTrue(
+          "MOH_PS3_FONT_RENDER",
+          true))
+  {
+    return false;
+  }
+
+  const char* requested =
+      std::getenv(
+          "MOH_PS3_FONT");
+
+  const std::string_view name =
+      requested && *requested ?
+          std::string_view(requested) :
+          std::string_view("mohgamefont_72.sfn");
+
+  const auto* font =
+      PS3FontParser::
+          FindByFilename(name);
+
+  return
+      font &&
+      font->atlas_rgba_ready &&
+      font->atlas_width > 0 &&
+      font->atlas_height > 0 &&
+      !font->atlas_rgba.empty();
+}
+
+bool QueuePS3FontDraw(
+    const char* text,
+    float x,
+    float y,
+    bool centered)
+{
+  if (!text ||
+      !*text ||
+      !IsPS3FontBridgeReady())
+  {
+    return false;
+  }
+
+  if (!std::isfinite(x) ||
+      !std::isfinite(y) ||
+      x < -2048.0f ||
+      x > 4096.0f ||
+      y < -2048.0f ||
+      y > 4096.0f)
+  {
+    return false;
+  }
+
+  PS3FontDrawRequest request;
+
+  request.text = text;
+  request.x = x;
+  request.y = y;
+  request.centered = centered;
+
+  std::scoped_lock lock(
+      s_ps3_font_draw_mutex);
+
+  // Queue saturated: preserve original GameCube CFont as fallback.
+  if (s_ps3_font_draw_requests.size() >=
+      256u)
+  {
+    return false;
+  }
+
+  // Same text already queued for this host frame:
+  // PS3 replacement is already guaranteed, therefore return success
+  // so the duplicate GC draw is suppressed too.
+  for (auto it =
+           s_ps3_font_draw_requests.rbegin();
+       it !=
+           s_ps3_font_draw_requests.rend();
+       ++it)
+  {
+    if (it->text ==
+            request.text &&
+        std::abs(
+            it->x -
+            request.x) < 0.01f &&
+        std::abs(
+            it->y -
+            request.y) < 0.01f &&
+        it->centered ==
+            request.centered)
+    {
+      return true;
+    }
+  }
+
+  s_ps3_font_draw_requests.emplace_back(
+      std::move(request));
+
+  return true;
+}
+
+void DrawPS3FontUI(
+    float backbuffer_scale)
+{
+  (void)backbuffer_scale;
+
+  std::vector<PS3FontDrawRequest>
+      requests;
+
+  std::vector<PS3FontDrawRequest>
+      incoming;
+
+  {
+    std::scoped_lock lock(
+        s_ps3_font_draw_mutex);
+
+    incoming.swap(
+        s_ps3_font_draw_requests);
+  }
+
+  // v6.5:
+  // Persist captured guest CFont draws across host presentation frames.
+  //
+  // At 120 Hz the host UI can render between two guest HUD/CFont updates.
+  // The old queue-swap implementation therefore generated:
+  //
+  //   capture -> visible -> empty queue -> invisible -> capture -> ...
+  //
+  // Retain each logical HUD slot for a short period instead.
+  struct RetainedPS3FontDraw
+  {
+    PS3FontDrawRequest request;
+    std::chrono::steady_clock::time_point last_seen;
+  };
+
+  static std::vector<
+      RetainedPS3FontDraw>
+      retained;
+
+  const auto now =
+      std::chrono::steady_clock::now();
+
+  // Never allow stale gameplay HUD text over menus or movies.
+  if (!s.gameplay.load(
+          std::memory_order_relaxed) ||
+      s.movie_active.load(
+          std::memory_order_relaxed))
+  {
+    retained.clear();
+    return;
+  }
+
+  const double hold_ms =
+      std::clamp(
+          EnvDouble(
+              "MOH_PS3_FONT_HOLD_MS",
+              180.0),
+          40.0,
+          1000.0);
+
+  for (auto& request :
+       incoming)
+  {
+    bool refreshed =
+        false;
+
+    for (auto& entry :
+         retained)
+    {
+      const float dx =
+          std::abs(
+              entry.request.x -
+              request.x);
+
+      const float dy =
+          std::abs(
+              entry.request.y -
+              request.y);
+
+      // Main identity is the logical CFont position. This naturally updates
+      // changing ammo numbers without leaving the previous value behind.
+      const bool same_slot =
+          entry.request.centered ==
+              request.centered &&
+          dx < 8.0f &&
+          dy < 8.0f;
+
+      // Also follow a label whose position moves slightly because of
+      // widescreen/HUD interpolation.
+      const bool same_text_near =
+          entry.request.text ==
+              request.text &&
+          dx < 64.0f &&
+          dy < 64.0f;
+
+      if (
+          same_slot ||
+          same_text_near
+      )
+      {
+        entry.request =
+            std::move(request);
+
+        entry.last_seen =
+            now;
+
+        refreshed =
+            true;
+
+        break;
+      }
+    }
+
+    if (
+        !refreshed &&
+        retained.size() < 256u
+    )
+    {
+      retained.push_back(
+          {
+              std::move(request),
+              now
+          });
+    }
+  }
+
+  for (
+      auto it = retained.begin();
+      it != retained.end();)
+  {
+    const double age_ms =
+        std::chrono::duration<
+            double,
+            std::milli>(
+                now -
+                it->last_seen)
+            .count();
+
+    if (age_ms >
+        hold_ms)
+    {
+      it =
+          retained.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+
+  requests.reserve(
+      retained.size());
+
+  for (const auto& entry :
+       retained)
+  {
+    requests.push_back(
+        entry.request);
+  }
+
+  static bool hold_logged =
+      false;
+
+  if (
+      !hold_logged &&
+      !requests.empty()
+  )
+  {
+    hold_logged =
+        true;
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3-font] PS3 font temporal hold active: %.0f ms\n",
+        hold_ms);
+  }
+
+
+  if (requests.empty() ||
+      !IsPS3FontBridgeReady() ||
+      !g_gfx)
+  {
+    return;
+  }
+
+  const char* requested =
+      std::getenv(
+          "MOH_PS3_FONT");
+
+  const std::string font_name =
+      requested && *requested ?
+          requested :
+          "mohgamefont_72.sfn";
+
+  const auto* font =
+      PS3FontParser::
+          FindByFilename(
+              font_name);
+
+  if (!font ||
+      !font->atlas_rgba_ready)
+  {
+    return;
+  }
+
+  const std::string key =
+      font->absolute_path.string();
+
+  if (!s_ps3_font_gpu_texture ||
+      s_ps3_font_gpu_key != key ||
+      s_ps3_font_gpu_texture
+          ->GetWidth() !=
+          font->atlas_width ||
+      s_ps3_font_gpu_texture
+          ->GetHeight() !=
+          font->atlas_height)
+  {
+    TextureConfig config(
+        font->atlas_width,
+        font->atlas_height,
+        1,
+        1,
+        1,
+        AbstractTextureFormat::RGBA8,
+        0,
+        AbstractTextureType::
+            Texture_2DArray);
+
+    auto texture =
+        g_gfx->CreateTexture(
+            config,
+            "MOH Frontline PS3 SFNH font atlas");
+
+    if (!texture)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-ps3-font] GPU atlas creation failed: %s\\n",
+          font_name.c_str());
+
+      return;
+    }
+
+    texture->Load(
+        0,
+        font->atlas_width,
+        font->atlas_height,
+        font->atlas_width,
+        font->atlas_rgba.data(),
+        font->atlas_rgba.size());
+
+    s_ps3_font_gpu_texture =
+        std::move(texture);
+
+    s_ps3_font_gpu_key =
+        key;
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3-font] GPU CFont bridge READY: "
+        "%s %ux%u\\n",
+        font_name.c_str(),
+        font->atlas_width,
+        font->atlas_height);
+  }
+
+  ImDrawList* draw =
+      ImGui::GetForegroundDrawList();
+
+  if (!draw)
+    return;
+
+  const ImVec2 display =
+      ImGui::GetIO()
+          .DisplaySize;
+
+  if (!(display.x > 0.0f) ||
+      !(display.y > 0.0f))
+  {
+    return;
+  }
+
+  const float game_x_scale =
+      display.x /
+      640.0f;
+
+  const float game_y_scale =
+      display.y /
+      480.0f;
+
+  const float requested_scale =
+      static_cast<float>(
+          std::clamp(
+              EnvDouble(
+                  "MOH_PS3_FONT_SCALE",
+                  1.0),
+              0.25,
+              4.0));
+
+  // Glyph aspect must remain normal in widescreen.
+  // Position X still follows the full 640->backbuffer mapping.
+  // v6.4:
+  // Keep positioning in the original 640x480 logical coordinate system,
+  // but normalize high-resolution PS3 glyph pixels to a logical HUD height.
+  const float base_output_scale =
+      game_y_scale *
+      requested_scale;
+
+  const auto line_height = [&]()
+  {
+    u32 value = 0;
+
+    for (const auto& glyph :
+         font->glyphs)
+    {
+      value =
+          std::max(
+              value,
+              glyph.height);
+    }
+
+    return
+        static_cast<float>(
+            std::max<u32>(
+                value,
+                1u));
+  }();
+
+  const float target_logical_height =
+      static_cast<float>(
+          std::clamp(
+              EnvDouble(
+                  "MOH_PS3_FONT_HEIGHT",
+                  24.0),
+              12.0,
+              48.0));
+
+  const float glyph_scale =
+      base_output_scale *
+      target_logical_height /
+      std::max(
+          line_height,
+          1.0f);
+
+  static bool s_hq_font_logged = false;
+
+  if (!s_hq_font_logged)
+  {
+    s_hq_font_logged = true;
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3-font] HQ PS3 HUD font ACTIVE: "
+        "%s native-height=%.1f logical-height=%.1f\n",
+        font_name.c_str(),
+        line_height,
+        target_logical_height);
+  }
+
+
+  auto text_width =
+      [&](std::string_view text)
+      {
+        float width = 0.0f;
+        float max_width = 0.0f;
+
+        for (unsigned char ch :
+             text)
+        {
+          if (ch == '\n')
+          {
+            max_width =
+                std::max(
+                    max_width,
+                    width);
+
+            width = 0.0f;
+            continue;
+          }
+
+          const u16 cp =
+              ch < 0x80u ?
+                  static_cast<u16>(ch) :
+                  static_cast<u16>('?');
+
+          const auto* glyph =
+              PS3FontParser::
+                  FindGlyph(
+                      *font,
+                      cp);
+
+          if (!glyph)
+          {
+            glyph =
+                PS3FontParser::
+                    FindGlyph(
+                        *font,
+                        '?');
+          }
+
+          if (glyph)
+          {
+            width +=
+                static_cast<float>(
+                    glyph->advance) *
+                glyph_scale;
+          }
+        }
+
+        return
+            std::max(
+                max_width,
+                width);
+      };
+
+  for (const auto& request :
+       requests)
+  {
+    float origin_x =
+        request.x *
+        game_x_scale;
+
+    float pen_y =
+        request.y *
+        game_y_scale;
+
+    if (request.centered)
+    {
+      origin_x -=
+          text_width(
+              request.text) *
+          0.5f;
+    }
+
+    float pen_x =
+        origin_x;
+
+    for (unsigned char ch :
+         request.text)
+    {
+      if (ch == '\n')
+      {
+        pen_x =
+            origin_x;
+
+        pen_y +=
+            line_height *
+            glyph_scale;
+
+        continue;
+      }
+
+      const u16 cp =
+          ch < 0x80u ?
+              static_cast<u16>(ch) :
+              static_cast<u16>('?');
+
+      const auto* glyph =
+          PS3FontParser::
+              FindGlyph(
+                  *font,
+                  cp);
+
+      if (!glyph)
+      {
+        glyph =
+            PS3FontParser::
+                FindGlyph(
+                    *font,
+                    '?');
+      }
+
+      if (!glyph)
+        continue;
+
+      if (ch != ' ' &&
+          glyph->width > 0 &&
+          glyph->height > 0)
+      {
+        const float x0 =
+            pen_x +
+            static_cast<float>(
+                glyph->bearing) *
+            glyph_scale;
+
+        const float y0 =
+            pen_y;
+
+        const float x1 =
+            x0 +
+            static_cast<float>(
+                glyph->width) *
+            glyph_scale;
+
+        const float y1 =
+            y0 +
+            static_cast<float>(
+                glyph->height) *
+            glyph_scale;
+
+      constexpr float ps3_font_uv_inset = 0.5f;
+
+      const float atlas_w =
+          static_cast<float>(
+              font->atlas_width);
+
+      const float atlas_h =
+          static_cast<float>(
+              font->atlas_height);
+
+      const float glyph_left =
+          static_cast<float>(
+              glyph->x);
+
+      const float glyph_top =
+          static_cast<float>(
+              glyph->y);
+
+      const float glyph_right =
+          static_cast<float>(
+              glyph->x +
+              glyph->width);
+
+      const float glyph_bottom =
+          static_cast<float>(
+              glyph->y +
+              glyph->height);
+
+      const ImVec2 uv0(
+          (glyph_left +
+           ps3_font_uv_inset) /
+              atlas_w,
+          (glyph_top +
+           ps3_font_uv_inset) /
+              atlas_h);
+
+      const ImVec2 uv1(
+          (glyph_right -
+           ps3_font_uv_inset) /
+              atlas_w,
+          (glyph_bottom -
+           ps3_font_uv_inset) /
+              atlas_h);
+
+        draw->AddImage(
+            *s_ps3_font_gpu_texture,
+            ImVec2(x0, y0),
+            ImVec2(x1, y1),
+            uv0,
+            uv1,
+            IM_COL32(
+                255,
+                255,
+                255,
+                255));
+
+      static bool s_ps3_font_actual_draw_logged = false;
+
+      if (!s_ps3_font_actual_draw_logged)
+      {
+        s_ps3_font_actual_draw_logged = true;
+
+        std::fprintf(
+            stderr,
+            "[moh-ps3-font] PS3 SFNH glyph rendering ACTIVE: "
+            "%s atlas=%ux%u\n",
+            font_name.c_str(),
+            font->atlas_width,
+            font->atlas_height);
+      }
+
+      }
+
+      pen_x +=
+          static_cast<float>(
+              glyph->advance) *
+          glyph_scale;
+    }
+  }
+}
 
 void DrawCrosshair(float backbuffer_scale)
 {

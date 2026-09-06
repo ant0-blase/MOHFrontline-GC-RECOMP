@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/PS3RemasterAssets.h"
+#include "VideoCommon/PS3FontParser.h"
 
 #include <algorithm>
 #include <cctype>
@@ -342,6 +343,10 @@ void Initialize()
 
   BuildIndex();
 
+  // Parse the actual PS3 SFNH fonts independently of the old experimental
+  // fuzzy texture bridge.
+  PS3FontParser::Initialize(s.root);
+
   const Stats& st = s.stats;
 
   std::fprintf(
@@ -379,6 +384,8 @@ void Initialize()
 
 void Shutdown()
 {
+  PS3FontParser::Shutdown();
+
   s.enabled = false;
   Reset();
   s.root.clear();

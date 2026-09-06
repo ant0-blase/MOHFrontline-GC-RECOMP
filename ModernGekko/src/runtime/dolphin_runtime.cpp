@@ -456,6 +456,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
 Runtime::~Runtime() {
   RequestStop();
   if (m_impl->booted) {
+    // Destroy MOH EFB/post-processing GPU resources before VideoCommon.
+    MohPcLayer::Shutdown();
     Core::Stop(Core::System::GetInstance());
     Core::Shutdown(Core::System::GetInstance());
   }
@@ -523,6 +525,8 @@ RuntimeRunResult Runtime::Run() {
   if (title_thread.joinable())
     title_thread.join();
   m_impl->platform->SaveWindowGeometry();
+  // Release scene-post GPU resources before Core destroys VideoCommon.
+  MohPcLayer::Shutdown();
   Core::Stop(Core::System::GetInstance());
   Core::Shutdown(Core::System::GetInstance());
   m_impl->booted = false;

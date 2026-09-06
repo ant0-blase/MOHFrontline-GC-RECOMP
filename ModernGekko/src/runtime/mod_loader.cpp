@@ -37,6 +37,11 @@ constexpr std::uint32_t MOH_HOSTCALL_FRAME_PRESENT = 0xFFFFF133u;
 constexpr std::uint32_t MOH_HOSTCALL_VP6_MOVIE_ON = 0xFFFFF140u;
 constexpr std::uint32_t MOH_HOSTCALL_VP6_MOVIE_OFF = 0xFFFFF141u;
 
+constexpr std::uint32_t MOH_HOSTCALL_SCENE_POSTPROCESS = 0xFFFFF150u;
+
+constexpr std::uint32_t MOH_HOSTCALL_PS3_FONT_DRAW = 0xFFFFF160u;
+constexpr std::uint32_t MOH_HOSTCALL_PS3_FONT_CENTERED = 0xFFFFF161u;
+
 std::uint32_t ReadGuestU32(CPUState* state, std::uint32_t address)
 {
   if (!state || !state->external_read)
@@ -75,6 +80,172 @@ std::uint32_t F32Bits(float value)
   return bits;
 }
 #endif
+
+bool ReadGuestCString(
+    CPUState* state,
+    std::uint32_t address,
+    std::string* out)
+{
+  if (!state ||
+      !state->external_read ||
+      !out ||
+      !(address >= 0x80000000u &&
+        address < 0x81800000u))
+  {
+    return false;
+  }
+
+  out->clear();
+
+  constexpr std::size_t MAX_TEXT =
+      160;
+
+  bool has_alnum = false;
+
+  for (std::size_t i = 0;
+       i < MAX_TEXT;
+       ++i)
+  {
+    const auto ch =
+        static_cast<unsigned char>(
+            state->external_read(
+                state,
+                address +
+                    static_cast<std::uint32_t>(i),
+                1));
+
+    if (ch == 0)
+    {
+      return
+          !out->empty() &&
+          has_alnum;
+    }
+
+    if (ch == '\n' ||
+        ch == '\r' ||
+        ch == '\t')
+    {
+      out->push_back(
+          static_cast<char>(ch));
+      continue;
+    }
+
+    if (ch < 0x20 ||
+        ch > 0x7e)
+    {
+      return false;
+    }
+
+    if (std::isalnum(ch))
+      has_alnum = true;
+
+    out->push_back(
+        static_cast<char>(ch));
+  }
+
+  return false;
+}
+
+bool FindGuestFontText(
+    CPUState* state,
+    std::string* out,
+    int* out_reg)
+{
+  if (!state ||
+      !out)
+  {
+    return false;
+  }
+
+  // PPC EABI C++ CFont calls normally keep "this" in r3 while text pointers
+  // land around r4-r8 depending on preceding float arguments. Also inspect
+  // nonvolatile registers because this hook sits inside CFont, not necessarily
+  // at function entry.
+  static constexpr int priority[] = {
+      6, 5, 4, 7, 8, 9, 10,
+      31, 30, 29, 28, 27, 26,
+      3, 11, 12, 13, 14, 15,
+      16, 17, 18, 19, 20, 21,
+      22, 23, 24, 25
+  };
+
+  int best_score =
+      std::numeric_limits<int>::min();
+
+  std::string best;
+  int best_reg = -1;
+
+  for (const int reg :
+       priority)
+  {
+    const std::uint32_t address =
+        state->gpr[reg];
+
+    std::string text;
+
+    if (!ReadGuestCString(
+            state,
+            address,
+            &text))
+    {
+      continue;
+    }
+
+    // Do not mistake asset/debug paths for CFont text.
+    if (text.find(".sfn") !=
+            std::string::npos ||
+        text.find(".ssh") !=
+            std::string::npos ||
+        text.find(".dol") !=
+            std::string::npos ||
+        text.find(".elf") !=
+            std::string::npos)
+    {
+      continue;
+    }
+
+    int score =
+        static_cast<int>(
+            std::min<std::size_t>(
+                text.size(),
+                80));
+
+    if (reg >= 4 &&
+        reg <= 10)
+    {
+      score += 100;
+    }
+
+    if (text.size() <= 48)
+      score += 20;
+
+    if (text.find('/') !=
+            std::string::npos ||
+        text.find('\\') !=
+            std::string::npos)
+    {
+      score -= 50;
+    }
+
+    if (score > best_score)
+    {
+      best_score = score;
+      best = std::move(text);
+      best_reg = reg;
+    }
+  }
+
+  if (best_reg < 0)
+    return false;
+
+  *out =
+      std::move(best);
+
+  if (out_reg)
+    *out_reg = best_reg;
+
+  return true;
+}
 
 struct Version {
   std::array<std::uint32_t, 3> parts{};
@@ -975,6 +1146,84 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     }
     return true;
   }
+  if (address == MOH_HOSTCALL_SCENE_POSTPROCESS) {
+    MohPcLayer::PreprocessSceneBefore2D();
+    return true;
+  }
+
+  if (address == MOH_HOSTCALL_PS3_FONT_DRAW ||
+      address == MOH_HOSTCALL_PS3_FONT_CENTERED)
+  {
+    // r0 is a private success return for the injected CFont hook.
+    state->gpr[0] = 0u;
+
+    if (!MohPcLayer::IsGameplayActive() ||
+        !MohPcLayer::IsPS3FontBridgeReady())
+    {
+      return true;
+    }
+
+    const double x =
+        state->fpr[1];
+
+    const double y =
+        state->fpr[2];
+
+    if (!std::isfinite(x) ||
+        !std::isfinite(y))
+    {
+      return true;
+    }
+
+    std::string text;
+    int source_reg = -1;
+
+    if (!FindGuestFontText(
+            state,
+            &text,
+            &source_reg))
+    {
+      return true;
+    }
+
+    static unsigned log_count = 0;
+
+    if (log_count < 16)
+    {
+      ++log_count;
+
+      std::fprintf(
+          stderr,
+          "[moh-ps3-font] CFont capture "
+          "r%d=%08X x=%.2f y=%.2f centered=%d text=\"%s\"\\n",
+          source_reg,
+          state->gpr[source_reg],
+          x,
+          y,
+          address ==
+              MOH_HOSTCALL_PS3_FONT_CENTERED ?
+              1 :
+              0,
+          text.c_str());
+    }
+
+    const bool ps3_font_accepted =
+      MohPcLayer::QueuePS3FontDraw(
+        text.c_str(),
+        static_cast<float>(x),
+        static_cast<float>(y),
+        address ==
+            MOH_HOSTCALL_PS3_FONT_CENTERED);
+
+    // Tell guest hook to suppress only the old GameCube CFont draw.
+    state->gpr[0] =
+      ps3_font_accepted ?
+          1u :
+          0u;
+
+    return true;
+  }
+
   if (address == MOH_HOSTCALL_VP6_MOVIE_ON || address == MOH_HOSTCALL_VP6_MOVIE_OFF) {
     MohPcLayer::SetMovieActive(address == MOH_HOSTCALL_VP6_MOVIE_ON);
     return true;
@@ -1052,6 +1301,13 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
   if (address == MOH_HOSTCALL_VI_GAMEPLAY_ON ||
       address == MOH_HOSTCALL_VI_GAMEPLAY_OFF) {
     const bool enable = address == MOH_HOSTCALL_VI_GAMEPLAY_ON;
+
+    // v6.6:
+    // Reuse the exact GameCube gameplay marker which already controls
+    // gameplay-only VI/FPS/widescreen behaviour.
+    MohPcLayer::SetGameplayDetected(
+        enable);
+
     Config::SetCurrent(Config::MAIN_VI_OVERCLOCK_ENABLE, enable);
     std::fprintf(stderr,
                  "[moh-enh] gameplay VI overclock %s (factor %.4f)\n",
@@ -1069,12 +1325,12 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
 bool ModManager::HostCall(CPUState *state, std::uint32_t address,
                           void *user_data) {
 #if defined(MODERNGEKKO_MOH_PC_LAYER)
-  // All native MOH PC-layer control tokens live in the compact F100..F141
+  // All native MOH PC-layer control tokens live in the compact F100..F161
   // window.  Ordinary guest PCs are nowhere near this range, so keep their
   // path leaf-like: one unsigned range check followed by a tail call into
   // Dispatch().  The expensive token implementation stays completely cold.
   constexpr std::uint32_t token_span =
-      MOH_HOSTCALL_VP6_MOVIE_OFF - MOH_HOSTCALL_VI_GAMEPLAY_ON;
+      MOH_HOSTCALL_PS3_FONT_CENTERED - MOH_HOSTCALL_VI_GAMEPLAY_ON;
   const std::uint32_t token_offset =
       address - MOH_HOSTCALL_VI_GAMEPLAY_ON;
 #if defined(__GNUC__) || defined(__clang__)

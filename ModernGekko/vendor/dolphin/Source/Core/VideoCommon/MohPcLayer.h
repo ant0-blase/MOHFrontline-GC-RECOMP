@@ -37,6 +37,19 @@ bool IsGameplayActive();
 void SetMovieActive(bool active);
 bool IsSettingsOpen();
 bool IsDebugOpen();
+
+// Enhanced scene compositor.
+// The user post-process is baked into gameplay 3D before the guest HUD.
+// Authoritative GameCube gameplay-state signal.
+void SetGameplayDetected(bool active);
+
+void PreprocessSceneBefore2D();
+
+// Final XFB policy.
+// true = use Dolphin's default final-copy pipeline.
+bool ShouldBypassFinalPostProcess();
+void NotifyFinalPostProcessComplete();
+
 bool WantsRelativeMouse();
 void ToggleSettings();
 void ToggleDebug();
@@ -68,6 +81,11 @@ bool ShouldHideAdsCrosshair();
 bool IsPcCrosshairEnabled();
 void SetCurrentWeaponType(int type);
 int GetCurrentWeaponType();
+
+// Native PS3 SFNH/CFont renderer.
+bool IsPS3FontBridgeReady();
+bool QueuePS3FontDraw(const char* text, float x, float y, bool centered);
+void DrawPS3FontUI(float backbuffer_scale);
 
 void DrawCrosshair(float backbuffer_scale);
 void DrawSettingsUI(float backbuffer_scale);

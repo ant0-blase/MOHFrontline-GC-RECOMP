@@ -108,10 +108,20 @@ public:
   bool Initialize(AbstractTextureFormat format);
 
   void RecompileShader();
+  // Compile the shader already loaded in m_config without replacing it
+  // with g_ActiveConfig.sPostProcessingShader.
+  void RecompileShaderFromCurrentConfig();
   void RecompilePipeline();
 
   void BlitFromTexture(const MathUtil::Rectangle<int>& dst, const MathUtil::Rectangle<int>& src,
                        const AbstractTexture* src_tex, int src_layer = -1);
+
+  // Fixed/default Dolphin output path without the selected user shader.
+  // Used after MOH's user shader has already been baked into gameplay 3D.
+  void BlitFromTextureDefault(const MathUtil::Rectangle<int>& dst,
+                              const MathUtil::Rectangle<int>& src,
+                              const AbstractTexture* src_tex,
+                              int src_layer = -1);
 
   bool IsColorCorrectionActive() const;
   bool NeedsIntermediaryBuffer() const;
@@ -122,7 +132,7 @@ protected:
   std::string GetFooter() const;
 
   bool CompileVertexShader();
-  bool CompilePixelShader();
+  bool CompilePixelShader(bool reload_from_active_config = true);
   bool CompilePipeline();
 
   size_t CalculateUniformsSize(bool user_post_process) const;
@@ -139,6 +149,9 @@ protected:
   std::unique_ptr<AbstractShader> m_default_vertex_shader;
   std::unique_ptr<AbstractShader> m_default_pixel_shader;
   std::unique_ptr<AbstractPipeline> m_default_pipeline;
+
+  // Default Dolphin shader compiled directly for the real destination format.
+  std::unique_ptr<AbstractPipeline> m_moh_passthrough_pipeline;
   std::unique_ptr<AbstractFramebuffer> m_intermediary_frame_buffer;
   std::unique_ptr<AbstractTexture> m_intermediary_color_texture;
   std::vector<u8> m_default_uniform_staging_buffer;

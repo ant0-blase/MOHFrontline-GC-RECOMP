@@ -422,6 +422,11 @@ void OnScreenUI::Finalize()
   perf_metrics.DrawImGuiStats(m_backbuffer_scale);
   DrawDebugText();
   MohPcLayer::UpdateFrame();
+
+  // PS3 SFNH replacement is queued by deterministic CFont guest hooks and
+  // rendered after the game/postprocess, so bloom can never touch the glyphs.
+  MohPcLayer::DrawPS3FontUI(m_backbuffer_scale);
+
   MohPcLayer::DrawCrosshair(m_backbuffer_scale);
   MohPcLayer::DrawSettingsUI(m_backbuffer_scale);
   MohPcLayer::DrawDebugUI(m_backbuffer_scale);

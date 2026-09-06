@@ -279,6 +279,14 @@ def apply_gmfe69_generated_enhancements(generated: Path):
     }
 """)
 
+    # Wide-FOV SKYBOX fix only. 0x800A8F6C is CSkyBox::Draw's
+    # per-face skip decision. Force the normal face draw path when the real
+    # post-aspect horizontal FOV is wide. Do not touch CFrustum/CCompartment.
+    _inject_after_label(generated, "800A8F6C", """    if (moh_wide_fov_force_skybox_faces()) {
+        goto label_800A8F70;
+    }
+""")
+
     # The player weapon/viewmodel builds its own Perspective matrix and never
     # goes through CCamera::SetPerspective.  Adjust its already-computed tangent
     # pair immediately before each Perspective call.
