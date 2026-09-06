@@ -42,8 +42,7 @@ MOH Frontline PC enhancements:
   --aspect <ratio|auto|default>
                               default/original, auto, 4:3, 16:10, 16:9,
                               21:9, 32:9, WIDTH:HEIGHT or WIDTHxHEIGHT
-  --fps <target|default>      default, 30, 60, 90, 120, 144, 165, 240,
-                              any 1-1000 value, or unlimited
+  --fps <0-120|default>      0 = lock off; 1..120 = FPS / VI Hz target
   --hud <safe|stretch>        Aspect-correct 4:3 HUD/menu safe area (default: safe)
   --mouse-sensitivity <value> Native mouse sensitivity, 0.05-10.0
   --mouse-x <value>           Horizontal sensitivity multiplier, 0.1-4.0
@@ -70,9 +69,9 @@ Ctrl+F10 or ` opens the in-game PC settings menu. Ctrl+F8 toggles diagnostics.
 Examples:
   ./run.sh
   ./run.sh --aspect 16:9
-  ./run.sh --aspect 21:9 --fov 100 --fps 144
-  ./run.sh --aspect 3440x1440 --fps unlimited
-  MOH_OUTPUT_SIZE=5120x1440 ./run.sh --aspect auto --fps 240
+  ./run.sh --aspect 21:9 --fov 100 --fps 90
+  ./run.sh --aspect 3440x1440 --fps 120
+  MOH_OUTPUT_SIZE=5120x1440 ./run.sh --aspect auto --fps 120
 
 With no MOH options, the original game FOV/aspect/FPS behavior is preserved.
 USAGE
@@ -380,19 +379,20 @@ esac
 
 case "${FPS,,}" in
   default|original)
-    ;;
-  unlimited)
-    export MOH_TIMING_PATCH=1
-    export MOH_FPS_TARGET=unlimited
+    # Do not export an FPS target: the saved in-game slider remains authoritative.
     ;;
   *)
-    if ! [[ "$FPS" =~ ^[0-9]+([.][0-9]+)?$ ]] || \
-       ! awk -v v="$FPS" 'BEGIN { exit !(v>=1 && v<=1000) }'; then
-      echo "error: --fps must be default, unlimited, or a value from 1 to 1000" >&2
+    if ! [[ "$FPS" =~ ^[0-9]+$ ]] || (( FPS < 0 || FPS > 120 )); then
+      echo "error: --fps must be default or an integer from 0 to 120" >&2
       exit 2
     fi
-    export MOH_TIMING_PATCH=1
-    export MOH_FPS_TARGET="$FPS"
+    if (( FPS == 0 )); then
+      # Explicit CLI 0 = lock off / original VI.
+      unset MOH_TIMING_PATCH MOH_FPS_TARGET 2>/dev/null || true
+    else
+      export MOH_TIMING_PATCH=1
+      export MOH_FPS_TARGET="$FPS"
+    fi
     ;;
 esac
 

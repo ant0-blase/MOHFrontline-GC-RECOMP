@@ -200,7 +200,9 @@ struct State
   std::atomic<int> audio_volume{100};
   std::atomic<bool> fill_audio_gaps{true};
   std::atomic<bool> preserve_audio_pitch{true};
-  std::atomic<int> requested_fps{60}; // 60/120 fixed modes only.
+  // 0 = lock OFF; 1..120 = exact gameplay FPS / VI Hz target.
+  std::atomic<int> requested_fps{60};
+  std::atomic<bool> vi_skip{true};
   std::atomic<bool> fov_override{false};
   std::atomic<float> fov{90.0f};
   std::atomic<bool> weapon_follow{true};
@@ -603,17 +605,35 @@ void ApplyFov()
 
 void ApplyFPS()
 {
-  const int fps = s.requested_fps.load(std::memory_order_relaxed) == 120 ? 120 : 60;
+  const int fps =
+      std::clamp(s.requested_fps.load(std::memory_order_relaxed), 0, 120);
+  const bool vi_skip = s.vi_skip.load(std::memory_order_relaxed);
+
   s.requested_fps.store(fps, std::memory_order_relaxed);
   s.adaptive_fps.store(false, std::memory_order_relaxed);
   s.adaptive_profile.store(0, std::memory_order_relaxed);
 
-  SetEnv("MOH_TIMING_PATCH", "1");
-  SetEnv("MOH_FPS_TARGET", std::to_string(fps));
+  // VBI Skip is an independent graphics hack and is ON by default.
+  Config::SetCurrent(Config::GFX_HACK_VI_SKIP, vi_skip);
   UnsetEnv("MOH_ADAPTIVE_PROFILE");
 
-  Config::SetCurrent(Config::MAIN_VI_OVERCLOCK,
-                     static_cast<float>(static_cast<double>(fps) / NATIVE_VPS));
+  if (fps == 0)
+  {
+    // Slider 0 = no custom FPS/VI lock; restore the game's native VI timing.
+    UnsetEnv("MOH_TIMING_PATCH");
+    UnsetEnv("MOH_FPS_TARGET");
+    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK_ENABLE, false);
+    Config::SetCurrent(Config::MAIN_VI_OVERCLOCK, 1.0f);
+    return;
+  }
+
+  // 1..120: the selected FPS target and gameplay VI frequency are identical.
+  SetEnv("MOH_TIMING_PATCH", "1");
+  SetEnv("MOH_FPS_TARGET", std::to_string(fps));
+
+  Config::SetCurrent(
+      Config::MAIN_VI_OVERCLOCK,
+      static_cast<float>(static_cast<double>(fps) / NATIVE_VPS));
   Config::SetCurrent(Config::MAIN_PRECISION_FRAME_TIMING, true);
   Config::SetCurrent(Config::GFX_VSYNC, false);
 }
@@ -703,6 +723,7 @@ void SaveSettings()
   f << "fill_audio_gaps=" << s.fill_audio_gaps.load() << '\n';
   f << "preserve_audio_pitch=" << s.preserve_audio_pitch.load() << '\n';
   f << "fps=" << s.requested_fps.load() << '\n';
+  f << "vi_skip=" << s.vi_skip.load() << '\n';
   f << "fov_enabled=" << s.fov_override.load() << '\n';
   f << "fov=" << s.fov.load() << '\n';
   f << "weapon_follow=" << s.weapon_follow.load() << '\n';
@@ -812,7 +833,8 @@ void LoadSettings()
     else if (key == "audio_volume") s.audio_volume = std::clamp(as_i(), 0, 100);
     else if (key == "fill_audio_gaps") s.fill_audio_gaps = as_i() != 0;
     else if (key == "preserve_audio_pitch") s.preserve_audio_pitch = as_i() != 0;
-    else if (key == "fps") s.requested_fps = as_i() == 120 ? 120 : 60;
+    else if (key == "fps") s.requested_fps = std::clamp(as_i(), 0, 120);
+    else if (key == "vi_skip") s.vi_skip = as_i() != 0;
     else if (key == "fov_enabled") s.fov_override = as_i() != 0;
     else if (key == "fov") s.fov = std::clamp(as_f(), 20.0f, 105.0f);
     else if (key == "weapon_follow") s.weapon_follow = as_i() != 0;
@@ -1059,8 +1081,10 @@ void SyncFromEnvironment()
 
   if (const char* fps = std::getenv("MOH_FPS_TARGET"))
   {
-    if (std::string_view(fps) == "unlimited") s.requested_fps = 0;
-    else s.requested_fps = std::clamp(std::atoi(fps), 1, 1000);
+    if (std::string_view(fps) == "unlimited")
+      s.requested_fps = 0;
+    else
+      s.requested_fps = std::clamp(std::atoi(fps), 0, 120);
   }
 
   if (const char* fov = std::getenv("MOH_FOV_DEGREES"))
@@ -1102,7 +1126,8 @@ void Initialize()
     SetEnv("MOH_PS3_AUTO_TEXTURES", "0");
 
   PS3RemasterAssets::Initialize();
-  s.requested_fps = -1;
+  s.requested_fps = 60;
+  s.vi_skip = true;
   s.original_post_shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
   s.applied_post_shader = s.original_post_shader;
   s.original_fast_texture_sampling = Config::Get(Config::GFX_HACK_FAST_TEXTURE_SAMPLING);
@@ -1174,6 +1199,7 @@ void ApplyDolphinSettings()
   Config::SetBase(Config::MAIN_AUDIO_FILL_GAPS, s.fill_audio_gaps.load());
   Config::SetBase(Config::MAIN_AUDIO_PRESERVE_PITCH, s.preserve_audio_pitch.load());
   Config::SetBase(Config::MAIN_AUDIO_VOLUME, s.audio_volume.load());
+  Config::SetBase(Config::GFX_HACK_VI_SKIP, s.vi_skip.load());
   ApplyFov();
   ApplyAdsEnvironment();
   if (s.aspect_mode.load() != 0)
@@ -1624,18 +1650,28 @@ void DrawSettingsUI(float backbuffer_scale)
     {
       if (ImGui::BeginTabItem("Graphics"))
       {
-        int fps = s.requested_fps.load(std::memory_order_relaxed) == 120 ? 120 : 60;
-        const char* fps_items[] = {"60 FPS", "120 FPS"};
-        const int fps_values[] = {60, 120};
-        int fps_idx = fps == 120 ? 1 : 0;
-        if (ImGui::Combo("Frame rate", &fps_idx, fps_items, 2))
+        int fps =
+            std::clamp(s.requested_fps.load(std::memory_order_relaxed), 0, 120);
+        if (ImGui::SliderInt("FPS / VI lock", &fps, 0, 120, "%d FPS / Hz"))
         {
-          s.requested_fps.store(fps_values[fps_idx], std::memory_order_relaxed);
+          s.requested_fps.store(fps, std::memory_order_relaxed);
           ApplyFPS();
         }
-        ImGui::TextDisabled("Fixed 60/120 FPS lock - adaptive/unlimited removed");
 
-bool fov_on = s.fov_override.load();
+        if (fps == 0)
+          ImGui::TextDisabled("0 = lock OFF / original game VI timing");
+        else
+          ImGui::TextDisabled("FPS target = VI frequency = %d Hz", fps);
+
+        bool vi_skip = s.vi_skip.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox("VBI Skip", &vi_skip))
+        {
+          s.vi_skip.store(vi_skip, std::memory_order_relaxed);
+          Config::SetCurrent(Config::GFX_HACK_VI_SKIP, vi_skip);
+        }
+        ImGui::TextDisabled("VBI Skip is enabled by default.");
+
+                bool fov_on = s.fov_override.load();
         if (ImGui::Checkbox("Custom world FOV", &fov_on))
         {
           s.fov_override = fov_on;
