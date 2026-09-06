@@ -282,6 +282,30 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
   // Run CPU and GPU emulation on separate host threads.
   Config::SetBase(Config::MAIN_CPU_THREAD, true);
 
+  // MOH host-side multithreading policy.
+  //
+  // The emulated Gekko/PPC CPUState is intentionally kept serial: executing
+  // guest basic blocks concurrently would race GPR/FPR/MMIO/interrupt state.
+  // Everything below is independent host work and can safely use the other
+  // cores while the static-recompiled CPU runs on its own thread.
+  const unsigned host_threads = std::max(1u, std::thread::hardware_concurrency());
+  const int shader_workers =
+      std::clamp(static_cast<int>(host_threads) - 4, 2, 6);
+
+  Config::SetBase(Config::GFX_BACKEND_MULTITHREADING, true);
+  Config::SetBase(Config::GFX_SHADER_COMPILER_THREADS, shader_workers);
+  Config::SetBase(Config::GFX_SHADER_PRECOMPILER_THREADS, shader_workers);
+  Config::SetBase(Config::GFX_ENABLE_GPU_TEXTURE_DECODING, true);
+
+  // Never serialize the CPU against the GPU merely to keep both timelines
+  // close. FIFO synchronization still happens at the hardware-visible points.
+  Config::SetBase(Config::MAIN_SYNC_GPU, false);
+
+  std::fprintf(stderr,
+               "[moh-mt] host MT enabled: CPU/GPU split, backend MT, "
+               "%d shader workers, GPU texture decode (host threads=%u)\n",
+               shader_workers, host_threads);
+
   // HPCOS native-port policy:
   // Don't emulate the original GameCube optical-drive transfer speed.
   // Virtual-disc reads may complete at host-storage speed.

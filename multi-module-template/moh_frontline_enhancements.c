@@ -239,6 +239,19 @@ static double smooth_ads(double x)
     return x * x * (3.0 - 2.0 * x);
 }
 
+static void moh_reference_fov_tangents(double fov_degrees,
+                                       double aspect,
+                                       double* out_x,
+                                       double* out_y)
+{
+    /* Keep custom/ADS FOV in the game's native 4:3 reference space, then
+     * apply the same Hor+ widening as the normal widescreen path. */
+    const double native_tan_x = tan(fov_degrees * (MOH_PI / 360.0));
+    const double aspect_scale = aspect / MOH_NATIVE_ASPECT;
+    *out_x = native_tan_x * aspect_scale;
+    *out_y = native_tan_x / MOH_NATIVE_ASPECT;
+}
+
 int moh_camera_override(CPUState* ctx)
 {
     const u32 camera = ctx->gpr[3];
@@ -253,29 +266,23 @@ int moh_camera_override(CPUState* ctx)
 
     {
         const double ads = smooth_ads(moh_ads_blend(ctx));
-        double base_fov;
-        if (s_fov_degrees > 0.0)
-        {
-            base_fov = s_fov_degrees;
-        }
-        else
-        {
-            double base_tan = tan(original_half_x);
-            if (fabs(s_aspect - MOH_NATIVE_ASPECT) >= 0.000001)
-                base_tan *= s_aspect / MOH_NATIVE_ASPECT;
-            base_fov = atan(base_tan) * (360.0 / MOH_PI);
-        }
 
         if (ads > 0.000001)
         {
-            const double effective_fov = base_fov + (s_ads_world_fov - base_fov) * ads;
-            tan_half_x = tan(effective_fov * (MOH_PI / 360.0));
-            tan_half_y = tan_half_x / s_aspect;
+            /* Interpolate in 4:3 reference-FOV space. Aspect correction is
+             * applied afterwards, so ADS never squeezes back toward 4:3. */
+            const double base_fov =
+                s_fov_degrees > 0.0 ? s_fov_degrees :
+                atan(tan(original_half_x)) * (360.0 / MOH_PI);
+            const double effective_fov =
+                base_fov + (s_ads_world_fov - base_fov) * ads;
+            moh_reference_fov_tangents(effective_fov, s_aspect,
+                                       &tan_half_x, &tan_half_y);
         }
         else if (s_fov_degrees > 0.0)
         {
-            tan_half_x = tan(s_fov_degrees * (MOH_PI / 360.0));
-            tan_half_y = tan_half_x / s_aspect;
+            moh_reference_fov_tangents(s_fov_degrees, s_aspect,
+                                       &tan_half_x, &tan_half_y);
         }
         else if (fabs(s_aspect - MOH_NATIVE_ASPECT) < 0.000001)
         {
@@ -299,7 +306,7 @@ int moh_camera_override(CPUState* ctx)
     {
         s_camera_logged = 1;
         fprintf(stderr,
-                "[moh-enh] native camera override active: aspect=%.6f fov=%s%.2f\n",
+                "[moh-enh] aspect-stable camera override: aspect=%.6f fov=%s%.2f\n",
                 s_aspect, s_fov_degrees > 0.0 ? "" : "Hor+ ",
                 s_fov_degrees > 0.0 ? s_fov_degrees : 0.0);
     }
@@ -308,7 +315,8 @@ int moh_camera_override(CPUState* ctx)
 
 int moh_weapon_projection_override(CPUState* ctx)
 {
-    double horizontal_scale = 1.0;
+    double aspect_scale;
+    double horizontal_scale;
     double vertical_scale = 1.0;
     double requested_fov;
 
@@ -316,24 +324,20 @@ int moh_weapon_projection_override(CPUState* ctx)
     if (!s_camera_enabled)
         return 0;
 
-    /* By default the weapon follows --fov.  --weapon-fov can override it.
-     * An explicit FOV is interpreted as the final horizontal viewmodel FOV,
-     * just like --fov is for the world camera.  Scale both weapon tangents by
-     * the same amount so the gun itself keeps its proportions. */
+    aspect_scale = fabs(s_aspect - MOH_NATIVE_ASPECT) >= 0.000001 ?
+        s_aspect / MOH_NATIVE_ASPECT : 1.0;
+    horizontal_scale = aspect_scale;
+
+    /* FOV scale and widescreen scale are independent. The previous path
+     * replaced Hor+ with the FOV scale, making the weapon look squashed. */
     requested_fov = s_weapon_fov_degrees > 0.0 ? s_weapon_fov_degrees : s_fov_degrees;
     if (requested_fov > 0.0)
     {
         const double original_half = 35.0 * (MOH_PI / 180.0);
         const double requested_half = requested_fov * (MOH_PI / 360.0);
         const double fov_scale = tan(requested_half) / tan(original_half);
-        horizontal_scale = fov_scale;
+        horizontal_scale = fov_scale * aspect_scale;
         vertical_scale = fov_scale;
-    }
-    else if (fabs(s_aspect - MOH_NATIVE_ASPECT) >= 0.000001)
-    {
-        /* Aspect-only mode is Hor+: widen only the horizontal tangent so the
-         * viewmodel follows the world camera without becoming taller/shorter. */
-        horizontal_scale = s_aspect / MOH_NATIVE_ASPECT;
     }
 
     {
@@ -343,7 +347,8 @@ int moh_weapon_projection_override(CPUState* ctx)
             const double original_half = 35.0 * (MOH_PI / 180.0);
             const double ads_half = s_ads_weapon_fov * (MOH_PI / 360.0);
             const double ads_scale = tan(ads_half) / tan(original_half);
-            horizontal_scale += (ads_scale - horizontal_scale) * ads;
+            const double ads_horizontal_scale = ads_scale * aspect_scale;
+            horizontal_scale += (ads_horizontal_scale - horizontal_scale) * ads;
             vertical_scale += (ads_scale - vertical_scale) * ads;
         }
     }
@@ -356,14 +361,13 @@ int moh_weapon_projection_override(CPUState* ctx)
         s_weapon_logged = 1;
         if (requested_fov > 0.0)
             fprintf(stderr,
-                    "[moh-enh] weapon FOV override active: %.2f deg (scale %.6f)\n",
-                    requested_fov, horizontal_scale);
+                    "[moh-enh] aspect-stable weapon FOV: %.2f deg (x=%.6f y=%.6f aspect=%.6f)\n",
+                    requested_fov, horizontal_scale, vertical_scale, s_aspect);
         else
             fprintf(stderr,
                     "[moh-enh] weapon Hor+ override active: aspect=%.6f (x scale %.6f)\n",
                     s_aspect, horizontal_scale);
     }
-
     return 1;
 }
 
@@ -853,6 +857,7 @@ static int s_m1_manual_reload_pending;
 static u32 s_m1_manual_reload_weapon;
 static u16 s_m1_manual_reload_clip;
 static u32 s_m1_manual_reload_wait_frames;
+static int s_m1_reload_input_latched;
 static int s_m1_manual_reload_logged;
 static int s_m1_manual_reload_started_logged;
 
@@ -982,31 +987,16 @@ void moh_m1_manual_reload_prepare(CPUState* ctx)
     if (!ctx)
         return;
 
-    /* r3 is GetValue(action 15): zero means the reload button was not pressed.
-     * r31 remains the live CPlayerObject* throughout this BeginUpdate block. */
+    /* Garand tactical reload is edge-triggered. Holding/spamming R previously
+     * re-armed event 17 immediately after StartReloading and could wedge fire. */
     if (ctx->gpr[3] == 0u)
+    {
+        s_m1_reload_input_latched = 0;
         return;
+    }
 
     player = ctx->gpr[31];
     weapon = moh_player_current_weapon(ctx, player);
-
-    /*
-     * Never dispatch reload event 17 repeatedly while our previous tactical
-     * reload is waiting for the stock script. Re-triggering the event can
-     * wedge the weapon's reload/fire state when R is spammed.
-     *
-     * If the player switched weapons between presses, restore the old M1 first
-     * and then evaluate the new current weapon normally.
-     */
-    if (s_m1_manual_reload_pending)
-    {
-        if (weapon == s_m1_manual_reload_weapon)
-        {
-            ctx->gpr[3] = 0u;
-            return;
-        }
-        moh_m1_manual_reload_restore(ctx);
-    }
     if (!moh_is_cached_mem1(weapon))
         return;
 
@@ -1014,31 +1004,34 @@ void moh_m1_manual_reload_prepare(CPUState* ctx)
     properties = mem_read32(ctx, weapon + 0x280u);
     if (!moh_is_cached_mem1(properties))
         return;
-
-    reserve = (s16)mem_read16(ctx, weapon + 0x284u);
-    clip = (s16)mem_read16(ctx, weapon + 0x286u);
     max_clip = (s16)mem_read16(ctx, properties + 0x04u);
 
-    /* Runtime diagnostics identify the actual player M1 Garand as weapon type
-     * 14 in GMFE69 (some earlier experiments observed 20 in another weapon
-     * path).  Accept both internal aliases, but still require the Garand's
-     * characteristic 8-round en-bloc capacity so no other weapon is touched. */
     if ((weapon_type != 14u && weapon_type != 20u) || max_clip != 8)
         return;
 
-    /*
-     * Full M1 / no reserve: consume R completely. Sending stock reload event
-     * 17 for a reload that cannot happen can leave the scripted weapon state
-     * unable to fire. Setting r3=0 here makes the original cmpwi @ 0x800A4A68
-     * take its normal "no reload input" branch.
-     */
-    if (clip >= max_clip || reserve <= 0)
+    if (s_m1_reload_input_latched)
+    {
+        ctx->gpr[3] = 0u;
+        return;
+    }
+    s_m1_reload_input_latched = 1;
+
+    if (s_m1_manual_reload_pending)
     {
         ctx->gpr[3] = 0u;
         return;
     }
 
-    /* Empty clip uses Frontline's normal empty/reload flow. */
+    reserve = (s16)mem_read16(ctx, weapon + 0x284u);
+    clip = (s16)mem_read16(ctx, weapon + 0x286u);
+
+    /* Full/no-reserve reload is ignored completely. Empty clip keeps stock
+     * behavior. Only a genuine partial Garand clip enters the compatibility path. */
+    if (clip >= max_clip || reserve <= 0)
+    {
+        ctx->gpr[3] = 0u;
+        return;
+    }
     if (clip <= 0)
         return;
 
@@ -1046,8 +1039,6 @@ void moh_m1_manual_reload_prepare(CPUState* ctx)
     s_m1_manual_reload_weapon = weapon;
     s_m1_manual_reload_clip = (u16)clip;
     s_m1_manual_reload_wait_frames = 0u;
-
-    /* Keep this value at zero until StartReloading has actually committed. */
     mem_write16(ctx, weapon + 0x286u, 0u);
 
     if (!s_m1_manual_reload_logged)
@@ -1055,7 +1046,7 @@ void moh_m1_manual_reload_prepare(CPUState* ctx)
         s_m1_manual_reload_logged = 1;
         fprintf(stderr,
                 "[moh-enh] M1 Garand partial-clip tactical reload armed "
-                "(type=%u clip=%d/%d reserve=%d)\\n",
+                "(type=%u clip=%d/%d reserve=%d)\n",
                 weapon_type, (int)clip, (int)max_clip, (int)reserve);
     }
 }
@@ -1072,6 +1063,11 @@ void moh_player_vertical_delta_fix(CPUState* ctx)
 
     if (!ctx)
         return;
+
+    /* This existing per-frame player hook also polls the M1 pending state,
+     * so weapon switches/cancels restore the temporary clip even without R. */
+    moh_m1_manual_reload_restore(ctx);
+
     refresh_config();
     if (!s_timing_enabled || !s_gameplay_active)
         return;

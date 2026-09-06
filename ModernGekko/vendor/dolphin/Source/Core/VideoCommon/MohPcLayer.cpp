@@ -1433,11 +1433,17 @@ bool ConsumeVBlankPresentSuppression(u32 xfb_addr)
 
 void AdaptivePerformanceUpdate()
 {
-  // Very small capacity follower, not the old audio-conservative controller.
-  // The requested FPS is a ceiling.  If the host only sustains e.g. 110/120,
-  // lower the gameplay VI to ~110 so CoreTiming/DSP remain at 100% real time.
-  // When headroom returns, gently climb back to the user's requested ceiling.
+  // Fixed VI is the default for the FPS unlock.
+  //
+  // Do NOT continuously retune VI from measured emulation speed unless the
+  // user explicitly enabled an adaptive profile. The previous unconditional
+  // follower changed MAIN_VI_OVERCLOCK every 250 ms and could create a
+  // feedback loop (for example 120 -> 80 -> 50 -> 100 Hz) while audio/CoreTiming
+  // tried to remain at real-time speed.
   if (!s.initialized.load() || !s.gameplay.load())
+    return;
+
+  if (!s.adaptive_fps.load(std::memory_order_relaxed))
     return;
 
   const int requested_fps = s.requested_fps.load();
