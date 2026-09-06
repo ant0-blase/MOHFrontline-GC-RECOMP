@@ -305,6 +305,47 @@ def apply_gmfe69_generated_enhancements(generated: Path):
     }
 ''')
 
+
+    # MOH Frontline SND gettag loop safety V3.
+    # The final parser-loop gettag call feeds cmpwi r3,0 at 0x8015E798.
+    # Validate the stream slot before entering gettag; an invalid stream
+    # is converted to the game's normal zero-return loop termination.
+    _inject_after_label(generated, "8015E794", """    {
+        /*
+         * MOH Frontline SND gettag loop safety V3.
+         *
+         * SNDI_parsetimbre repeatedly calls SNDI_gettag with r3 pointing to
+         * the parser's current stream slot.  A corrupted stream can survive
+         * the entry-only guard and then gettag scans byte-by-byte forever.
+         *
+         * Validate both the pointer-to-pointer and *r3 immediately before the
+         * call.  On failure, emulate a zero return and continue at the game's
+         * own post-call cmpwi (0x8015E798), which naturally leaves the loop.
+         * No PPC stack frame or callee-saved state is skipped.
+         */
+        const u32 snd_v3_pp = ctx->gpr[3];
+        const u32 snd_v3_pp_phys = snd_v3_pp & 0x3FFFFFFFu;
+        u32 snd_v3_stream = 0u;
+        u32 snd_v3_stream_phys = 0u;
+        int snd_v3_bad = 0;
+
+        if (snd_v3_pp == 0u || snd_v3_pp_phys > 0x017FFFFCu) {
+            snd_v3_bad = 1;
+        } else {
+            snd_v3_stream = mem_read32(ctx, snd_v3_pp);
+            snd_v3_stream_phys = snd_v3_stream & 0x3FFFFFFFu;
+
+            if (snd_v3_stream == 0u || snd_v3_stream_phys >= 0x01800000u)
+                snd_v3_bad = 1;
+        }
+
+        if (snd_v3_bad) {
+            ctx->gpr[3] = 0u;
+            goto label_8015E798;
+        }
+    }
+""")
+
     _inject_after_label(generated, "80079E7C", """    if (moh_camera_override(ctx)) {
         ctx->pc = ctx->lr & ~3u;
         goto return_dispatch_80076E80;
