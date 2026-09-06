@@ -240,7 +240,62 @@ def _inject_after_label(generated: Path, label: str, body: str, occurrence: str 
     path.write_text(text)
 
 
+
+def _sanitize_snd_gettag_read8_range(generated: Path, start_label: str, end_addr: int):
+    # Protect only the known SNDI_gettag STT_FUNC guest-address range.
+    path = _find_chunk_with_label(generated, start_label)
+    text = path.read_text()
+
+    marker = "MOH Frontline SND gettag safe-read V5"
+    start_anchor = f"label_{start_label}:"
+    a = text.find(start_anchor)
+    if a < 0:
+        raise ValueError(f"missing {start_anchor}")
+
+    b = -1
+    tail = text[a + len(start_anchor):]
+    for m in re.finditer(r"(?m)^label_([0-9A-Fa-f]{8}):", tail):
+        addr = int(m.group(1), 16)
+        if addr >= end_addr:
+            b = a + len(start_anchor) + m.start()
+            break
+
+    if b < 0:
+        raise ValueError(
+            f"no generated label at/after SNDI_gettag end 0x{end_addr:08X}"
+        )
+
+    section = text[a:b]
+    raw = "mem_read8(ctx, ea)"
+    safe = (
+        "(((ea) != 0u && (((ea) & 0x3FFFFFFFu) < 0x01800000u)) "
+        "? mem_read8(ctx, ea) : (u8)0xFFu)"
+    )
+
+    if safe in section and raw not in section:
+        return
+
+    count = section.count(raw)
+    if count < 1:
+        raise ValueError(
+            "SNDI_gettag V5 expected at least one raw mem_read8 site"
+        )
+
+    section = section.replace(raw, safe)
+    if marker not in section:
+        section = (
+            f"/* {marker}: invalid SND byte addresses become 0xFF EOF. */\n"
+            + section
+        )
+
+    path.write_text(text[:a] + section + text[b:])
+
+
 def apply_gmfe69_generated_enhancements(generated: Path):
+
+    # MOH Frontline SND gettag safe-read V5
+    # Treat invalid/out-of-MEM1 SND bytes as the parser's 0xFF EOF.
+    _sanitize_snd_gettag_read8_range(generated, "8015E29C", 0x8015E3A4)
     """Inject GMFE69 overrides into the actual generated C fast paths."""
 
     # SND bank parser safety. SNDI_parsetimbre receives a pointer-to-pointer in
@@ -274,7 +329,6 @@ def apply_gmfe69_generated_enhancements(generated: Path):
 """)
 
 
-<<<<<<< HEAD
     # SND stream-reader safety V2.
     #
     # 0x8015E1A4 is a direct byte reader entered with:
@@ -298,53 +352,12 @@ def apply_gmfe69_generated_enhancements(generated: Path):
                 (snd_phys > (0x01800000u - snd_count));
 
             if (snd_bad) {
-=======
-    # MOH Frontline SND getb negative-count safety V4.
-    # A negative byte count makes the original decrement-to--1 loop
-    # effectively unbounded.  Bail before the function executes.
-    _inject_after_label(generated, "8015E1A4", """    {
-        /*
-         * MOH Frontline SND getb negative-count safety V4.
-         *
-         * 0x8015E1A4 is SNDI_getb's entry.  r3 is the byte-stream pointer and
-         * r4 is the signed byte count.  The original routine only treats zero
-         * as empty; a negative/corrupted count underflows its decrement loop
-         * and can walk sequentially through unmapped memory for billions of
-         * iterations.
-         *
-         * This guard executes before the first PPC instruction/prologue.
-         * Negative counts are invalid for a big-endian integer byte reader:
-         * return zero immediately.  Positive counts also get the complete MEM1
-         * span validation from V2.  Count == 0 is left to the original routine.
-         */
-        const s32 snd_v4_count_s = (s32)ctx->gpr[4];
-
-        if (snd_v4_count_s < 0) {
-            ctx->gpr[3] = 0u;
-            ctx->pc = ctx->lr & ~3u;
-            goto return_dispatch_8015AE80;
-        }
-
-        if (snd_v4_count_s > 0) {
-            const u32 snd_v4_stream = ctx->gpr[3];
-            const u32 snd_v4_count = (u32)snd_v4_count_s;
-            const u32 snd_v4_phys = snd_v4_stream & 0x3FFFFFFFu;
-
-            const int snd_v4_bad =
-                (snd_v4_stream == 0u) ||
-                (snd_v4_phys >= 0x01800000u) ||
-                (snd_v4_count > 0x01800000u) ||
-                (snd_v4_phys > (0x01800000u - snd_v4_count));
-
-            if (snd_v4_bad) {
->>>>>>> a1c6a5a1 (feat: improve PS3 fonts compass and rendering)
                 ctx->gpr[3] = 0u;
                 ctx->pc = ctx->lr & ~3u;
                 goto return_dispatch_8015AE80;
             }
         }
     }
-<<<<<<< HEAD
 ''')
 
 
@@ -386,8 +399,6 @@ def apply_gmfe69_generated_enhancements(generated: Path):
             goto label_8015E798;
         }
     }
-=======
->>>>>>> a1c6a5a1 (feat: improve PS3 fonts compass and rendering)
 """)
 
     _inject_after_label(generated, "80079E7C", """    if (moh_camera_override(ctx)) {
