@@ -273,6 +273,38 @@ def apply_gmfe69_generated_enhancements(generated: Path):
     }
 """)
 
+
+    # SND stream-reader safety V2.
+    #
+    # 0x8015E1A4 is a direct byte reader entered with:
+    #   r3 = stream pointer
+    #   r4 = signed byte count
+    #
+    # Guard the complete MEM1 span before any lbz. This catches streams which
+    # were valid when SNDI_parsetimbre started but later walked/corrupted past
+    # MEM1. Bail at the reader entry, not from the middle of parsetimbre.
+    _inject_after_label(generated, "8015E1A4", '''    {
+        const u32 snd_stream = ctx->gpr[3];
+        const s32 snd_count_s = (s32)ctx->gpr[4];
+
+        if (snd_count_s > 0) {
+            const u32 snd_count = (u32)snd_count_s;
+            const u32 snd_phys = snd_stream & 0x3FFFFFFFu;
+            const int snd_bad =
+                (snd_stream == 0u) ||
+                (snd_phys >= 0x01800000u) ||
+                (snd_count > 0x01800000u) ||
+                (snd_phys > (0x01800000u - snd_count));
+
+            if (snd_bad) {
+                ctx->gpr[3] = 0u;
+                ctx->pc = ctx->lr & ~3u;
+                goto return_dispatch_8015AE80;
+            }
+        }
+    }
+''')
+
     _inject_after_label(generated, "80079E7C", """    if (moh_camera_override(ctx)) {
         ctx->pc = ctx->lr & ~3u;
         goto return_dispatch_80076E80;
