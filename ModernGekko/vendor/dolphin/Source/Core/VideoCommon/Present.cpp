@@ -874,58 +874,17 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
                                   const AbstractTexture* source_texture,
                                   const MathUtil::Rectangle<int>& source_rc)
 {
-#if defined(MODERNGEKKO_MOH_PC_LAYER)
-  const bool moh_final_bypass =
-      MohPcLayer::
-          ShouldBypassFinalPostProcess();
-
-  struct MohFinalPostNotify
-  {
-    ~MohFinalPostNotify()
-    {
-      MohPcLayer::
-          NotifyFinalPostProcessComplete();
-    }
-  } moh_final_post_notify;
-
-  auto moh_blit =
-      [this, moh_final_bypass](
-          const auto&... args)
-      {
-        if (moh_final_bypass)
-        {
-          m_post_processor
-              ->BlitFromTextureDefault(
-                  args...);
-        }
-        else
-        {
-          m_post_processor
-              ->BlitFromTexture(
-                  args...);
-        }
-      };
-#else
-  auto moh_blit =
-      [this](
-          const auto&... args)
-      {
-        m_post_processor
-            ->BlitFromTexture(
-                args...);
-      };
-#endif
-
-
+  // MOHF clean path: always use Dolphin's normal post-processing blit.
+  // Gameplay/menu/movie selection is done by the selected shader in MohPcLayer,
+  // not by replacing Presenter's framebuffer path.
   if (g_ActiveConfig.stereo_mode == StereoMode::QuadBuffer &&
       g_backend_info.bUsesExplictQuadBuffering)
   {
-    // Quad-buffered stereo is annoying on GL.
     g_gfx->SelectLeftBuffer();
-    moh_blit(target_rc, source_rc, source_texture, 0);
+    m_post_processor->BlitFromTexture(target_rc, source_rc, source_texture, 0);
 
     g_gfx->SelectRightBuffer();
-    moh_blit(target_rc, source_rc, source_texture, 1);
+    m_post_processor->BlitFromTexture(target_rc, source_rc, source_texture, 1);
 
     g_gfx->SelectMainBuffer();
   }
@@ -934,14 +893,12 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
   {
     const auto [left_rc, right_rc] = ConvertStereoRectangle(target_rc);
 
-    moh_blit(left_rc, source_rc, source_texture, 0);
-    moh_blit(right_rc, source_rc, source_texture, 1);
+    m_post_processor->BlitFromTexture(left_rc, source_rc, source_texture, 0);
+    m_post_processor->BlitFromTexture(right_rc, source_rc, source_texture, 1);
   }
-  // Every other case will be treated the same (stereo or not).
-  // If there's multiple source layers, they should all be copied.
   else
   {
-    moh_blit(target_rc, source_rc, source_texture);
+    m_post_processor->BlitFromTexture(target_rc, source_rc, source_texture);
   }
 }
 
@@ -954,15 +911,11 @@ void Presenter::Present(PresentInfo* present_info)
 
   if (!g_gfx->SupportsUtilityDrawing())
   {
-    // Video Software doesn't support drawing a UI or doing post-processing
-    // So just show the XFB
+    // Video Software doesn't support drawing a UI or doing post-processing.
     if (m_xfb_entry)
     {
       const MathUtil::Rectangle<int> rect = AdjustForCustomCrop(m_xfb_rect);
       g_gfx->ShowImage(m_xfb_entry->texture.get(), rect);
-
-      // Update the window size based on the frame that was just rendered.
-      // Due to depending on guest state, we need to call this every frame.
       SetSuggestedWindowSize(rect.GetWidth(), rect.GetHeight());
     }
     return;

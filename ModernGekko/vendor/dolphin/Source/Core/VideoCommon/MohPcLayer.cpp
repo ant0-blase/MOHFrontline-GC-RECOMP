@@ -486,65 +486,94 @@ void UpdateAdsAnimation()
 void UpdateEnhancedPostProcess()
 {
   const bool enabled =
-      s.enhanced_graphics.load(
-          std::memory_order_relaxed);
+      s.enhanced_graphics.load(std::memory_order_relaxed);
+  const bool gameplay =
+      s.gameplay.load(std::memory_order_acquire);
+  const bool movie =
+      s.movie_active.load(std::memory_order_acquire);
 
-  // v6.5:
-  //
-  // MOHFrontlineEnhanced must never live in Presenter's final-XFB
-  // PostProcessing instance. Otherwise a menu, loading frame or VP6 path
-  // which misses one of our bypass branches can still receive bloom /
-  // tonemap / sharpening.
-  //
-  // Enhanced mode therefore means:
-  //
-  //   Presenter final shader = NONE
-  //   F150 scene processor    = MOHFrontlineEnhanced
-  //
-  // Turning Enhanced mode off restores the user's original Dolphin shader.
+  const bool moh_active =
+      enabled && gameplay && !movie;
+
   std::string desired;
 
-  if (!enabled)
+  if (moh_active)
   {
-    desired =
-        s.original_post_shader;
+    desired = "MOHFrontlineEnhanced";
+  }
+  else
+  {
+    desired = s.original_post_shader;
 
-    // Never restore a stale MOH shader from a previous experimental build.
-    if (desired ==
-        "MOHFrontlineEnhanced")
-    {
+    // Do not restore our own shader as an "original" shader after older
+    // experimental builds have written it into the config.
+    if (desired == "MOHFrontlineEnhanced")
       desired.clear();
-    }
   }
 
-  if (s.applied_post_shader !=
-      desired)
+  if (s.applied_post_shader != desired)
   {
     Config::SetCurrent(
         Config::GFX_ENHANCE_POST_SHADER,
         desired);
 
-    s.applied_post_shader =
-        desired;
-  }
-
-  static int s_logged_state = -1;
-
-  const int state =
-      enabled ? 1 : 0;
-
-  if (s_logged_state != state)
-  {
-    s_logged_state =
-        state;
+    s.applied_post_shader = desired;
 
     std::fprintf(
         stderr,
-        "[moh-gfx] enhanced graphics %s: "
-        "GLOBAL final post shader DISABLED; "
-        "MOH shader reserved for gameplay 3D F150 only\n",
-        enabled ? "ON" : "OFF");
+        "[moh-gfx] FINAL-XFB postprocess %s: shader=%s gameplay=%d movie=%d\n",
+        moh_active ? "ON" : "OFF",
+        desired.empty() ? "<default>" : desired.c_str(),
+        gameplay ? 1 : 0,
+        movie ? 1 : 0);
   }
+
+  if (!moh_active ||
+      !g_presenter ||
+      !g_presenter->GetPostProcessor())
+  {
+    return;
+  }
+
+  auto* config =
+      g_presenter->GetPostProcessor()->GetConfig();
+
+  if (!config ||
+      config->GetShader() != "MOHFrontlineEnhanced")
+  {
+    return;
+  }
+
+  // Keep the existing selected values. Bloom strength is intentionally
+  // untouched; this only fixes where/when the shader is used.
+  SetPostOptionBool(config, "MASTER_ENABLE", true);
+  SetPostOptionBool(config, "BLOOM_ENABLE", s.gfx_bloom.load());
+  SetPostOptionFloat(config, "BLOOM_INTENSITY", s.gfx_bloom_intensity.load());
+  SetPostOptionFloat(config, "BLOOM_THRESHOLD", s.gfx_bloom_threshold.load());
+  SetPostOptionBool(config, "TONEMAP_ENABLE", s.gfx_tonemap.load());
+  SetPostOptionFloat(config, "EXPOSURE", s.gfx_exposure.load());
+  SetPostOptionFloat(config, "CONTRAST", s.gfx_contrast.load());
+  SetPostOptionFloat(config, "SATURATION", s.gfx_saturation.load());
+  SetPostOptionBool(config, "SHARPEN_ENABLE", s.gfx_sharpen.load());
+  SetPostOptionFloat(config, "SHARPEN_STRENGTH", s.gfx_sharpen_strength.load());
+  SetPostOptionBool(config, "DOF_ENABLE", s.gfx_dof.load());
+
+  const float dof =
+      s.gfx_dof_ads_only.load() ?
+          s.gfx_dof_strength.load() * s.ads_blend.load() :
+          s.gfx_dof_strength.load();
+
+  SetPostOptionFloat(config, "DOF_STRENGTH", dof);
+  SetPostOptionBool(config, "LIGHTING_ENABLE", s.gfx_enhanced_lighting.load());
+  SetPostOptionFloat(config, "LIGHTING_STRENGTH", s.gfx_lighting_strength.load());
+  SetPostOptionBool(config, "SSAO_ENABLE", s.gfx_ssao.load());
+  SetPostOptionFloat(config, "SSAO_STRENGTH", s.gfx_ssao_strength.load());
+  SetPostOptionBool(config, "CONTACT_SHADOW_ENABLE", s.gfx_contact_shadows.load());
+  SetPostOptionFloat(config, "CONTACT_SHADOW_STRENGTH", s.gfx_contact_shadow_strength.load());
+  SetPostOptionBool(config, "VIGNETTE_ENABLE", s.gfx_vignette.load());
+  SetPostOptionFloat(config, "VIGNETTE_STRENGTH", s.gfx_vignette_strength.load());
+  SetPostOptionBool(config, "FILM_GRAIN_ENABLE", s.gfx_film_grain.load());
+  SetPostOptionFloat(config, "FILM_GRAIN_STRENGTH", s.gfx_film_grain_strength.load());
 }
 
 void ApplyAspect(int mode)
@@ -1620,6 +1649,7 @@ void ApplyDolphinSettings()
 void SetGameplayActive(bool active)
 {
   s.gameplay = active;
+  UpdateEnhancedPostProcess();
 
   if (active)
   {
@@ -1667,6 +1697,8 @@ void SetGameplayActive(bool active)
 void SetMovieActive(bool active)
 {
   const bool previous = s.movie_active.exchange(active);
+
+  UpdateEnhancedPostProcess();
 
   if (active)
   {
@@ -1734,6 +1766,8 @@ void SetGameplayDetected(bool active)
           active,
           std::memory_order_acq_rel);
 
+  UpdateEnhancedPostProcess();
+
   if (active)
   {
     // The GameCube gameplay loop is authoritative. Any delayed VP6 guard
@@ -1773,182 +1807,20 @@ void SetGameplayDetected(bool active)
 
 void PreprocessSceneBefore2D()
 {
-
-  static bool s_final_policy_logged = false;
-
-  if (!s_final_policy_logged)
-  {
-    s_final_policy_logged = true;
-
-    std::fprintf(
-        stderr,
-        "[moh-gfx] menu/VP6 final postprocess bypass ACTIVE\n");
-  }
-
-
-  static bool s_f150_logged = false;
-
-  if (!s_f150_logged)
-  {
-    s_f150_logged = true;
-
-    std::fprintf(
-        stderr,
-        "[moh-gfx] pre-HUD F150 scene request received\\n");
-  }
-
-  if (!s.initialized.load(
-          std::memory_order_relaxed) ||
-      !s.enhanced_graphics.load(
-          std::memory_order_relaxed) ||
-      !s.gameplay.load(
-          std::memory_order_acquire) ||
-      s.movie_active.load(
-          std::memory_order_acquire))
-  {
-    return;
-  }
-
-  if (s.scene_postprocess_done.load(
-          std::memory_order_acquire))
-  {
-    return;
-  }
-
-  bool expected = false;
-
-  if (!s.scene_postprocess_busy
-           .compare_exchange_strong(
-               expected,
-               true,
-               std::memory_order_acq_rel))
-  {
-    return;
-  }
-
-  // Finish all GX world/viewmodel/character work before snapshotting the EFB.
-  Core::System::GetInstance()
-      .GetFifo()
-      .SyncGPUForRegisterAccess();
-
-  // v6.8.1 - F150 CPU/GPU ordering barrier.
-  //
-  // F150 is emitted at the real GAMEPLAY 3D -> HUD transition.
-  // The recomp CPU is already there, but in DualCore the Dolphin GPU thread
-  // can still be finishing GX commands previously emitted for world, actors
-  // and weapon.
-  //
-  // Drain those commands BEFORE asking the video thread to process the EFB.
-  {
-    auto& system =
-        Core::System::GetInstance();
-
-    auto& fifo =
-        system.GetFifo();
-
-    if (system.IsDualCoreMode())
-    {
-      fifo.RunGpu();
-      fifo.FlushGpu();
-    }
-    else
-    {
-      fifo.SyncGPUForRegisterAccess();
-    }
-  }
-
-  static bool s_f150_gpu_order_logged =
-      false;
-
-  if (!s_f150_gpu_order_logged)
-  {
-    s_f150_gpu_order_logged =
-        true;
-
-    std::fprintf(
-        stderr,
-        "[moh-gfx] F150 CPU/GPU ordering ACTIVE: "
-        "GAMEPLAY GX drained before scene postprocess\n");
-  }
-
-  const bool success =
-      AsyncRequests::GetInstance()
-          ->PushBlockingEvent(
-              [] {
-                return RunScenePostProcessOnGpu();
-              });
-
-  if (success)
-  {
-    s.scene_postprocess_done.store(
-        true,
-        std::memory_order_release);
-  }
-
-  s.scene_postprocess_busy.store(
-      false,
-      std::memory_order_release);
+  // F150/EFB scene compositor intentionally disabled.
+  // The final XFB Presenter path below is the sole post-process authority.
+  return;
 }
 
 bool ShouldBypassFinalPostProcess()
 {
-  if (!s.initialized.load(
-          std::memory_order_relaxed))
-  {
-    return false;
-  }
-
-  if (!s.enhanced_graphics.load(
-          std::memory_order_relaxed))
-  {
-    return false;
-  }
-
-  // VP6/FMVs are NEVER post-processed.
-  if (s.movie_active.load(
-          std::memory_order_relaxed) ||
-      s.movie_bypass_frames.load(
-          std::memory_order_relaxed) > 0)
-  {
-    return true;
-  }
-
-  // Frontend/menu/loading screens are NEVER post-processed.
-  if (!s.gameplay.load(
-          std::memory_order_relaxed))
-  {
-    return true;
-  }
-
-  // Gameplay:
-  //
-  // If the pre-HUD F150 scene pass succeeded this frame, the 3D has already
-  // received MOHFrontlineEnhanced. Final XFB must therefore be DEFAULT so
-  // HUD/fonts remain clean.
-  //
-  // If F150 failed, return false as fail-safe so Enhanced is not lost.
-  return s.scene_postprocess_done.load(
-      std::memory_order_acquire);
+  // No alternate Presenter path. Shader selection handles menu/movie/gameplay.
+  return false;
 }
 
 void NotifyFinalPostProcessComplete()
 {
-  s.scene_postprocess_done.store(
-      false,
-      std::memory_order_release);
-
-  int frames =
-      s.movie_bypass_frames.load(
-          std::memory_order_relaxed);
-
-  while (frames > 0 &&
-         !s.movie_bypass_frames
-              .compare_exchange_weak(
-                  frames,
-                  frames - 1,
-                  std::memory_order_relaxed))
-  {
-  }
+  return;
 }
 
 bool WantsRelativeMouse()
