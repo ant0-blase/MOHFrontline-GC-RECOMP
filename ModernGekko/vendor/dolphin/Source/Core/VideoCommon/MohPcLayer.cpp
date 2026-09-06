@@ -4,6 +4,7 @@
 #include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3FontParser.h"
+#include <map>
 
 #include "Common/Config/Config.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -257,17 +258,49 @@ struct PS3FontDrawRequest
   float x = 0.0f;
   float y = 0.0f;
   bool centered = false;
+  PS3FontRole role = PS3FontRole::Generic;
+  u32 rgba = 0xFFFFFFFF;
 };
 
 std::mutex s_ps3_font_draw_mutex;
 std::vector<PS3FontDrawRequest>
     s_ps3_font_draw_requests;
+std::vector<PS3FontDrawRequest> s_ps3_font_frame;
+std::chrono::steady_clock::time_point s_ps3_font_frame_time;
 
-std::unique_ptr<AbstractTexture>
-    s_ps3_font_gpu_texture;
+struct PS3FontAtlas
+{
+  std::unique_ptr<AbstractTexture> texture;
+  float line_height = 1;
+};
+std::map<std::string, PS3FontAtlas> s_ps3_font_atlases;
 
-std::string
-    s_ps3_font_gpu_key;
+const char* FontRoleName(PS3FontRole role)
+{
+  static constexpr const char* names[] = {"HUD", "WEAPON", "OBJECTIVE", "SUBTITLE",
+      "MENU", "PAUSE", "POPUP", "INTRO", "GENERIC"};
+  return names[static_cast<unsigned>(role)];
+}
+
+const std::string& FontFilename(PS3FontRole role)
+{
+  // Environment is startup configuration; no filesystem work in the draw path.
+  static const auto names = [] {
+    std::array<std::string, 9> result;
+    const char* defaults[] = {"mohgamefont_72.sfn", "popupdisplay.sfn", "objfont.sfn",
+        "subtitlefont.sfn", "pausescreenfont.sfn", "pausescreenfont.sfn",
+        "popupdisplay.sfn", "ddayintro.sfn", "langfont.sfn"};
+    for (unsigned i = 0; i < result.size(); ++i)
+    {
+      const auto env = std::string("MOH_PS3_FONT_") + FontRoleName(static_cast<PS3FontRole>(i));
+      const char* value = std::getenv(env.c_str());
+      if (!value || !*value) value = std::getenv("MOH_PS3_FONT");
+      result[i] = value && *value ? value : defaults[i];
+    }
+    return result;
+  }();
+  return names[static_cast<unsigned>(role)];
+}
 
 
 bool EnvTrue(const char* name, bool fallback)
@@ -1511,8 +1544,7 @@ bool RunScenePostProcessOnGpu()
 
 void ReleaseScenePostProcessOnGpu()
 {
-  s_ps3_font_gpu_texture.reset();
-  s_ps3_font_gpu_key.clear();
+  s_ps3_font_atlases.clear();
 
   s.scene_post_source.reset();
   s.scene_post_processor.reset();
@@ -1567,7 +1599,7 @@ void Shutdown()
 
   if ((s.scene_post_source ||
        s.scene_post_processor ||
-       s_ps3_font_gpu_texture) &&
+       !s_ps3_font_atlases.empty()) &&
       g_gfx)
   {
     Core::System::GetInstance()
@@ -1648,8 +1680,17 @@ void ApplyDolphinSettings()
 
 void SetGameplayActive(bool active)
 {
+<<<<<<< HEAD
   s.gameplay = active;
   UpdateEnhancedPostProcess();
+=======
+  if (s.gameplay.exchange(active) != active)
+  {
+    std::scoped_lock lock(s_ps3_font_draw_mutex);
+    s_ps3_font_draw_requests.clear();
+    s_ps3_font_frame.clear();
+  }
+>>>>>>> a1c6a5a1 (feat: improve PS3 fonts compass and rendering)
 
   if (active)
   {
@@ -1697,6 +1738,12 @@ void SetGameplayActive(bool active)
 void SetMovieActive(bool active)
 {
   const bool previous = s.movie_active.exchange(active);
+  if (active)
+  {
+    std::scoped_lock lock(s_ps3_font_draw_mutex);
+    s_ps3_font_draw_requests.clear();
+    s_ps3_font_frame.clear();
+  }
 
   UpdateEnhancedPostProcess();
 
@@ -2104,33 +2151,12 @@ bool IsPcCrosshairEnabled()
 void SetCurrentWeaponType(int type) { s.current_weapon_type = type; }
 int GetCurrentWeaponType() { return s.current_weapon_type.load(); }
 
-bool IsPS3FontBridgeReady()
+bool IsPS3FontBridgeReady(PS3FontRole role)
 {
-  if (!EnvTrue(
-          "MOH_PS3_FONT_RENDER",
-          true))
-  {
+  if (!EnvTrue("MOH_PS3_FONT_RENDER", true) || s.movie_active.load())
     return false;
-  }
-
-  const char* requested =
-      std::getenv(
-          "MOH_PS3_FONT");
-
-  const std::string_view name =
-      requested && *requested ?
-          std::string_view(requested) :
-          std::string_view("mohgamefont_72.sfn");
-
-  const auto* font =
-      PS3FontParser::
-          FindByFilename(name);
-
-  return
-      font &&
-      font->atlas_rgba_ready &&
-      font->atlas_width > 0 &&
-      font->atlas_height > 0 &&
+  const auto* font = PS3FontParser::FindByFilename(FontFilename(role));
+  return font && font->atlas_rgba_ready && font->atlas_width && font->atlas_height &&
       !font->atlas_rgba.empty();
 }
 
@@ -2138,11 +2164,11 @@ bool QueuePS3FontDraw(
     const char* text,
     float x,
     float y,
-    bool centered)
+    bool centered, PS3FontRole role, u32 rgba)
 {
   if (!text ||
       !*text ||
-      !IsPS3FontBridgeReady())
+      !IsPS3FontBridgeReady(role))
   {
     return false;
   }
@@ -2159,6 +2185,8 @@ bool QueuePS3FontDraw(
 
   PS3FontDrawRequest request;
 
+  request.role = role;
+  request.rgba = rgba;
   request.text = text;
   request.x = x;
   request.y = y;
@@ -2183,7 +2211,7 @@ bool QueuePS3FontDraw(
            s_ps3_font_draw_requests.rend();
        ++it)
   {
-    if (it->text ==
+    if (it->role == request.role && it->rgba == request.rgba && it->text ==
             request.text &&
         std::abs(
             it->x -
@@ -2204,582 +2232,96 @@ bool QueuePS3FontDraw(
   return true;
 }
 
-void DrawPS3FontUI(
-    float backbuffer_scale)
+void PublishPS3FontFrame()
+{
+  std::scoped_lock lock(s_ps3_font_draw_mutex);
+  s_ps3_font_frame.swap(s_ps3_font_draw_requests);
+  s_ps3_font_draw_requests.clear();
+  s_ps3_font_frame_time = std::chrono::steady_clock::now();
+}
+
+void DrawPS3FontUI(float backbuffer_scale)
 {
   (void)backbuffer_scale;
-
-  std::vector<PS3FontDrawRequest>
-      requests;
-
-  std::vector<PS3FontDrawRequest>
-      incoming;
-
+  std::vector<PS3FontDrawRequest> requests;
   {
-    std::scoped_lock lock(
-        s_ps3_font_draw_mutex);
-
-    incoming.swap(
-        s_ps3_font_draw_requests);
+    std::scoped_lock lock(s_ps3_font_draw_mutex);
+    // Whole guest-frame snapshots avoid flicker between 120 Hz host presents.
+    // Empty loading flips and scene/movie transitions clear old labels.
+    if (std::chrono::steady_clock::now() - s_ps3_font_frame_time > std::chrono::milliseconds(100))
+      s_ps3_font_frame.clear();
+    requests = s_ps3_font_frame;
   }
-
-  // v6.5:
-  // Persist captured guest CFont draws across host presentation frames.
-  //
-  // At 120 Hz the host UI can render between two guest HUD/CFont updates.
-  // The old queue-swap implementation therefore generated:
-  //
-  //   capture -> visible -> empty queue -> invisible -> capture -> ...
-  //
-  // Retain each logical HUD slot for a short period instead.
-  struct RetainedPS3FontDraw
-  {
-    PS3FontDrawRequest request;
-    std::chrono::steady_clock::time_point last_seen;
-  };
-
-  static std::vector<
-      RetainedPS3FontDraw>
-      retained;
-
-  const auto now =
-      std::chrono::steady_clock::now();
-
-  // Never allow stale gameplay HUD text over menus or movies.
-  if (!s.gameplay.load(
-          std::memory_order_relaxed) ||
-      s.movie_active.load(
-          std::memory_order_relaxed))
-  {
-    retained.clear();
+  if (requests.empty() || s.movie_active.load() || !g_gfx)
     return;
-  }
-
-  const double hold_ms =
-      std::clamp(
-          EnvDouble(
-              "MOH_PS3_FONT_HOLD_MS",
-              180.0),
-          40.0,
-          1000.0);
-
-  for (auto& request :
-       incoming)
-  {
-    bool refreshed =
-        false;
-
-    for (auto& entry :
-         retained)
-    {
-      const float dx =
-          std::abs(
-              entry.request.x -
-              request.x);
-
-      const float dy =
-          std::abs(
-              entry.request.y -
-              request.y);
-
-      // Main identity is the logical CFont position. This naturally updates
-      // changing ammo numbers without leaving the previous value behind.
-      const bool same_slot =
-          entry.request.centered ==
-              request.centered &&
-          dx < 8.0f &&
-          dy < 8.0f;
-
-      // Also follow a label whose position moves slightly because of
-      // widescreen/HUD interpolation.
-      const bool same_text_near =
-          entry.request.text ==
-              request.text &&
-          dx < 64.0f &&
-          dy < 64.0f;
-
-      if (
-          same_slot ||
-          same_text_near
-      )
-      {
-        entry.request =
-            std::move(request);
-
-        entry.last_seen =
-            now;
-
-        refreshed =
-            true;
-
-        break;
-      }
-    }
-
-    if (
-        !refreshed &&
-        retained.size() < 256u
-    )
-    {
-      retained.push_back(
-          {
-              std::move(request),
-              now
-          });
-    }
-  }
-
-  for (
-      auto it = retained.begin();
-      it != retained.end();)
-  {
-    const double age_ms =
-        std::chrono::duration<
-            double,
-            std::milli>(
-                now -
-                it->last_seen)
-            .count();
-
-    if (age_ms >
-        hold_ms)
-    {
-      it =
-          retained.erase(it);
-    }
-    else
-    {
-      ++it;
-    }
-  }
-
-  requests.reserve(
-      retained.size());
-
-  for (const auto& entry :
-       retained)
-  {
-    requests.push_back(
-        entry.request);
-  }
-
-  static bool hold_logged =
-      false;
-
-  if (
-      !hold_logged &&
-      !requests.empty()
-  )
-  {
-    hold_logged =
-        true;
-
-    std::fprintf(
-        stderr,
-        "[moh-ps3-font] PS3 font temporal hold active: %.0f ms\n",
-        hold_ms);
-  }
-
-
-  if (requests.empty() ||
-      !IsPS3FontBridgeReady() ||
-      !g_gfx)
-  {
+  auto* draw = ImGui::GetForegroundDrawList();
+  const ImVec2 display = ImGui::GetIO().DisplaySize;
+  if (!draw || display.x <= 0 || display.y <= 0)
     return;
-  }
-
-  const char* requested =
-      std::getenv(
-          "MOH_PS3_FONT");
-
-  const std::string font_name =
-      requested && *requested ?
-          requested :
-          "mohgamefont_72.sfn";
-
-  const auto* font =
-      PS3FontParser::
-          FindByFilename(
-              font_name);
-
-  if (!font ||
-      !font->atlas_rgba_ready)
+  const float x_scale = display.x / 640.0f;
+  const float y_scale = display.y / 480.0f;
+  static const float requested_scale = std::clamp(EnvDouble("MOH_PS3_FONT_SCALE", 1.0), 0.25, 4.0);
+  static std::array<bool, 9> logged{};
+  for (const auto& request : requests)
   {
-    return;
-  }
-
-  const std::string key =
-      font->absolute_path.string();
-
-  if (!s_ps3_font_gpu_texture ||
-      s_ps3_font_gpu_key != key ||
-      s_ps3_font_gpu_texture
-          ->GetWidth() !=
-          font->atlas_width ||
-      s_ps3_font_gpu_texture
-          ->GetHeight() !=
-          font->atlas_height)
-  {
-    TextureConfig config(
-        font->atlas_width,
-        font->atlas_height,
-        1,
-        1,
-        1,
-        AbstractTextureFormat::RGBA8,
-        0,
-        AbstractTextureType::
-            Texture_2DArray);
-
-    auto texture =
-        g_gfx->CreateTexture(
-            config,
-            "MOH Frontline PS3 SFNH font atlas");
-
-    if (!texture)
+    const auto& font_name = FontFilename(request.role);
+    const auto* font = PS3FontParser::FindByFilename(font_name);
+    if (!font || !font->atlas_rgba_ready)
+      continue;
+    auto& atlas = s_ps3_font_atlases[font_name];
+    if (!atlas.texture)
     {
-      std::fprintf(
-          stderr,
-          "[moh-ps3-font] GPU atlas creation failed: %s\\n",
-          font_name.c_str());
-
-      return;
-    }
-
-    texture->Load(
-        0,
-        font->atlas_width,
-        font->atlas_height,
-        font->atlas_width,
-        font->atlas_rgba.data(),
-        font->atlas_rgba.size());
-
-    s_ps3_font_gpu_texture =
-        std::move(texture);
-
-    s_ps3_font_gpu_key =
-        key;
-
-    std::fprintf(
-        stderr,
-        "[moh-ps3-font] GPU CFont bridge READY: "
-        "%s %ux%u\\n",
-        font_name.c_str(),
-        font->atlas_width,
-        font->atlas_height);
-  }
-
-  ImDrawList* draw =
-      ImGui::GetForegroundDrawList();
-
-  if (!draw)
-    return;
-
-  const ImVec2 display =
-      ImGui::GetIO()
-          .DisplaySize;
-
-  if (!(display.x > 0.0f) ||
-      !(display.y > 0.0f))
-  {
-    return;
-  }
-
-  const float game_x_scale =
-      display.x /
-      640.0f;
-
-  const float game_y_scale =
-      display.y /
-      480.0f;
-
-  const float requested_scale =
-      static_cast<float>(
-          std::clamp(
-              EnvDouble(
-                  "MOH_PS3_FONT_SCALE",
-                  1.0),
-              0.25,
-              4.0));
-
-  // Glyph aspect must remain normal in widescreen.
-  // Position X still follows the full 640->backbuffer mapping.
-  // v6.4:
-  // Keep positioning in the original 640x480 logical coordinate system,
-  // but normalize high-resolution PS3 glyph pixels to a logical HUD height.
-  const float base_output_scale =
-      game_y_scale *
-      requested_scale;
-
-  const auto line_height = [&]()
-  {
-    u32 value = 0;
-
-    for (const auto& glyph :
-         font->glyphs)
-    {
-      value =
-          std::max(
-              value,
-              glyph.height);
-    }
-
-    return
-        static_cast<float>(
-            std::max<u32>(
-                value,
-                1u));
-  }();
-
-  const float target_logical_height =
-      static_cast<float>(
-          std::clamp(
-              EnvDouble(
-                  "MOH_PS3_FONT_HEIGHT",
-                  24.0),
-              12.0,
-              48.0));
-
-  const float glyph_scale =
-      base_output_scale *
-      target_logical_height /
-      std::max(
-          line_height,
-          1.0f);
-
-  static bool s_hq_font_logged = false;
-
-  if (!s_hq_font_logged)
-  {
-    s_hq_font_logged = true;
-
-    std::fprintf(
-        stderr,
-        "[moh-ps3-font] HQ PS3 HUD font ACTIVE: "
-        "%s native-height=%.1f logical-height=%.1f\n",
-        font_name.c_str(),
-        line_height,
-        target_logical_height);
-  }
-
-
-  auto text_width =
-      [&](std::string_view text)
-      {
-        float width = 0.0f;
-        float max_width = 0.0f;
-
-        for (unsigned char ch :
-             text)
-        {
-          if (ch == '\n')
-          {
-            max_width =
-                std::max(
-                    max_width,
-                    width);
-
-            width = 0.0f;
-            continue;
-          }
-
-          const u16 cp =
-              ch < 0x80u ?
-                  static_cast<u16>(ch) :
-                  static_cast<u16>('?');
-
-          const auto* glyph =
-              PS3FontParser::
-                  FindGlyph(
-                      *font,
-                      cp);
-
-          if (!glyph)
-          {
-            glyph =
-                PS3FontParser::
-                    FindGlyph(
-                        *font,
-                        '?');
-          }
-
-          if (glyph)
-          {
-            width +=
-                static_cast<float>(
-                    glyph->advance) *
-                glyph_scale;
-          }
-        }
-
-        return
-            std::max(
-                max_width,
-                width);
-      };
-
-  for (const auto& request :
-       requests)
-  {
-    float origin_x =
-        request.x *
-        game_x_scale;
-
-    float pen_y =
-        request.y *
-        game_y_scale;
-
-    if (request.centered)
-    {
-      origin_x -=
-          text_width(
-              request.text) *
-          0.5f;
-    }
-
-    float pen_x =
-        origin_x;
-
-    for (unsigned char ch :
-         request.text)
-    {
-      if (ch == '\n')
-      {
-        pen_x =
-            origin_x;
-
-        pen_y +=
-            line_height *
-            glyph_scale;
-
+      TextureConfig config(font->atlas_width, font->atlas_height, 1, 1, 1,
+          AbstractTextureFormat::RGBA8, 0, AbstractTextureType::Texture_2DArray);
+      atlas.texture = g_gfx->CreateTexture(config, "MOH PS3 SFNH atlas");
+      if (!atlas.texture)
         continue;
-      }
-
-      const u16 cp =
-          ch < 0x80u ?
-              static_cast<u16>(ch) :
-              static_cast<u16>('?');
-
-      const auto* glyph =
-          PS3FontParser::
-              FindGlyph(
-                  *font,
-                  cp);
-
-      if (!glyph)
+      atlas.texture->Load(0, font->atlas_width, font->atlas_height, font->atlas_width,
+                          font->atlas_rgba.data(), font->atlas_rgba.size());
+      for (const auto& glyph : font->glyphs)
+        atlas.line_height = std::max(atlas.line_height, static_cast<float>(glyph.height));
+    }
+    const float logical_height = std::clamp(EnvDouble("MOH_PS3_FONT_HEIGHT",
+        request.role == PS3FontRole::HudCounter ? 24.0 : 16.0), 12.0, 48.0);
+    const float scale = y_scale * requested_scale * logical_height / atlas.line_height;
+    const auto glyph_for = [&](unsigned char ch) {
+      const auto* glyph = PS3FontParser::FindGlyph(*font, ch);
+      return glyph ? glyph : PS3FontParser::FindGlyph(*font, '?');
+    };
+    float width = 0, max_width = 0;
+    for (unsigned char ch : request.text)
+    {
+      if (ch == '\n') { max_width = std::max(max_width, width); width = 0; }
+      else if (const auto* glyph = glyph_for(ch)) width += glyph->advance * scale;
+    }
+    const float origin_x = request.x * x_scale -
+        (request.centered ? std::max(width, max_width) * 0.5f : 0);
+    float pen_x = origin_x, pen_y = request.y * y_scale;
+    const ImU32 color = IM_COL32(request.rgba >> 24, (request.rgba >> 16) & 255,
+                                 (request.rgba >> 8) & 255, request.rgba & 255);
+    for (unsigned char ch : request.text)
+    {
+      if (ch == '\n') { pen_x = origin_x; pen_y += logical_height * y_scale; continue; }
+      const auto* glyph = glyph_for(ch);
+      if (!glyph) continue;
+      if (ch != ' ' && glyph->width && glyph->height)
       {
-        glyph =
-            PS3FontParser::
-                FindGlyph(
-                    *font,
-                    '?');
+        const float x0 = pen_x + glyph->bearing * scale;
+        const ImVec2 uv0((glyph->x + 0.5f) / font->atlas_width,
+                         (glyph->y + 0.5f) / font->atlas_height);
+        const ImVec2 uv1((glyph->x + glyph->width - 0.5f) / font->atlas_width,
+                         (glyph->y + glyph->height - 0.5f) / font->atlas_height);
+        draw->AddImage(*atlas.texture, ImVec2(x0, pen_y),
+                       ImVec2(x0 + glyph->width * scale, pen_y + glyph->height * scale),
+                       uv0, uv1, color);
       }
-
-      if (!glyph)
-        continue;
-
-      if (ch != ' ' &&
-          glyph->width > 0 &&
-          glyph->height > 0)
-      {
-        const float x0 =
-            pen_x +
-            static_cast<float>(
-                glyph->bearing) *
-            glyph_scale;
-
-        const float y0 =
-            pen_y;
-
-        const float x1 =
-            x0 +
-            static_cast<float>(
-                glyph->width) *
-            glyph_scale;
-
-        const float y1 =
-            y0 +
-            static_cast<float>(
-                glyph->height) *
-            glyph_scale;
-
-      constexpr float ps3_font_uv_inset = 0.5f;
-
-      const float atlas_w =
-          static_cast<float>(
-              font->atlas_width);
-
-      const float atlas_h =
-          static_cast<float>(
-              font->atlas_height);
-
-      const float glyph_left =
-          static_cast<float>(
-              glyph->x);
-
-      const float glyph_top =
-          static_cast<float>(
-              glyph->y);
-
-      const float glyph_right =
-          static_cast<float>(
-              glyph->x +
-              glyph->width);
-
-      const float glyph_bottom =
-          static_cast<float>(
-              glyph->y +
-              glyph->height);
-
-      const ImVec2 uv0(
-          (glyph_left +
-           ps3_font_uv_inset) /
-              atlas_w,
-          (glyph_top +
-           ps3_font_uv_inset) /
-              atlas_h);
-
-      const ImVec2 uv1(
-          (glyph_right -
-           ps3_font_uv_inset) /
-              atlas_w,
-          (glyph_bottom -
-           ps3_font_uv_inset) /
-              atlas_h);
-
-        draw->AddImage(
-            *s_ps3_font_gpu_texture,
-            ImVec2(x0, y0),
-            ImVec2(x1, y1),
-            uv0,
-            uv1,
-            IM_COL32(
-                255,
-                255,
-                255,
-                255));
-
-      static bool s_ps3_font_actual_draw_logged = false;
-
-      if (!s_ps3_font_actual_draw_logged)
-      {
-        s_ps3_font_actual_draw_logged = true;
-
-        std::fprintf(
-            stderr,
-            "[moh-ps3-font] PS3 SFNH glyph rendering ACTIVE: "
-            "%s atlas=%ux%u\n",
-            font_name.c_str(),
-            font->atlas_width,
-            font->atlas_height);
-      }
-
-      }
-
-      pen_x +=
-          static_cast<float>(
-              glyph->advance) *
-          glyph_scale;
+      pen_x += glyph->advance * scale;
+    }
+    if (!logged[static_cast<unsigned>(request.role)])
+    {
+      logged[static_cast<unsigned>(request.role)] = true;
+      std::fprintf(stderr, "[moh-ps3-font] role=%s font=%s text=\"%s\"\n",
+                   FontRoleName(request.role), font_name.c_str(), request.text.c_str());
     }
   }
 }

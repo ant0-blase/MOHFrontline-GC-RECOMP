@@ -129,6 +129,10 @@ add_library(videocommon
   MohPcLayer.h
   PS3RemasterAssets.cpp
   PS3RemasterAssets.h
+  PS3Compass.cpp
+  PS3Compass.h
+  PS3TextureDecoder.cpp
+  PS3TextureDecoder.h
   PS3FontParser.cpp
   PS3FontParser.h
   OnScreenUIKeyMap.h

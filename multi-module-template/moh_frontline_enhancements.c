@@ -870,8 +870,7 @@ static void moh_ps3_font_submit(
     int replacement_ready;
 
     if (!ctx ||
-        !ctx->host_call ||
-        s_hud_draw_depth == 0u)
+        !ctx->host_call)
     {
         return;
     }
@@ -881,7 +880,7 @@ static void moh_ps3_font_submit(
      * r0. Preserve r0 because this hook lives inside the original function.
      */
     saved_r0 = ctx->gpr[0];
-    ctx->gpr[0] = 0u;
+    ctx->gpr[0] = s_ui_draw_depth ? 4u : 8u;
 
     (void)ctx->host_call(
         ctx,
@@ -907,34 +906,51 @@ static void moh_ps3_font_submit(
 
 void moh_hud_text_position_override(CPUState* ctx)
 {
-    const double center_x = 320.0;
-    const double center_y = 240.0;
-
-    if (!ctx || s_hud_draw_depth == 0u)
-        return;
-
-    ctx->fpr[1] = center_x + (ctx->fpr[1] - center_x) * s_hud_root_x_scale;
-    ctx->fpr[2] = center_y + (ctx->fpr[2] - center_y) * s_hud_root_y_scale;
-    moh_ps3_font_submit(
-        ctx,
-        MOH_HOSTCALL_PS3_FONT_DRAW);
-
+    if (!ctx) return;
+    if (s_hud_draw_depth) {
+        ctx->fpr[1] = 320.0 + (ctx->fpr[1] - 320.0) * s_hud_root_x_scale;
+        ctx->fpr[2] = 240.0 + (ctx->fpr[2] - 240.0) * s_hud_root_y_scale;
+    } else if (s_ui_draw_depth) {
+        ctx->fpr[1] = 320.0 + (ctx->fpr[1] - 320.0) * s_ui_root_x_scale;
+        ctx->fpr[2] = 240.0 + (ctx->fpr[2] - 240.0) * s_ui_root_y_scale;
+    }
+    moh_ps3_font_submit(ctx, MOH_HOSTCALL_PS3_FONT_DRAW);
 }
 
 void moh_hud_centered_text_position_override(CPUState* ctx)
 {
-    const double center_y = 240.0;
+    if (!ctx) return;
+    if (s_hud_draw_depth)
+        ctx->fpr[1] = 240.0 + (ctx->fpr[1] - 240.0) * s_hud_root_y_scale;
+    else if (s_ui_draw_depth)
+        ctx->fpr[1] = 240.0 + (ctx->fpr[1] - 240.0) * s_ui_root_y_scale;
+    moh_ps3_font_submit(ctx, MOH_HOSTCALL_PS3_FONT_CENTERED);
+}
 
-    if (!ctx || s_hud_draw_depth == 0u)
-        return;
+/* The formatted variant must submit the completed vsprintf buffer, not "%s".
+ * 0x8007CD54: r31=CFont, f31=y, stack+132=formatted string. */
+void moh_ps3_formatted_font(CPUState* ctx)
+{
+    u32 r3 = ctx->gpr[3], r4 = ctx->gpr[4];
+    f64 f1 = ctx->fpr[1], f2 = ctx->fpr[2];
+    ctx->gpr[3] = ctx->gpr[31];
+    ctx->gpr[4] = ctx->gpr[1] + 132u;
+    ctx->fpr[1] = ctx->fpr[31];
+    moh_hud_centered_text_position_override(ctx);
+    ctx->fpr[31] = ctx->fpr[1];
+    ctx->gpr[3] = r3; ctx->gpr[4] = r4;
+    ctx->fpr[1] = f1; ctx->fpr[2] = f2;
+}
 
-    /* DrawTextCentered computes horizontal centring internally; its only float
-     * argument is the vertical position. */
-    ctx->fpr[1] = center_y + (ctx->fpr[1] - center_y) * s_hud_root_y_scale;
-    moh_ps3_font_submit(
-        ctx,
-        MOH_HOSTCALL_PS3_FONT_CENTERED);
-
+/* Private metadata hostcalls leave all guest state untouched. */
+void moh_ps3_metadata(CPUState* ctx, u32 token, u32 name)
+{
+    u32 r0;
+    if (!ctx || !ctx->host_call) return;
+    r0 = ctx->gpr[0];
+    ctx->gpr[0] = name;
+    (void)ctx->host_call(ctx, token);
+    ctx->gpr[0] = r0;
 }
 
 void moh_ui_font_scale_override(CPUState* ctx)

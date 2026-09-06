@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/TextureCacheBase.h"
+#include "VideoCommon/PS3Compass.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1519,6 +1520,9 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     }
   }
 
+  // This lookup runs only after normal address-cache hits have been exhausted.
+  auto ps3_compass = PS3Compass::Find(texture_info);
+
   // Search the texture cache for normal textures by hash
   //
   // If the texture was fully hashed, the address does not need to match. Identical duplicate
@@ -1535,7 +1539,8 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     {
       RcTcacheEntry& entry = hash_iter->second;
       // All parameters, except the address, need to match here
-      if (entry->format == full_format && entry->native_levels >= texture_info.GetLevelCount() &&
+      if (!ps3_compass && !entry->is_ps3_compass &&
+          entry->format == full_format && entry->native_levels >= texture_info.GetLevelCount() &&
           entry->native_width == texture_info.GetRawWidth() &&
           entry->native_height == texture_info.GetRawHeight())
       {
@@ -1583,6 +1588,15 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     }
   }
 
+  // Only exact, guest-registered compass textures enter this native upload path.
+  // Cache hits retain the GPU texture; geometry, UVs, blend and rotation stay GX-owned.
+  if (ps3_compass)
+  {
+    custom_texture_data = ps3_compass;
+    hires_texture.reset();
+    skip_texture_dump = true;
+  }
+
   std::string texture_name = "";
 
   if (g_ActiveConfig.bGraphicMods)
@@ -1602,6 +1616,8 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
       CreateTextureEntry(TextureCreationInfo{base_hash, full_hash, bytes_per_block, palette_size},
                          texture_info, textureCacheSafetyColorSampleSize, custom_texture_data.get(),
                          has_arbitrary_mipmaps, skip_texture_dump);
+  if (!entry) return entry;
+  entry->is_ps3_compass = bool(ps3_compass);
   entry->hires_texture = std::move(hires_texture);
   entry->last_load_time = load_time;
   entry->texture_info_name = std::move(texture_name);

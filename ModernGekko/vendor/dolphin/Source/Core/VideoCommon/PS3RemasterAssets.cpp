@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/PS3RemasterAssets.h"
+#include "VideoCommon/PS3Compass.h"
 #include "VideoCommon/PS3FontParser.h"
 
 #include <algorithm>
@@ -384,6 +385,7 @@ void Initialize()
 
 void Shutdown()
 {
+  PS3Compass::Shutdown();
   PS3FontParser::Shutdown();
 
   s.enabled = false;

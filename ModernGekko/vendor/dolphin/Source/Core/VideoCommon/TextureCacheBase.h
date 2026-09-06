@@ -131,6 +131,7 @@ struct TCacheEntry
   u32 memory_stride = 0;
   bool is_efb_copy = false;
   bool is_custom_tex = false;
+  bool is_ps3_compass = false;
   bool may_have_overlapping_textures = true;
   // indicates that the mips in this texture are arbitrary content, aren't just downscaled
   bool has_arbitrary_mips = false;

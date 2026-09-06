@@ -3,6 +3,8 @@
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
 #include "VideoCommon/MohPcLayer.h"
+#include "VideoCommon/PS3Compass.h"
+#include "VideoCommon/TextureDecoder.h"
 #endif
 
 #if defined(MODERNGEKKO_ENABLE_DYNAMIC_MODULES)
@@ -25,6 +27,25 @@ namespace moderngekko {
 namespace {
 constexpr std::uint32_t MAX_ITEMS = 1u << 20;
 #if defined(MODERNGEKKO_MOH_PC_LAYER)
+using FontRole = MohPcLayer::PS3FontRole;
+std::unordered_map<std::uint32_t, FontRole> loaded_font_roles;
+std::unordered_map<std::uint32_t, FontRole> cfont_roles;
+
+FontRole FontAssetRole(std::string name)
+{
+  const auto slash = name.find_last_of("/\\:");
+  if (slash != std::string::npos) name.erase(0, slash + 1);
+  std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+  if (name.ends_with(".gfn")) name.replace(name.size() - 4, 4, ".sfn");
+  if (name == "objfont.sfn") return FontRole::Objective;
+  if (name == "subtitlefont.sfn") return FontRole::Subtitle;
+  if (name == "pausescreenfont.sfn") return FontRole::Pause;
+  if (name == "popupdisplay.sfn") return FontRole::Popup;
+  if (name == "ddayintro.sfn") return FontRole::Intro;
+  if (name == "comicfont.sfn" || name == "upcomicfont.sfn") return FontRole::Menu;
+  return FontRole::Generic;
+}
+
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_ON = 0xFFFFF100u;
 constexpr std::uint32_t MOH_HOSTCALL_VI_GAMEPLAY_OFF = 0xFFFFF101u;
 constexpr std::uint32_t MOH_HOSTCALL_GAMEPLAY_ENTER = 0xFFFFF110u;
@@ -144,107 +165,6 @@ bool ReadGuestCString(
   }
 
   return false;
-}
-
-bool FindGuestFontText(
-    CPUState* state,
-    std::string* out,
-    int* out_reg)
-{
-  if (!state ||
-      !out)
-  {
-    return false;
-  }
-
-  // PPC EABI C++ CFont calls normally keep "this" in r3 while text pointers
-  // land around r4-r8 depending on preceding float arguments. Also inspect
-  // nonvolatile registers because this hook sits inside CFont, not necessarily
-  // at function entry.
-  static constexpr int priority[] = {
-      6, 5, 4, 7, 8, 9, 10,
-      31, 30, 29, 28, 27, 26,
-      3, 11, 12, 13, 14, 15,
-      16, 17, 18, 19, 20, 21,
-      22, 23, 24, 25
-  };
-
-  int best_score =
-      std::numeric_limits<int>::min();
-
-  std::string best;
-  int best_reg = -1;
-
-  for (const int reg :
-       priority)
-  {
-    const std::uint32_t address =
-        state->gpr[reg];
-
-    std::string text;
-
-    if (!ReadGuestCString(
-            state,
-            address,
-            &text))
-    {
-      continue;
-    }
-
-    // Do not mistake asset/debug paths for CFont text.
-    if (text.find(".sfn") !=
-            std::string::npos ||
-        text.find(".ssh") !=
-            std::string::npos ||
-        text.find(".dol") !=
-            std::string::npos ||
-        text.find(".elf") !=
-            std::string::npos)
-    {
-      continue;
-    }
-
-    int score =
-        static_cast<int>(
-            std::min<std::size_t>(
-                text.size(),
-                80));
-
-    if (reg >= 4 &&
-        reg <= 10)
-    {
-      score += 100;
-    }
-
-    if (text.size() <= 48)
-      score += 20;
-
-    if (text.find('/') !=
-            std::string::npos ||
-        text.find('\\') !=
-            std::string::npos)
-    {
-      score -= 50;
-    }
-
-    if (score > best_score)
-    {
-      best_score = score;
-      best = std::move(text);
-      best_reg = reg;
-    }
-  }
-
-  if (best_reg < 0)
-    return false;
-
-  *out =
-      std::move(best);
-
-  if (out_reg)
-    *out_reg = best_reg;
-
-  return true;
 }
 
 struct Version {
@@ -846,6 +766,10 @@ DiscoverModSources(const std::vector<std::filesystem::path> &directories,
 }
 
 void ModManager::Unload() {
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
+  loaded_font_roles.clear();
+  cfont_roles.clear();
+#endif
   for (auto it = m_impl->mods.rbegin(); it != m_impl->mods.rend(); ++it) {
     if ((*it) && (*it)->loaded && (*it)->descriptor &&
         (*it)->descriptor->on_unload)
@@ -1151,17 +1075,108 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     return true;
   }
 
+  if (address == 0xFFFFF147u)
+  {
+    MohPcLayer::PublishPS3FontFrame();
+    return true;
+  }
+  // Metadata calls are injected at ELF-verified load/constructor boundaries.
+  if (address == 0xFFFFF143u)
+  {
+    std::string name;
+    if (IsMem1Address(state->gpr[3]))
+    {
+      loaded_font_roles.erase(state->gpr[3]);
+      if (ReadGuestCString(state, state->gpr[0], &name))
+      {
+        auto role = FontAssetRole(name);
+        if (role != FontRole::Generic) loaded_font_roles[state->gpr[3]] = role;
+      }
+    }
+    return true;
+  }
+  if (address == 0xFFFFF144u || address == 0xFFFFF145u)
+  {
+    cfont_roles.erase(state->gpr[3]);
+    if (address == 0xFFFFF144u)
+    {
+      const auto it = loaded_font_roles.find(state->gpr[0]);
+      if (it != loaded_font_roles.end()) cfont_roles[state->gpr[3]] = it->second;
+    }
+    return true;
+  }
+  if (address == 0xFFFFF146u)
+  {
+    std::string name;
+    if (!ReadGuestCString(state, state->gpr[0], &name)) return true;
+    const int index = PS3Compass::NameIndex(name);
+    const u32 file = state->gpr[3];
+    if (index < 0 || !IsMem1Address(file) || file > 0x817FFFE8u ||
+        ReadGuestU32(state, file) != 0x53485047u) return true;
+    const u32 offset = ReadGuestU32(state, file + 20);
+    if (offset < 24 || offset > 0x81800000u - file - 16) return true;
+    const u32 shape = file + offset;
+    const u32 wh = ReadGuestU32(state, shape + 4);
+    const u32 w = wh >> 16, h = wh & 65535;
+    const u32 type = ReadGuestU32(state, shape) >> 24;
+    // SHPG CTexture::Set switch verified against the GMFE69 ELF.
+    const int format = type == 20 ? 4 : type == 22 ? 6 : type == 24 ? 8 : type == 25 ? 9 : type == 30 ? 14 : -1;
+    if (format < 0 || !w || !h || w > 1024 || h > 1024) return true;
+    const auto size = TexDecoder_GetTextureSizeInBytes(w, h, static_cast<TextureFormat>(format));
+    if (size <= 0 || static_cast<u32>(size) > 0x81800000u - shape - 16) return true;
+    std::vector<u8> original(size);
+    for (int i = 0; i < size; ++i)
+      original[i] = static_cast<u8>(state->external_read(state, shape + 16 + i, 1));
+    std::vector<u8> palette;
+    u32 palette_format = 0;
+    if (format == 8 || format == 9)
+    {
+      const u32 poff = ReadGuestU32(state, shape) & 0xFFFFFF;
+      const u32 psize = format == 8 ? 32 : 512;
+      if (poff < 16 || poff > 0x81800000u - shape - 16 - psize) return true;
+      const u32 p = shape + poff;
+      const u32 pt = ReadGuestU32(state, p) >> 24;
+      if (pt < 48 || pt > 50) return true;
+      palette_format = pt - 48;
+      palette.resize(psize);
+      for (u32 i = 0; i < psize; ++i)
+        palette[i] = static_cast<u8>(state->external_read(state, p + 16 + i, 1));
+    }
+    PS3Compass::Register(index, shape + 16, w, h, format, std::move(original),
+                         palette_format, std::move(palette));
+    return true;
+  }
+
   if (address == MOH_HOSTCALL_PS3_FONT_DRAW ||
       address == MOH_HOSTCALL_PS3_FONT_CENTERED)
   {
-    // r0 is a private success return for the injected CFont hook.
+    // r0 carries UI scope in and replacement acceptance out.
+    FontRole role = state->gpr[0] == 4 ? FontRole::Menu : FontRole::Generic;
+    const bool frontend = role == FontRole::Menu;
     state->gpr[0] = 0u;
-
-    if (!MohPcLayer::IsGameplayActive() ||
-        !MohPcLayer::IsPS3FontBridgeReady())
+    const auto font_it = cfont_roles.find(state->gpr[3]);
+    if (font_it != cfont_roles.end())
     {
-      return true;
+      role = font_it->second;
+      if (role == FontRole::Pause && frontend) role = FontRole::Menu;
     }
+    // Caller and bounded ABI backchain identify real draw scopes, including
+    // formatted CFont and nested UIS dispatch. No text-content heuristics.
+    u32 pc = state->lr, sp = state->gpr[1];
+    for (unsigned depth = 0; depth < 12; ++depth)
+    {
+      if (pc >= 0x800BD590u && pc < 0x800BD864u) { role = FontRole::Weapon; break; }
+      if (pc >= 0x800BCE58u && pc < 0x800BD590u) { role = FontRole::HudCounter; break; }
+      if (pc >= 0x800DD7D8u && pc < 0x800DD98Cu) { role = FontRole::Pause; break; }
+      if (pc >= 0x800B9A00u && pc < 0x800BA304u && role == FontRole::Generic)
+        role = FontRole::Popup;
+      if (!IsMem1Address(sp) || (sp & 3) || sp > 0x817FFFF7u) break;
+      const u32 parent = ReadGuestU32(state, sp);
+      if (parent <= sp || !IsMem1Address(parent) || parent > 0x817FFFF7u) break;
+      sp = parent;
+      pc = ReadGuestU32(state, sp + 4);
+    }
+    if (!MohPcLayer::IsPS3FontBridgeReady(role)) return true;
 
     const double x =
         state->fpr[1];
@@ -1178,10 +1193,8 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     std::string text;
     int source_reg = -1;
 
-    if (!FindGuestFontText(
-            state,
-            &text,
-            &source_reg))
+    source_reg = 4;
+    if (!ReadGuestCString(state, state->gpr[4], &text))
     {
       return true;
     }
@@ -1207,13 +1220,19 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
           text.c_str());
     }
 
+    u32 rgba = 0xFFFFFFFF;
+    if (IsMem1Address(state->gpr[3]) && state->gpr[3] < 0x817FFFDCu)
+    {
+      const u32 font_data = ReadGuestU32(state, state->gpr[3] + 32);
+      if (IsMem1Address(font_data) && font_data < 0x817FFFDCu)
+        rgba = ReadGuestU32(state, font_data + 32);
+    }
     const bool ps3_font_accepted =
       MohPcLayer::QueuePS3FontDraw(
         text.c_str(),
-        static_cast<float>(x),
-        static_cast<float>(y),
-        address ==
-            MOH_HOSTCALL_PS3_FONT_CENTERED);
+        address == MOH_HOSTCALL_PS3_FONT_CENTERED ? 320.0f : static_cast<float>(x),
+        address == MOH_HOSTCALL_PS3_FONT_CENTERED ? static_cast<float>(x) : static_cast<float>(y),
+        address == MOH_HOSTCALL_PS3_FONT_CENTERED, role, rgba);
 
     // Tell guest hook to suppress only the old GameCube CFont draw.
     state->gpr[0] =

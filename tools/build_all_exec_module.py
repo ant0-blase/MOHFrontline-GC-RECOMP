@@ -274,6 +274,7 @@ def apply_gmfe69_generated_enhancements(generated: Path):
 """)
 
 
+<<<<<<< HEAD
     # SND stream-reader safety V2.
     #
     # 0x8015E1A4 is a direct byte reader entered with:
@@ -297,12 +298,53 @@ def apply_gmfe69_generated_enhancements(generated: Path):
                 (snd_phys > (0x01800000u - snd_count));
 
             if (snd_bad) {
+=======
+    # MOH Frontline SND getb negative-count safety V4.
+    # A negative byte count makes the original decrement-to--1 loop
+    # effectively unbounded.  Bail before the function executes.
+    _inject_after_label(generated, "8015E1A4", """    {
+        /*
+         * MOH Frontline SND getb negative-count safety V4.
+         *
+         * 0x8015E1A4 is SNDI_getb's entry.  r3 is the byte-stream pointer and
+         * r4 is the signed byte count.  The original routine only treats zero
+         * as empty; a negative/corrupted count underflows its decrement loop
+         * and can walk sequentially through unmapped memory for billions of
+         * iterations.
+         *
+         * This guard executes before the first PPC instruction/prologue.
+         * Negative counts are invalid for a big-endian integer byte reader:
+         * return zero immediately.  Positive counts also get the complete MEM1
+         * span validation from V2.  Count == 0 is left to the original routine.
+         */
+        const s32 snd_v4_count_s = (s32)ctx->gpr[4];
+
+        if (snd_v4_count_s < 0) {
+            ctx->gpr[3] = 0u;
+            ctx->pc = ctx->lr & ~3u;
+            goto return_dispatch_8015AE80;
+        }
+
+        if (snd_v4_count_s > 0) {
+            const u32 snd_v4_stream = ctx->gpr[3];
+            const u32 snd_v4_count = (u32)snd_v4_count_s;
+            const u32 snd_v4_phys = snd_v4_stream & 0x3FFFFFFFu;
+
+            const int snd_v4_bad =
+                (snd_v4_stream == 0u) ||
+                (snd_v4_phys >= 0x01800000u) ||
+                (snd_v4_count > 0x01800000u) ||
+                (snd_v4_phys > (0x01800000u - snd_v4_count));
+
+            if (snd_v4_bad) {
+>>>>>>> a1c6a5a1 (feat: improve PS3 fonts compass and rendering)
                 ctx->gpr[3] = 0u;
                 ctx->pc = ctx->lr & ~3u;
                 goto return_dispatch_8015AE80;
             }
         }
     }
+<<<<<<< HEAD
 ''')
 
 
@@ -344,6 +386,8 @@ def apply_gmfe69_generated_enhancements(generated: Path):
             goto label_8015E798;
         }
     }
+=======
+>>>>>>> a1c6a5a1 (feat: improve PS3 fonts compass and rendering)
 """)
 
     _inject_after_label(generated, "80079E7C", """    if (moh_camera_override(ctx)) {
@@ -473,8 +517,23 @@ def apply_gmfe69_generated_enhancements(generated: Path):
 """)
     _inject_after_label(generated, "8007CDB0", """    moh_hud_centered_text_position_override(ctx);
 """)
-    _inject_after_label(generated, "8007CBB0", """    moh_hud_centered_text_position_override(ctx);
+    _inject_after_label(generated, "8007CD54", """    moh_ps3_formatted_font(ctx);
 """)
+
+    # Publish the complete text frame, including empty loading frames.
+    _inject_after_label(generated, "8001BA5C",
+        "    moh_ps3_metadata(ctx, 0xFFFFF147u, 0u);\n")
+    # ELF-verified TLT return points: r3=file data, r29/r30=original name.
+    for label, reg in (("8001DDC8", 29), ("8001DC98", 30), ("8001DAF4", 30)):
+        _inject_after_label(generated, label,
+            f"    moh_ps3_metadata(ctx, 0xFFFFF143u, ctx->gpr[{reg}]);\n")
+    _inject_after_label(generated, "8007D148",
+        "    moh_ps3_metadata(ctx, 0xFFFFF144u, ctx->gpr[4]);\n")
+    _inject_after_label(generated, "8007D0C0",
+        "    moh_ps3_metadata(ctx, 0xFFFFF145u, 0u);\n")
+    # CSprite constructor: r30 still holds the exact SSH filename, r3 is SHPG.
+    _inject_after_label(generated, "80082700",
+        "    moh_ps3_metadata(ctx, 0xFFFFF146u, ctx->gpr[30]);\n")
 
     # Arm high-rate VI only for actual in-level gameplay.  The shell/menu and
     # LoadTheGame paths must keep original GameCube timing because their state
