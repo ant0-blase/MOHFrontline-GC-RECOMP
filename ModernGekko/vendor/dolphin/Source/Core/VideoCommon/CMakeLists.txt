@@ -129,10 +129,6 @@ add_library(videocommon
   MohPcLayer.h
   PS3RemasterAssets.cpp
   PS3RemasterAssets.h
-  PS3SshDecoder.cpp
-  PS3SshDecoder.h
-  PS3TextureBridge.cpp
-  PS3TextureBridge.h
   OnScreenUIKeyMap.h
   OpcodeDecoding.cpp
   OpcodeDecoding.h

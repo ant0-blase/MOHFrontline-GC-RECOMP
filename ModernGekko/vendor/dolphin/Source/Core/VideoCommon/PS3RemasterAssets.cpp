@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/PS3RemasterAssets.h"
-#include "VideoCommon/PS3TextureBridge.h"
 
 #include <algorithm>
 #include <cctype>
@@ -343,9 +342,6 @@ void Initialize()
 
   BuildIndex();
 
-  // Build host-side visual matching index for PS3 diffuse/UI textures.
-  PS3TextureBridge::Initialize(s.root);
-
   const Stats& st = s.stats;
 
   std::fprintf(
@@ -383,7 +379,6 @@ void Initialize()
 
 void Shutdown()
 {
-  PS3TextureBridge::Shutdown();
   s.enabled = false;
   Reset();
   s.root.clear();

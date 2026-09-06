@@ -51,6 +51,12 @@ struct pixel_shader_uid_data
   u32 rgba6_format : 1;
   u32 dither : 1;
   u32 uint_output : 1;
+
+  // Medal of Honor: Frontline PS3-style renderer.
+  //
+  // This bit is set only for perspective GX draws. Orthographic HUD/menu/
+  // font draws therefore compile/use the untouched GameCube shader.
+  u32 moh_ps3_renderer : 1;
   u32 blend_enable : 1;                       // Only used with shader_framebuffer_fetch blend
   SrcBlendFactor blend_src_factor : 3;        // Only used with shader_framebuffer_fetch blend
   SrcBlendFactor blend_src_factor_alpha : 3;  // Only used with shader_framebuffer_fetch blend

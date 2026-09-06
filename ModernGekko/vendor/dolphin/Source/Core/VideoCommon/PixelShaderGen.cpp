@@ -3,6 +3,9 @@
 
 #include "VideoCommon/PixelShaderGen.h"
 
+#include <cstdlib>
+#include <string_view>
+
 #include "Common/Assert.h"
 #include "Common/CommonTypes.h"
 #include "Common/EnumMap.h"
@@ -15,6 +18,26 @@
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/XFMemory.h"  // for texture projection mode
+
+namespace
+{
+bool IsMohPs3EngineRendererActive()
+{
+  const char* value =
+      std::getenv("MOH_PS3_RENDERER_ACTIVE");
+
+  if (!value || !*value)
+    return false;
+
+  const std::string_view v(value);
+
+  return
+      v != "0" &&
+      v != "false" &&
+      v != "off" &&
+      v != "no";
+}
+}  // namespace
 
 // TODO: Get rid of these
 enum : u32
@@ -178,6 +201,15 @@ PixelShaderUid GetPixelShaderUid()
       bpmem.zcontrol.pixel_format == PixelFormat::RGBA6_Z24 && !g_ActiveConfig.bForceTrueColor;
   uid_data->dither = bpmem.blendmode.dither && uid_data->rgba6_format;
   uid_data->uint_output = bpmem.blendmode.UseLogicOp();
+
+  // Frontline HUD, menus and fonts are predominantly orthographic GX draws.
+  // The actual game world is perspective. Make that distinction part of the
+  // shader UID so the remaster renderer literally does not exist in 2D
+  // shaders.
+  uid_data->moh_ps3_renderer =
+      IsMohPs3EngineRendererActive() &&
+      g_ActiveConfig.bEnablePixelLighting &&
+      xfmem.projection.type == ProjectionType::Perspective;
 
   u32 numStages = uid_data->genMode_numtevstages + 1;
 
@@ -993,6 +1025,181 @@ ShaderCode GeneratePixelShaderCode(APIType api_type, const ShaderHostConfig& hos
 
   out.Write("\tDolphinFragmentOutput frag_output;\n");
   out.Write("\tprocess_fragment(frag_input, frag_output);\n");
+
+  if (uid_data->moh_ps3_renderer)
+  {
+    // Frontline HD / PS3 renderer concepts recovered from the executable
+    // include:
+    //
+    //   g_NormalTexture
+    //   g_DetailTexture
+    //   g_vLightDirWorld
+    //   g_vLightPosition
+    //   g_vLightColor
+    //   g_vSpecularLightMultiplier
+    //   g_vCameraPos
+    //
+    // We do not consume RSX resources here. Instead we reimplement the
+    // corresponding material response using the real GX geometry normal,
+    // position and the already emulated material/TEV result.
+    out.Write(R"MOHPS3(
+	// ------------------------------------------------------------
+	// Medal of Honor: Frontline - PS3-style 3D material renderer
+	// ------------------------------------------------------------
+
+	float3 moh_base =
+	    clamp(
+	        float3(frag_output.main.rgb) / 255.0,
+	        float3(0.0, 0.0, 0.0),
+	        float3(1.0, 1.0, 1.0));
+
+	float moh_n_len2 =
+	    dot(frag_input.normal, frag_input.normal);
+
+	float3 moh_n =
+	    moh_n_len2 > 0.00001 ?
+	        normalize(frag_input.normal) :
+	        float3(0.0, 0.0, 1.0);
+
+	float moh_p_len2 =
+	    dot(frag_input.position, frag_input.position);
+
+	float3 moh_v =
+	    moh_p_len2 > 0.00001 ?
+	        normalize(-frag_input.position) :
+	        float3(0.0, 0.0, 1.0);
+
+	// Presentation/key light.
+	//
+	// The original GX lighting has already been evaluated by Dolphin's
+	// per-pixel lighting path. This is a restrained additional material
+	// response representing the stronger PS3 remaster directional light.
+	float3 moh_key_dir =
+	    normalize(float3(-0.38, 0.46, 0.80));
+
+	float moh_ndotl =
+	    dot(moh_n, moh_key_dir);
+
+	// Wrapped diffuse gives faces/geometry a softer modern falloff without
+	// flattening the original baked/vertex lighting.
+	float moh_wrap =
+	    clamp(
+	        (moh_ndotl + 0.24) / 1.24,
+	        0.0,
+	        1.0);
+
+	// View-dependent half-vector highlight.
+	float3 moh_half =
+	    normalize(moh_key_dir + moh_v);
+
+	float moh_ndoth =
+	    max(
+	        dot(moh_n, moh_half),
+	        0.0);
+
+	float moh_luma =
+	    dot(
+	        moh_base,
+	        float3(0.2126, 0.7152, 0.0722));
+
+	float moh_max_c =
+	    max(
+	        max(moh_base.r, moh_base.g),
+	        moh_base.b);
+
+	float moh_min_c =
+	    min(
+	        min(moh_base.r, moh_base.g),
+	        moh_base.b);
+
+	float moh_chroma =
+	    moh_max_c - moh_min_c;
+
+	// Approximation of the remaster's material-dependent
+	// g_vSpecularLightMultiplier.
+	//
+	// Bright, relatively neutral surfaces receive more specular response;
+	// heavily saturated diffuse art receives less, avoiding a plastic look.
+	float moh_spec_material =
+	    clamp(
+	        0.12 +
+	        moh_luma * 0.52 -
+	        moh_chroma * 0.18,
+	        0.07,
+	        0.60);
+
+	float moh_specular =
+	    pow(
+	        moh_ndoth,
+	        30.0) *
+	    moh_spec_material;
+
+	// Fresnel/rim response gives silhouettes and weapons a little more
+	// separation, similar to the higher-frequency PS3 material lighting.
+	float moh_ndotv =
+	    max(
+	        dot(moh_n, moh_v),
+	        0.0);
+
+	float moh_fresnel =
+	    pow(
+	        1.0 - moh_ndotv,
+	        3.0);
+
+	// Very subtle hemispherical fill.
+	float moh_hemi =
+	    clamp(
+	        moh_n.y * 0.5 + 0.5,
+	        0.0,
+	        1.0);
+
+	float3 moh_ambient_tint =
+	    lerp(
+	        float3(0.965, 0.980, 1.020),
+	        float3(1.025, 1.012, 0.985),
+	        moh_hemi);
+
+	float3 moh_result =
+	    moh_base *
+	    (0.955 + 0.105 * moh_wrap) *
+	    moh_ambient_tint;
+
+	// Slightly warm specular highlight, matching Frontline HD's presentation
+	// better than a pure white highlight.
+	moh_result +=
+	    float3(1.000, 0.955, 0.875) *
+	    moh_specular *
+	    0.26;
+
+	moh_result +=
+	    moh_base *
+	    moh_fresnel *
+	    0.055;
+
+	// Preserve a little high-frequency material separation after the
+	// additional diffuse response.
+	float3 moh_centered =
+	    moh_base -
+	    float3(moh_luma, moh_luma, moh_luma);
+
+	moh_result +=
+	    moh_centered *
+	    0.035;
+
+	moh_result =
+	    clamp(
+	        moh_result,
+	        float3(0.0, 0.0, 0.0),
+	        float3(1.0, 1.0, 1.0));
+
+	frag_output.main.rgb =
+	    clamp(
+	        iround(moh_result * 255.0),
+	        int3(0, 0, 0),
+	        int3(255, 255, 255));
+)MOHPS3");
+  }
+
   out.Write("\tivec4 prev = frag_output.main & 255;\n");
 
   // NOTE: Fragment may not be discarded if alpha test always fails and early depth test is enabled

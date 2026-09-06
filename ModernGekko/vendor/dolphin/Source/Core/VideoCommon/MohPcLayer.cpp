@@ -472,12 +472,44 @@ void UpdateEnhancedPostProcess()
                         s.gfx_dof_strength.load() * s.ads_blend.load() :
                         s.gfx_dof_strength.load();
   SetPostOptionFloat(config, "DOF_STRENGTH", dof);
-  SetPostOptionBool(config, "LIGHTING_ENABLE", s.gfx_enhanced_lighting.load());
-  SetPostOptionFloat(config, "LIGHTING_STRENGTH", s.gfx_lighting_strength.load());
-  SetPostOptionBool(config, "SSAO_ENABLE", s.gfx_ssao.load());
-  SetPostOptionFloat(config, "SSAO_STRENGTH", s.gfx_ssao_strength.load());
-  SetPostOptionBool(config, "CONTACT_SHADOW_ENABLE", s.gfx_contact_shadows.load());
-  SetPostOptionFloat(config, "CONTACT_SHADOW_STRENGTH", s.gfx_contact_shadow_strength.load());
+  // Lighting/material response is now calculated on actual 3D geometry.
+  // Do not run the old screen-space approximations over HUD/fonts when the
+  // PS3 engine renderer is active.
+  const bool ps3_engine_materials =
+      EnvTrue("MOH_PS3_RENDERER_ACTIVE", false);
+
+  SetPostOptionBool(
+      config,
+      "LIGHTING_ENABLE",
+      s.gfx_enhanced_lighting.load() &&
+          !ps3_engine_materials);
+
+  SetPostOptionFloat(
+      config,
+      "LIGHTING_STRENGTH",
+      s.gfx_lighting_strength.load());
+
+  SetPostOptionBool(
+      config,
+      "SSAO_ENABLE",
+      s.gfx_ssao.load() &&
+          !ps3_engine_materials);
+
+  SetPostOptionFloat(
+      config,
+      "SSAO_STRENGTH",
+      s.gfx_ssao_strength.load());
+
+  SetPostOptionBool(
+      config,
+      "CONTACT_SHADOW_ENABLE",
+      s.gfx_contact_shadows.load() &&
+          !ps3_engine_materials);
+
+  SetPostOptionFloat(
+      config,
+      "CONTACT_SHADOW_STRENGTH",
+      s.gfx_contact_shadow_strength.load());
   SetPostOptionBool(config, "VIGNETTE_ENABLE", s.gfx_vignette.load());
   SetPostOptionFloat(config, "VIGNETTE_STRENGTH", s.gfx_vignette_strength.load());
   SetPostOptionBool(config, "FILM_GRAIN_ENABLE", s.gfx_film_grain.load());
@@ -1069,6 +1101,12 @@ void Initialize()
   if (s.initialized.exchange(true))
     return;
 
+  // The old experimental visual-similarity bridge could map dynamic
+  // framebuffer textures to unrelated PS3 UI assets. Keep it OFF unless
+  // explicitly requested for debugging.
+  if (!EnvTrue("MOH_PS3_EXPERIMENTAL_FUZZY_TEXTURES", false))
+    SetEnv("MOH_PS3_AUTO_TEXTURES", "0");
+
   PS3RemasterAssets::Initialize();
   s.requested_fps = -1;
   s.original_post_shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
@@ -1103,6 +1141,41 @@ void ApplyDolphinSettings()
   Config::SetBase(Config::GFX_ENHANCE_FORCE_TEXTURE_FILTERING, TextureMode(s.texture_filter.load()));
   Config::SetBase(Config::GFX_ENHANCE_FORCE_TRUE_COLOR, s.true_color.load());
   Config::SetBase(Config::GFX_ENHANCE_DISABLE_COPY_FILTER, s.disable_copy_filter.load());
+
+  // Engine-side PS3-style renderer.
+  //
+  // This enables Dolphin's real per-pixel GX lighting so PixelShaderGen has
+  // interpolated geometry normals and positions available. The shader itself
+  // is compiled only for perspective draws.
+  const bool ps3_engine_renderer =
+      s.enhanced_graphics.load() &&
+      EnvTrue("MOH_PS3_RENDERER", true);
+
+  Config::SetBase(
+      Config::GFX_ENABLE_PIXEL_LIGHTING,
+      ps3_engine_renderer);
+
+  SetEnv(
+      "MOH_PS3_RENDERER_ACTIVE",
+      ps3_engine_renderer ? "1" : "0");
+
+  static int last_ps3_renderer_state = -1;
+
+  const int current_ps3_renderer_state =
+      ps3_engine_renderer ? 1 : 0;
+
+  if (last_ps3_renderer_state !=
+      current_ps3_renderer_state)
+  {
+    last_ps3_renderer_state =
+        current_ps3_renderer_state;
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3] engine renderer %s: "
+        "per-pixel GX lighting + 3D-only PS3 material response\n",
+        ps3_engine_renderer ? "ON" : "OFF");
+  }
   Config::SetBase(Config::MAIN_AUDIO_BUFFER_SIZE, s.audio_buffer_ms.load());
   Config::SetBase(Config::MAIN_AUDIO_FILL_GAPS, s.fill_audio_gaps.load());
   Config::SetBase(Config::MAIN_AUDIO_PRESERVE_PITCH, s.preserve_audio_pitch.load());
