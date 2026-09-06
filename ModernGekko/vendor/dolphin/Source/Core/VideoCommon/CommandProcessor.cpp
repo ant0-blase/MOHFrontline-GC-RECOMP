@@ -421,6 +421,20 @@ void CommandProcessorManager::GatherPipeBursted()
 
   m_system.GetFifo().RunGpu();
 
+  // The static-recompiled CPU can fill the ring before its next timing check,
+  // even when watermark interrupts are disabled. Waking the GPU alone does
+  // not apply backpressure. Drain at the capacity limit, leaving the final
+  // 32-byte slot free before UpdateGatherPipe copies another burst to RAM.
+  // Use the published distance so a concurrent GPU read can only cause an
+  // unnecessary wait, never hide a full FIFO.
+  const u32 fifo_capacity = m_fifo.CPEnd.load(std::memory_order_relaxed) -
+                           m_fifo.CPBase.load(std::memory_order_relaxed);
+  if (distance_after_burst >= fifo_capacity && m_cp_ctrl_reg.GPReadEnable &&
+      IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
+  {
+    m_system.GetFifo().FlushGpu();
+  }
+
   ASSERT_MSG(COMMANDPROCESSOR,
              m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) <=
                  m_fifo.CPEnd.load(std::memory_order_relaxed) -
