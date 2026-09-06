@@ -83,11 +83,9 @@ void SetCurrentWeaponType(int type);
 int GetCurrentWeaponType();
 
 // Native PS3 SFNH/CFont renderer.
-enum class PS3FontRole : u8 { HudCounter, Weapon, Objective, Subtitle, Menu, Pause, Popup, Intro, Generic };
-bool IsPS3FontBridgeReady(PS3FontRole role = PS3FontRole::Generic);
-bool QueuePS3FontDraw(const char* text, float x, float y, bool centered, PS3FontRole role, u32 rgba = 0xFFFFFFFF);
+bool IsPS3FontBridgeReady();
+bool QueuePS3FontDraw(const char* text, float x, float y, bool centered);
 void DrawPS3FontUI(float backbuffer_scale);
-void PublishPS3FontFrame();
 
 void DrawCrosshair(float backbuffer_scale);
 void DrawSettingsUI(float backbuffer_scale);
