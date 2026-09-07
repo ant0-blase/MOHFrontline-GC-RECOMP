@@ -886,6 +886,21 @@ std::unordered_map<
     strict_level_matches;
 std::unordered_set<u64> strict_level_rejected;
 
+struct SkyGCProbe
+{
+  u64 key = 0;
+  Auto3DFingerprint fingerprint;
+};
+
+std::vector<SkyGCProbe> sky_gc_probes;
+
+std::unordered_map<
+    u64,
+    std::string>
+    sky_exact_assignments;
+
+bool sky_assignment_logged = false;
+
 bool StrictLevelTexturesEnabled()
 {
   const char* value = std::getenv("MOH_PS3_STRICT_LEVEL_TEXTURES");
@@ -893,6 +908,21 @@ bool StrictLevelTexturesEnabled()
     return true;
   const std::string lower = Lower(std::string(value));
   return lower != "0" && lower != "false" && lower != "off" && lower != "no";
+}
+
+bool SkyTexturesEnabled()
+{
+  const char* value = std::getenv("MOH_PS3_SKY");
+
+  if (!value || !*value)
+    return true;
+
+  const std::string lower = Lower(std::string(value));
+
+  return lower != "0" &&
+         lower != "false" &&
+         lower != "off" &&
+         lower != "no";
 }
 
 bool Auto3DEnabled()
@@ -1290,6 +1320,641 @@ bool IsLikelyCubeFaceCandidate(
   return false;
 }
 
+std::string CurrentLevelIdFromScope(
+    std::string_view scope)
+{
+  std::string level =
+      Normalize(std::string(scope));
+
+  while (!level.empty() &&
+         level.back() == '/')
+  {
+    level.pop_back();
+  }
+
+  const auto slash =
+      level.find_last_of('/');
+
+  if (slash != std::string::npos)
+    level.erase(0, slash + 1);
+
+  return level;
+}
+
+bool IsExactCurrentLevelSkyFacePath(
+    std::string_view relative,
+    std::string_view scope)
+{
+  if (!SkyTexturesEnabled() ||
+      scope.empty())
+  {
+    return false;
+  }
+
+  std::string normalized_scope =
+      Normalize(std::string(scope));
+
+  if (!normalized_scope.ends_with('/'))
+    normalized_scope.push_back('/');
+
+  const std::string path =
+      Normalize(std::string(relative));
+
+  // Sky faces in the PS3 remaster are standalone files:
+  // data/2/2_1/2_1_fr.ssh, ... not level.viv:: entries.
+  if (!path.starts_with(normalized_scope) ||
+      path.find("::") != std::string::npos)
+  {
+    return false;
+  }
+
+  const std::string level =
+      CurrentLevelIdFromScope(
+          normalized_scope);
+
+  if (level.empty())
+    return false;
+
+  const std::string file =
+      Filename(path);
+
+  static constexpr std::string_view faces[] = {
+      "fr", "bk", "lf", "rt", "up", "dn",
+  };
+
+  for (const auto face : faces)
+  {
+    if (file ==
+        level + "_" +
+            std::string(face) +
+            ".ssh")
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+bool UpdateDeterministicSkyAssignmentLocked(
+    u64 key,
+    const Auto3DFingerprint& fingerprint,
+    u32 width,
+    u32 height,
+    std::string* assigned_path,
+    bool* potential_sky)
+{
+  if (assigned_path)
+    assigned_path->clear();
+
+  if (potential_sky)
+    *potential_sky = false;
+
+  if (!SkyTexturesEnabled() ||
+      auto3d_level_scope.empty() ||
+      width != 128 ||
+      height != 128)
+  {
+    return false;
+  }
+
+  /*
+   * v13.9.2
+   *
+   * The PS3 remaster has six canonical cube faces:
+   *
+   *   FR BK LF RT UP DN
+   *
+   * Do NOT require auto3d_candidates.size() to contain exactly six
+   * decoded sky entries. Asset aliases and unsupported SSH variants
+   * can make the decoded set smaller/larger.
+   *
+   * Deduplicate by canonical face identity and solve using whatever
+   * usable subset exists.
+   */
+
+  static constexpr
+      std::array<std::string_view, 6>
+      face_suffixes = {
+          "fr",
+          "bk",
+          "lf",
+          "rt",
+          "up",
+          "dn",
+      };
+
+  std::array<
+      const Auto3DCandidate*,
+      6>
+      face_slots = {
+          nullptr,
+          nullptr,
+          nullptr,
+          nullptr,
+          nullptr,
+          nullptr,
+      };
+
+  const std::string level =
+      CurrentLevelIdFromScope(
+          auto3d_level_scope);
+
+  for (const auto& candidate :
+       auto3d_candidates)
+  {
+    if (!IsExactCurrentLevelSkyFacePath(
+            candidate.relative_path,
+            auto3d_level_scope))
+    {
+      continue;
+    }
+
+    const std::string file =
+        Filename(
+            candidate.relative_path);
+
+    for (std::size_t slot = 0;
+         slot < face_suffixes.size();
+         ++slot)
+    {
+      const std::string expected =
+          level +
+          "_" +
+          std::string(
+              face_suffixes[slot]) +
+          ".ssh";
+
+      if (file != expected)
+        continue;
+
+      const Auto3DCandidate* old =
+          face_slots[slot];
+
+      if (!old ||
+          static_cast<u64>(
+              candidate.width) *
+                  candidate.height >
+              static_cast<u64>(
+                  old->width) *
+                  old->height ||
+          (candidate.width ==
+               old->width &&
+           candidate.height ==
+               old->height &&
+           candidate.relative_path <
+               old->relative_path))
+      {
+        face_slots[slot] =
+            &candidate;
+      }
+
+      break;
+    }
+  }
+
+
+  std::vector<
+      const Auto3DCandidate*>
+      faces;
+
+  std::vector<std::size_t>
+      canonical_slots;
+
+  for (std::size_t slot = 0;
+       slot < face_slots.size();
+       ++slot)
+  {
+    if (!face_slots[slot])
+      continue;
+
+    faces.push_back(
+        face_slots[slot]);
+
+    canonical_slots.push_back(
+        slot);
+  }
+
+
+  static unsigned inventory_logs = 0;
+
+  if (inventory_logs++ < 16)
+  {
+    std::fprintf(
+        stderr,
+        "[moh-ps3-sky] FACE INVENTORY: "
+        "scope=%s decoded=%zu/6 "
+        "FR=%s BK=%s LF=%s RT=%s UP=%s DN=%s\n",
+        auto3d_level_scope.c_str(),
+        faces.size(),
+        face_slots[0] ? "yes" : "NO",
+        face_slots[1] ? "yes" : "NO",
+        face_slots[2] ? "yes" : "NO",
+        face_slots[3] ? "yes" : "NO",
+        face_slots[4] ? "yes" : "NO",
+        face_slots[5] ? "yes" : "NO");
+  }
+
+
+  /*
+   * Require four decoded PS3 faces minimum.
+   *
+   * This avoids accidentally assigning two random 128x128 world
+   * textures if only one/two malformed SSH files entered the index.
+   */
+  if (faces.size() < 4)
+    return false;
+
+
+  float nearest =
+      std::numeric_limits<float>
+          ::infinity();
+
+  for (const auto* face :
+       faces)
+  {
+    nearest =
+        std::min(
+            nearest,
+            Auto3DDistance(
+                fingerprint,
+                face->fingerprint));
+  }
+
+
+  if (potential_sky)
+  {
+    *potential_sky =
+        std::isfinite(nearest) &&
+        nearest <= 0.75f;
+  }
+
+
+  bool known = false;
+
+  for (auto& probe :
+       sky_gc_probes)
+  {
+    if (probe.key == key)
+    {
+      probe.fingerprint =
+          fingerprint;
+
+      known = true;
+
+      break;
+    }
+  }
+
+
+  if (!known &&
+      sky_gc_probes.size() < 96)
+  {
+    SkyGCProbe probe;
+
+    probe.key =
+        key;
+
+    probe.fingerprint =
+        fingerprint;
+
+    sky_gc_probes.push_back(
+        std::move(probe));
+  }
+
+
+  const std::size_t face_count =
+      faces.size();
+
+  /*
+   * Do not freeze an assignment immediately on the first four uploads.
+   * Collect enough anonymous GC textures for the global assignment to
+   * choose the real sky faces instead of nearby world/HUD textures.
+   */
+  const std::size_t minimum_probes =
+      std::max<std::size_t>(
+          face_count,
+          12);
+
+  if (sky_gc_probes.size() <
+      minimum_probes)
+  {
+    return false;
+  }
+
+
+  struct AssignmentState
+  {
+    float cost =
+        std::numeric_limits<float>
+            ::infinity();
+
+    std::array<int, 6>
+        probe_for_face = {
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+        };
+  };
+
+
+  std::array<
+      AssignmentState,
+      64>
+      dp;
+
+  dp[0].cost =
+      0.0f;
+
+
+  const unsigned full_mask =
+      (1u <<
+       static_cast<unsigned>(
+           face_count)) -
+      1u;
+
+
+  for (std::size_t probe_index = 0;
+       probe_index <
+           sky_gc_probes.size();
+       ++probe_index)
+  {
+    auto next =
+        dp;
+
+    for (unsigned mask = 0;
+         mask <= full_mask;
+         ++mask)
+    {
+      if (!std::isfinite(
+              dp[mask].cost))
+      {
+        continue;
+      }
+
+      for (std::size_t face_index = 0;
+           face_index <
+               face_count;
+           ++face_index)
+      {
+        const unsigned bit =
+            1u <<
+            static_cast<unsigned>(
+                face_index);
+
+        if (mask & bit)
+          continue;
+
+        const float score =
+            Auto3DDistance(
+                sky_gc_probes[
+                    probe_index]
+                    .fingerprint,
+                faces[
+                    face_index]
+                    ->fingerprint);
+
+        if (!std::isfinite(score) ||
+            score > 1.10f)
+        {
+          continue;
+        }
+
+        const unsigned new_mask =
+            mask | bit;
+
+        const float new_cost =
+            dp[mask].cost +
+            score;
+
+        if (new_cost >=
+            next[new_mask].cost)
+        {
+          continue;
+        }
+
+        next[new_mask] =
+            dp[mask];
+
+        next[new_mask].cost =
+            new_cost;
+
+        next[new_mask]
+            .probe_for_face[
+                face_index] =
+            static_cast<int>(
+                probe_index);
+      }
+    }
+
+    dp =
+        std::move(next);
+  }
+
+
+  const AssignmentState&
+      solution =
+          dp[full_mask];
+
+
+  if (!std::isfinite(
+          solution.cost))
+  {
+    return false;
+  }
+
+
+  float max_edge =
+      0.0f;
+
+  unsigned strong_edges =
+      0;
+
+
+  for (std::size_t face_index = 0;
+       face_index <
+           face_count;
+       ++face_index)
+  {
+    const int probe_index =
+        solution
+            .probe_for_face[
+                face_index];
+
+    if (probe_index < 0)
+      return false;
+
+    const std::size_t probe =
+        static_cast<std::size_t>(
+            probe_index);
+
+    if (probe >=
+        sky_gc_probes.size())
+    {
+      return false;
+    }
+
+    const float score =
+        Auto3DDistance(
+            sky_gc_probes[
+                probe]
+                .fingerprint,
+            faces[
+                face_index]
+                ->fingerprint);
+
+    max_edge =
+        std::max(
+            max_edge,
+            score);
+
+    if (score <= 0.72f)
+    {
+      ++strong_edges;
+    }
+  }
+
+
+  const float average =
+      solution.cost /
+      static_cast<float>(
+          face_count);
+
+
+  const unsigned strong_needed =
+      std::max(
+          3u,
+          static_cast<unsigned>(
+              (face_count * 2u + 2u) /
+              3u));
+
+
+  if (average > 0.70f ||
+      max_edge > 1.10f ||
+      strong_edges <
+          strong_needed)
+  {
+    return false;
+  }
+
+
+  /*
+   * Once solved, install an exact GC texture hash -> PS3 face map.
+   */
+  sky_exact_assignments.clear();
+
+
+  for (std::size_t face_index = 0;
+       face_index <
+           face_count;
+       ++face_index)
+  {
+    const std::size_t probe =
+        static_cast<std::size_t>(
+            solution
+                .probe_for_face[
+                    face_index]);
+
+    sky_exact_assignments[
+        sky_gc_probes[
+            probe].key] =
+        faces[
+            face_index]
+            ->relative_path;
+  }
+
+
+  if (!sky_assignment_logged)
+  {
+    sky_assignment_logged =
+        true;
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3-sky] PARTIAL-6FACE ASSIGNMENT READY: "
+        "scope=%s ps3=%zu/6 probes=%zu "
+        "avg=%.3f max=%.3f strong=%u/%u\n",
+        auto3d_level_scope.c_str(),
+        face_count,
+        sky_gc_probes.size(),
+        average,
+        max_edge,
+        strong_edges,
+        strong_needed);
+
+
+    for (std::size_t face_index = 0;
+         face_index <
+             face_count;
+         ++face_index)
+    {
+      const std::size_t probe =
+          static_cast<std::size_t>(
+              solution
+                  .probe_for_face[
+                      face_index]);
+
+      const float score =
+          Auto3DDistance(
+              sky_gc_probes[
+                  probe]
+                  .fingerprint,
+              faces[
+                  face_index]
+                  ->fingerprint);
+
+      const std::size_t slot =
+          canonical_slots[
+              face_index];
+
+      std::fprintf(
+          stderr,
+          "[moh-ps3-sky]   %s "
+          "GC=%016llX -> %s score=%.3f\n",
+          std::string(
+              face_suffixes[
+                  slot])
+              .c_str(),
+          static_cast<
+              unsigned long long>(
+              sky_gc_probes[
+                  probe].key),
+          faces[
+              face_index]
+              ->relative_path
+              .c_str(),
+          score);
+    }
+  }
+
+
+  if (!assigned_path)
+    return false;
+
+
+  const auto it =
+      sky_exact_assignments.find(
+          key);
+
+
+  if (it ==
+      sky_exact_assignments.end())
+  {
+    return false;
+  }
+
+
+  *assigned_path =
+      it->second;
+
+  return true;
+}
+
+
 bool IsPowerOfTwoLikeScale(float scale)
 {
   if (!std::isfinite(scale) ||
@@ -1340,13 +2005,28 @@ bool Auto3DPathAllowed(
     return false;
 
   if (!scope.empty() &&
-      path.starts_with(scope) &&
-      (path.find("level.viv::") != std::string::npos ||
-       path.find("comp.viv::") != std::string::npos))
+      path.starts_with(scope))
   {
-    return true;
+    // IMPORTANT v13.9:
+    // PS3 sky faces are direct level files, not entries in level.viv.
+    if (IsExactCurrentLevelSkyFacePath(
+            path,
+            scope))
+    {
+      return true;
+    }
+
+    if (path.find("level.viv::") !=
+            std::string::npos ||
+        path.find("comp.viv::") !=
+            std::string::npos)
+    {
+      return true;
+    }
   }
 
+  // Kept exclusively for MOH_PS3_AUTO_3D_FUZZY diagnostics.
+  // Strict matching below never consumes global weapon candidates.
   if (path.find("/weapons/") != std::string::npos ||
       path.find("weapons.viv::") != std::string::npos ||
       path.find("weapon.viv::") != std::string::npos)
@@ -1504,127 +2184,380 @@ FindStrictCurrentLevelTexture(const TextureInfo& info)
   if (!StrictLevelTexturesEnabled() ||
       !MohPcLayer::IsPS3TextureReplacementEnabled() ||
       !PS3RemasterAssets::IsReady() ||
-      !info.IsDataValid() || info.IsFromTmem() ||
+      !info.IsDataValid() ||
+      info.IsFromTmem() ||
       info.GetTextureFormat() == TextureFormat::XFB ||
-      !info.GetData() || !info.GetTextureSize())
-    return nullptr;
-
-  const u32 width = info.GetRawWidth();
-  const u32 height = info.GetRawHeight();
-  if (width < 32 || height < 16 || width > 2048 || height > 2048)
-    return nullptr;
-
-  const u64 key = Auto3DKey(info);
+      !info.GetData() ||
+      !info.GetTextureSize())
   {
-    std::scoped_lock lock(auto3d_mutex);
-    if (auto3d_level_scope.empty())
+    return nullptr;
+  }
+
+  const u32 width =
+      info.GetRawWidth();
+
+  const u32 height =
+      info.GetRawHeight();
+
+  if (width < 32 ||
+      height < 16 ||
+      width > 2048 ||
+      height > 2048)
+  {
+    return nullptr;
+  }
+
+  const u64 key =
+      Auto3DKey(info);
+
+  std::string scope;
+
+  {
+    std::scoped_lock lock(
+        auto3d_mutex);
+
+    scope =
+        auto3d_level_scope;
+
+    if (scope.empty())
       return nullptr;
-    if (const auto it = strict_level_matches.find(key); it != strict_level_matches.end())
+
+    if (const auto it =
+            strict_level_matches.find(key);
+        it != strict_level_matches.end())
+    {
       return it->second;
+    }
+
     if (strict_level_rejected.contains(key))
       return nullptr;
+
     BuildAuto3DCandidatesLocked();
   }
 
-  std::vector<u8> gc_rgba(std::size_t(width) * height * 4u);
-  TexDecoder_Decode(gc_rgba.data(), info.GetData(), static_cast<int>(width),
-                    static_cast<int>(height), info.GetTextureFormat(),
-                    info.GetTlutAddress(), info.GetTlutFormat());
+  std::vector<u8> gc_rgba(
+      std::size_t(width) *
+      height *
+      4u);
 
-  const Auto3DFingerprint gc = MakeAuto3DFingerprint(gc_rgba.data(), width, height);
+  TexDecoder_Decode(
+      gc_rgba.data(),
+      info.GetData(),
+      static_cast<int>(width),
+      static_cast<int>(height),
+      info.GetTextureFormat(),
+      info.GetTlutAddress(),
+      info.GetTlutFormat());
+
+  const Auto3DFingerprint gc =
+      MakeAuto3DFingerprint(
+          gc_rgba.data(),
+          width,
+          height);
+
   if (gc.contrast < 0.018f)
     return nullptr;
 
-  const float gc_aspect = static_cast<float>(width) / static_cast<float>(height);
+  // v13.9.1:
+  // Do NOT compare each anonymous texture independently to the cube-map.
+  // Collect the 128x128 GameCube candidates and solve the six cube faces as
+  // one one-to-one assignment.
+  std::string assigned_sky_path;
+  bool potential_sky = false;
+
+  {
+    std::scoped_lock lock(
+        auto3d_mutex);
+
+    (void)
+        UpdateDeterministicSkyAssignmentLocked(
+            key,
+            gc,
+            width,
+            height,
+            &assigned_sky_path,
+            &potential_sky);
+  }
+
+  if (!assigned_sky_path.empty())
+  {
+    auto decoded =
+        DecodeAuto3DWinner(
+            assigned_sky_path);
+
+    if (decoded)
+    {
+      {
+        std::scoped_lock lock(
+            auto3d_mutex);
+
+        strict_level_matches[
+            key] = decoded;
+      }
+
+      static unsigned sky_match_logs = 0;
+
+      if (sky_match_logs++ < 48)
+      {
+        std::fprintf(
+            stderr,
+            "[moh-ps3-sky] PS3 FACE ACTIVE v13.9.2: "
+            "GC=%ux%u fmt=%u hash=%016llX -> %s\n",
+            width,
+            height,
+            static_cast<unsigned>(
+                info.GetTextureFormat()),
+            static_cast<unsigned long long>(
+                key),
+            assigned_sky_path.c_str());
+      }
+
+      return decoded;
+    }
+  }
+
+  // A plausible cube face must remain untouched until the global six-face
+  // assignment is ready. Most importantly, do not let the old level matcher
+  // misclassify it as an ordinary SSH material.
+  if (potential_sky)
+    return nullptr;
+
+  const float gc_aspect =
+      static_cast<float>(width) /
+      static_cast<float>(height);
+
   struct Winner
   {
     std::string path;
-    float best = std::numeric_limits<float>::infinity();
-    float second = std::numeric_limits<float>::infinity();
+    float best =
+        std::numeric_limits<float>::infinity();
+    float second =
+        std::numeric_limits<float>::infinity();
   };
+
   Winner sky;
   Winner level;
 
   {
-    std::scoped_lock lock(auto3d_mutex);
-    for (const auto& candidate : auto3d_candidates)
-    {
-      // Strict level fallback is level-local only. Global weapon/character
-      // materials belong to the exact TPK/RSX path below.
-      if (!candidate.relative_path.starts_with(auto3d_level_scope) ||
-          (candidate.relative_path.find("level.viv::") == std::string::npos &&
-           candidate.relative_path.find("comp.viv::") == std::string::npos))
-        continue;
+    std::scoped_lock lock(
+        auto3d_mutex);
 
-      const float candidate_aspect = static_cast<float>(candidate.width) / candidate.height;
-      const float aspect_error = std::abs(std::log(std::max(gc_aspect, 0.0001f) /
-                                                   std::max(candidate_aspect, 0.0001f)));
+    for (const auto& candidate :
+         auto3d_candidates)
+    {
+      const bool exact_sky =
+          IsExactCurrentLevelSkyFacePath(
+              candidate.relative_path,
+              scope);
+
+      const bool current_archive =
+          candidate.relative_path.starts_with(scope) &&
+          (candidate.relative_path.find(
+               "level.viv::") !=
+               std::string::npos ||
+           candidate.relative_path.find(
+               "comp.viv::") !=
+               std::string::npos);
+
+      // This deliberately rejects global weapon/material candidates.
+      if (!exact_sky &&
+          !current_archive)
+      {
+        continue;
+      }
+
+      // Cube faces observed in Frontline are square and reasonably large.
+      // This stops ordinary 32/64 px material textures selecting a sky face.
+      if (exact_sky &&
+          (width < 128 ||
+           height < 128 ||
+           gc_aspect < 0.90f ||
+           gc_aspect > 1.10f))
+      {
+        continue;
+      }
+
+      const float candidate_aspect =
+          static_cast<float>(
+              candidate.width) /
+          static_cast<float>(
+              candidate.height);
+
+      const float aspect_error =
+          std::abs(
+              std::log(
+                  std::max(
+                      gc_aspect,
+                      0.0001f) /
+                  std::max(
+                      candidate_aspect,
+                      0.0001f)));
+
       if (aspect_error > 0.08f)
         continue;
 
-      const float scale_x = static_cast<float>(candidate.width) / width;
-      const float scale_y = static_cast<float>(candidate.height) / height;
-      if (!IsPowerOfTwoLikeScale(scale_x) || !IsPowerOfTwoLikeScale(scale_y))
-        continue;
+      const float scale_x =
+          static_cast<float>(
+              candidate.width) /
+          static_cast<float>(
+              width);
 
-      const float scale_shape = std::abs(std::log(std::max(scale_x, 0.001f) /
-                                                  std::max(scale_y, 0.001f)));
+      const float scale_y =
+          static_cast<float>(
+              candidate.height) /
+          static_cast<float>(
+              height);
+
+      if (!IsPowerOfTwoLikeScale(scale_x) ||
+          !IsPowerOfTwoLikeScale(scale_y))
+      {
+        continue;
+      }
+
+      const float scale_shape =
+          std::abs(
+              std::log(
+                  std::max(
+                      scale_x,
+                      0.001f) /
+                  std::max(
+                      scale_y,
+                      0.001f)));
+
       if (scale_shape > 0.10f)
         continue;
 
-      const float score = Auto3DDistance(gc, candidate.fingerprint) +
-                          aspect_error * 0.30f + scale_shape * 0.12f;
-      Winner& target = IsLikelyCubeFaceCandidate(candidate.relative_path) ? sky : level;
+      const float score =
+          Auto3DDistance(
+              gc,
+              candidate.fingerprint) +
+          aspect_error * 0.30f +
+          scale_shape * 0.12f;
+
+      Winner& target =
+          exact_sky ?
+              sky :
+              level;
+
       if (score < target.best)
       {
-        target.second = target.best;
-        target.best = score;
-        target.path = candidate.relative_path;
+        target.second =
+            target.best;
+
+        target.best =
+            score;
+
+        target.path =
+            candidate.relative_path;
       }
       else if (score < target.second)
       {
-        target.second = score;
+        target.second =
+            score;
       }
     }
   }
 
-  const bool sky_confident = !sky.path.empty() && sky.best <= 0.20f &&
-      (!std::isfinite(sky.second) || sky.second - sky.best >= 0.020f);
-  const bool level_confident = !level.path.empty() && level.best <= 0.12f &&
-      (!std::isfinite(level.second) || level.second - level.best >= 0.055f);
-  const bool choose_sky = sky_confident &&
-      (!level_confident || sky.best + 0.015f < level.best);
-  const std::string chosen = choose_sky ? sky.path :
-      (level_confident ? level.path : std::string{});
+  // Slightly more tolerant than v13.8 because the PS3 remaster sky has
+  // resolution/color changes, but still requires a unique direct sky face.
+  const bool sky_confident =
+      SkyTexturesEnabled() &&
+      !sky.path.empty() &&
+      sky.best <= 0.30f &&
+      (!std::isfinite(sky.second) ||
+       sky.second - sky.best >= 0.008f);
+
+  const bool level_confident =
+      !level.path.empty() &&
+      level.best <= 0.12f &&
+      (!std::isfinite(level.second) ||
+       level.second - level.best >= 0.055f);
+
+  // Bias toward the exact six-face PS3 sky set when it is a credible match.
+  const bool choose_sky =
+      sky_confident &&
+      (!level_confident ||
+       sky.best <=
+           level.best + 0.030f);
+
+  const std::string chosen =
+      choose_sky ?
+          sky.path :
+          (level_confident ?
+               level.path :
+               std::string{});
 
   if (chosen.empty())
   {
-    std::scoped_lock lock(auto3d_mutex);
-    strict_level_rejected.insert(key);
+    {
+      std::scoped_lock lock(
+          auto3d_mutex);
+
+      strict_level_rejected.insert(
+          key);
+    }
+
+    static unsigned sky_reject_logs = 0;
+
+    if (std::isfinite(sky.best) &&
+        sky_reject_logs++ < 32)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-ps3-sky] direct-face candidate rejected: "
+          "GC=%ux%u best=%.3f second=%.3f scope=%s\n",
+          width,
+          height,
+          sky.best,
+          sky.second,
+          scope.c_str());
+    }
+
     return nullptr;
   }
 
-  auto decoded = DecodeAuto3DWinner(chosen);
+  auto decoded =
+      DecodeAuto3DWinner(
+          chosen);
+
   if (!decoded)
   {
-    std::scoped_lock lock(auto3d_mutex);
-    strict_level_rejected.insert(key);
+    std::scoped_lock lock(
+        auto3d_mutex);
+
+    strict_level_rejected.insert(
+        key);
+
     return nullptr;
   }
 
   {
-    std::scoped_lock lock(auto3d_mutex);
-    strict_level_matches[key] = decoded;
+    std::scoped_lock lock(
+        auto3d_mutex);
+
+    strict_level_matches[key] =
+        decoded;
   }
 
   static unsigned strict_logs = 0;
+
   if (strict_logs++ < 160)
   {
-    std::fprintf(stderr, choose_sky ?
-        "[moh-ps3-sky] STRICT MATCH: GC=%ux%u fmt=%u -> %s score=%.3f\n" :
-        "[moh-ps3-level] STRICT MATCH: GC=%ux%u fmt=%u -> %s score=%.3f\n",
-        width, height, static_cast<unsigned>(info.GetTextureFormat()), chosen.c_str(),
-        choose_sky ? sky.best : level.best);
+    std::fprintf(
+        stderr,
+        choose_sky ?
+            "[moh-ps3-sky] DIRECT PS3 MATCH: "
+            "GC=%ux%u fmt=%u -> %s score=%.3f\n" :
+            "[moh-ps3-level] STRICT MATCH: "
+            "GC=%ux%u fmt=%u -> %s score=%.3f\n",
+        width,
+        height,
+        static_cast<unsigned>(
+            info.GetTextureFormat()),
+        chosen.c_str(),
+        choose_sky ?
+            sky.best :
+            level.best);
   }
 
   return decoded;
@@ -2311,7 +3244,8 @@ FindAuto3D(const TextureInfo& info)
   {
     mode_logged = true;
     std::fprintf(stderr,
-                 "[moh-ps3-policy] TPK/RSX=%s MSH-decoder=%s DMF-decoder=%s strict-level=%s\n",
+                 "[moh-ps3-policy] sky=%s TPK/RSX=%s MSH-decoder=%s DMF-decoder=%s strict-level=%s\n",
+                 SkyTexturesEnabled() ? "ON" : "OFF",
                  PS3AssetPort::IsTPKRSXEnabled() ? "ON" : "OFF",
                  PS3AssetPort::IsMSHEnabled() ? "ON" : "OFF",
                  PS3AssetPort::IsDMFEnabled() ? "ON" : "OFF",
@@ -2623,7 +3557,7 @@ int NameIndex(std::string_view name)
 
       std::fprintf(
           stderr,
-          "[moh-ps3-texture] no PS3 match: guest=%.*s stem=%s\\n",
+          "[moh-ps3-texture] no PS3 match: guest=%.*s stem=%s\n",
           static_cast<int>(
               name.size()),
           name.data(),
@@ -2681,7 +3615,7 @@ int NameIndex(std::string_view name)
 
     std::fprintf(
         stderr,
-        "[moh-ps3-texture] map guest=%.*s -> PS3=%s\\n",
+        "[moh-ps3-texture] map guest=%.*s -> PS3=%s\n",
         static_cast<int>(
             name.size()),
         name.data(),
@@ -2817,6 +3751,9 @@ void Shutdown()
     auto3d_rejected.clear();
     strict_level_matches.clear();
     strict_level_rejected.clear();
+    sky_gc_probes.clear();
+    sky_exact_assignments.clear();
+    sky_assignment_logged = false;
     exact_tpk_decoded.clear();
     level_port_decoded.clear();
     level_port_textures.clear();

@@ -49,7 +49,7 @@ std::string GetCurrentLevel();
 Class Classify(std::string_view path);
 
 // Independent PS3 asset switches. Defaults are intentionally diagnostic:
-// TPK/RSX + static MSH ON, skinned DMF OFF.
+// TPK/RSX OFF until the PS3 UV/material bridge is active; static MSH ON, skinned DMF OFF.
 bool IsTPKRSXEnabled();
 bool IsMSHEnabled();
 bool IsDMFEnabled();

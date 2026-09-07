@@ -48,54 +48,104 @@ DMFInfo InspectDMF(std::span<const u8> bytes)
   if (!PS3AssetPort::IsDMFEnabled())
     return out;
 
-  if (bytes.size() < 0x5c || std::memcmp(bytes.data(), "DMF\0", 4) != 0)
+  if (bytes.size() < 0x5c ||
+      std::memcmp(bytes.data(), "DMF\\0", 4) != 0)
+  {
     return out;
-
-  // The archive documentation covers the LE/Xbox family. PS3 files may use
-  // another endian/layout revision, therefore inspection is intentionally
-  // conservative instead of pretending raw compatibility.
-  const u32 version_le = LE32(bytes.data() + 4);
-  const u32 version_be = BE32(bytes.data() + 4);
-
-  const bool le_plausible = version_le > 0 && version_le < 64;
-  const bool be_plausible = version_be > 0 && version_be < 64;
-
-  if (le_plausible)
-  {
-    out.version = version_le;
-    out.mesh_count = LE32(bytes.data() + 0x20);
-    out.material_count = LE32(bytes.data() + 0x28);
-    out.bone_ref_count = LE32(bytes.data() + 0x4c);
   }
-  else if (be_plausible)
+
+  // Frontline PS3 remaster DMF revision seen in the RPCS3 dump:
+  // bytes +04 = 05 02 00 00 -> revision 0x0502 + flags 0x0000.
+  const u32 ps3_revision =
+      (u32(bytes[4]) << 8) |
+      u32(bytes[5]);
+
+  const u32 ps3_flags =
+      (u32(bytes[6]) << 8) |
+      u32(bytes[7]);
+
+  if (ps3_revision >= 0x0100 &&
+      ps3_revision <= 0x0FFF &&
+      ps3_flags <= 0x00FF)
   {
-    out.version = version_be;
-    out.mesh_count = BE32(bytes.data() + 0x20);
-    out.material_count = BE32(bytes.data() + 0x28);
-    out.bone_ref_count = BE32(bytes.data() + 0x4c);
+    out.version =
+        ps3_revision;
+
+    out.mesh_count =
+        BE32(bytes.data() + 0x20);
+
+    out.material_count =
+        BE32(bytes.data() + 0x28);
+
+    // +0x48 = count.
+    // +0x4C is the pointer/table field and MUST NOT be read as a count.
+    out.bone_ref_count =
+        BE32(bytes.data() + 0x48);
   }
   else
   {
-    return out;
+    // Preserve conservative support for the older documented DMF family.
+    const u32 version_le =
+        LE32(bytes.data() + 4);
+
+    const u32 version_be =
+        BE32(bytes.data() + 4);
+
+    if (version_le > 0 &&
+        version_le < 64)
+    {
+      out.version =
+          version_le;
+
+      out.mesh_count =
+          LE32(bytes.data() + 0x20);
+
+      out.material_count =
+          LE32(bytes.data() + 0x28);
+
+      out.bone_ref_count =
+          LE32(bytes.data() + 0x4c);
+    }
+    else if (version_be > 0 &&
+             version_be < 64)
+    {
+      out.version =
+          version_be;
+
+      out.mesh_count =
+          BE32(bytes.data() + 0x20);
+
+      out.material_count =
+          BE32(bytes.data() + 0x28);
+
+      out.bone_ref_count =
+          BE32(bytes.data() + 0x4c);
+    }
+    else
+    {
+      return out;
+    }
   }
 
   char name[9]{};
-  std::memcpy(name, bytes.data() + 0x0c, 8);
-  out.model_name = name;
 
-  if (out.mesh_count > 65535 || out.material_count > 65535 ||
-      out.bone_ref_count > 1024)
+  std::memcpy(
+      name,
+      bytes.data() + 0x0c,
+      8);
+
+  out.model_name =
+      name;
+
+  if (out.mesh_count > 65535 ||
+      out.material_count > 65535 ||
+      out.bone_ref_count > 4096)
+  {
     return {};
+  }
 
   out.valid = true;
 
-  static unsigned logs = 0;
-  if (logs++ < 32)
-  {
-    std::fprintf(stderr,
-                 "[moh-ps3-dmf] inspected DMF: version=%u meshes=%u materials=%u bones=%u\n",
-                 out.version, out.mesh_count, out.material_count, out.bone_ref_count);
-  }
   return out;
 }
 

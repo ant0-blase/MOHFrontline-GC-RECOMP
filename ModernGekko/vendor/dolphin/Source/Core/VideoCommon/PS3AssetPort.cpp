@@ -30,7 +30,7 @@ bool EnvSwitch(const char* name, bool fallback)
 }
 }  // namespace
 
-bool IsTPKRSXEnabled() { return EnvSwitch("MOH_PS3_TPK_RSX", true); }
+bool IsTPKRSXEnabled() { return EnvSwitch("MOH_PS3_TPK_RSX", false); }
 bool IsMSHEnabled() { return EnvSwitch("MOH_PS3_MSH", true); }
 bool IsDMFEnabled() { return EnvSwitch("MOH_PS3_DMF", false); }
 void Initialize() { Native::Initialize(); }
