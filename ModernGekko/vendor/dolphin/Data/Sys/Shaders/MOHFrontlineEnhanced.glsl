@@ -101,16 +101,16 @@ StepAmount = 0.01
 DefaultValue = 0.22
 
 [OptionBool]
-GUIName = Contact Shadows
+GUIName = PS3 CSM Shadows
 OptionName = CONTACT_SHADOW_ENABLE
 DefaultValue = true
 [OptionRangeFloat]
-GUIName = Contact Shadow Strength
+GUIName = PS3 CSM Shadow Strength
 OptionName = CONTACT_SHADOW_STRENGTH
 MinValue = 0.0
 MaxValue = 1.0
 StepAmount = 0.01
-DefaultValue = 0.18
+DefaultValue = 0.55
 
 [OptionBool]
 GUIName = Vignette
@@ -187,39 +187,118 @@ float ComputeDepthAO(float2 uv, float depth, float2 px)
   return clamp(occ * 0.125, 0.0, 1.0);
 }
 
-float PS3ShadowPCF(float2 uv, float receiver_depth, float2 px,
-                   float2 ray_dir, float travel_px, float bias, float thickness)
+float SampleCSMDepth(int cascade, float2 uv)
 {
-  float2 p = uv + ray_dir * px * travel_px;
-  float2 side = float2(-ray_dir.y, ray_dir.x) * px * 0.85;
+  float raw;
+  if (cascade == 0)
+    raw = texture(samp_csm0, float3(uv, 0.0)).r;
+  else if (cascade == 1)
+    raw = texture(samp_csm1, float3(uv, 0.0)).r;
+  else if (cascade == 2)
+    raw = texture(samp_csm2, float3(uv, 0.0)).r;
+  else
+    raw = texture(samp_csm3, float3(uv, 0.0)).r;
 
-  // Four taps, mirroring the 4-tap PCF footprint recovered from the RSX
-  // receiver shader.  Here the taps compare against live scene depth.
-  float s0 = smoothstep(bias, thickness, receiver_depth - DepthAt(p + side));
-  float s1 = smoothstep(bias, thickness, receiver_depth - DepthAt(p - side));
-  float s2 = smoothstep(bias, thickness, receiver_depth - DepthAt(p + side * 0.35 + px * 0.85));
-  float s3 = smoothstep(bias, thickness, receiver_depth - DepthAt(p - side * 0.35 - px * 0.85));
-  return (s0 + s1 + s2 + s3) * 0.25;
+  // The caster deliberately renders reverse-Z (near=1, far=0) with GEqual.
+  return raw;
 }
 
-float ComputePS3DepthShadow(float2 uv, float depth, float2 px)
+float3 ReconstructMOHViewPosition(float2 uv, float reverse_depth)
 {
-  // Screen-space projection of the same presentation sun direction already
-  // used by the remaster lighting path.  The four travel bands emulate the
-  // near->far coverage of the four 1024x1024 PS3 cascades while the real host
-  // CSM caster is being brought online.
-  float2 ray_dir = normalize(float2(0.42, 0.50));
+  // GameCube perspective projection before Dolphin's host depth conversion:
+  // clip.z = p10*z + p11, clip.w = -z, console NDC z in [-1,0].
+  // SampleRawDepthLocation() returns -console_ndc_z (near=1, far=0), so:
+  // z = -p11 / (p10 - reverse_depth).
+  float p0 = moh_csm_camera0.x;
+  float p2 = moh_csm_camera0.y;
+  float p5 = moh_csm_camera0.z;
+  float p6 = moh_csm_camera0.w;
+  float p10 = moh_csm_camera1.x;
+  float p11 = moh_csm_camera1.y;
 
-  float c0 = PS3ShadowPCF(uv, depth, px, ray_dir,  2.5, 0.00030, 0.0065);
-  float c1 = PS3ShadowPCF(uv, depth, px, ray_dir,  5.0, 0.00040, 0.0090);
-  float c2 = PS3ShadowPCF(uv, depth, px, ray_dir, 10.0, 0.00055, 0.0130);
-  float c3 = PS3ShadowPCF(uv, depth, px, ray_dir, 18.0, 0.00075, 0.0190);
+  float denom = p10 - reverse_depth;
+  if (abs(denom) < 0.0000001)
+    denom = denom < 0.0 ? -0.0000001 : 0.0000001;
 
-  float shadow = max(max(c0, c1 * 0.92), max(c2 * 0.78, c3 * 0.62));
+  float z = -p11 / denom;
+  float depth_from_camera = -z;
 
-  // Reject sky/far-plane noise and soften tiny depth discontinuities.
-  float valid = 1.0 - smoothstep(0.996, 1.0, depth);
-  return clamp(shadow * valid, 0.0, 1.0);
+  // Post-process UVs use a top-left screen convention; projection NDC Y points up.
+  float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  if (moh_csm_flags.z != 0)
+    ndc.y = -ndc.y;
+
+  return float3(depth_from_camera * (ndc.x + p2) / p0,
+                depth_from_camera * (ndc.y + p6) / p5,
+                z);
+}
+
+float4 ProjectMOHCascade(int cascade, float3 view_pos)
+{
+  int base = cascade * 4;
+  float4 p = float4(view_pos, 1.0);
+  return float4(dot(moh_csm_matrix[base + 0], p),
+                dot(moh_csm_matrix[base + 1], p),
+                dot(moh_csm_matrix[base + 2], p),
+                dot(moh_csm_matrix[base + 3], p));
+}
+
+float CompareMOHShadowTap(int cascade, float2 uv, float receiver_reverse_z, float bias)
+{
+  float map_reverse_z = SampleCSMDepth(cascade, clamp(uv, float2(0.0), float2(1.0)));
+  // Reverse-Z map: the closest caster has the largest value.  Receiver bias is
+  // the host-side equivalent of the RSX caster's polygon-offset depth bias.
+  return receiver_reverse_z + bias >= map_reverse_z ? 1.0 : 0.0;
+}
+
+float SampleMOHTrueCSM(int cascade, float3 view_pos)
+{
+  float4 light = ProjectMOHCascade(cascade, view_pos);
+  if (abs(light.w) < 0.000001)
+    return 1.0;
+
+  float3 ndc = light.xyz / light.w;
+  float2 suv = ndc.xy * 0.5 + float2(0.5);
+  if (moh_csm_flags.z != 0)
+    suv.y = 1.0 - suv.y;
+
+  // Caster clip Z is [-1,0]. Dolphin converts it to reverse-Z [1,0].
+  float receiver_reverse_z = clamp(-ndc.z, 0.0, 1.0);
+  if (suv.x <= 0.001 || suv.x >= 0.999 || suv.y <= 0.001 || suv.y >= 0.999 ||
+      ndc.z < -1.001 || ndc.z > 0.001)
+    return 1.0;
+
+  // Exact 4-tap footprint recovered from the Frontline RSX receiver shader:
+  // 0.000830078 ~= 0.85 / 1024.
+  float o = moh_csm_camera1.w;
+  float bias = moh_csm_camera1.z * (1.0 + float(cascade) * 0.55);
+  float visibility = 0.0;
+  visibility += CompareMOHShadowTap(cascade, suv + float2( o,  0.0), receiver_reverse_z, bias);
+  visibility += CompareMOHShadowTap(cascade, suv + float2( o, -o), receiver_reverse_z, bias);
+  visibility += CompareMOHShadowTap(cascade, suv + float2(-o,  0.0), receiver_reverse_z, bias);
+  visibility += CompareMOHShadowTap(cascade, suv + float2(-o,  o), receiver_reverse_z, bias);
+  return visibility * 0.25;
+}
+
+float ComputeMOHTrueCSMShadow(float2 uv, float reverse_depth)
+{
+  if (!HasTrueCSM() || reverse_depth <= 0.000001)
+    return 0.0;
+
+  float3 view_pos = ReconstructMOHViewPosition(uv, reverse_depth);
+  float view_depth = max(-view_pos.z, 0.0);
+  int cascade = 3;
+  if (view_depth <= moh_csm_splits.x)
+    cascade = 0;
+  else if (view_depth <= moh_csm_splits.y)
+    cascade = 1;
+  else if (view_depth <= moh_csm_splits.z)
+    cascade = 2;
+  else if (view_depth > moh_csm_splits.w)
+    return 0.0;
+
+  float visibility = SampleMOHTrueCSM(cascade, view_pos);
+  return clamp(1.0 - visibility, 0.0, 1.0);
 }
 
 float3 BrightPass(float3 c)
@@ -264,6 +343,37 @@ void main()
   float2 uv = GetCoordinates();
   float2 px = GetInvResolution();
   float3 center = src.rgb;
+
+  // CSM diagnostic view.  This bypasses every colour/post effect so the caster
+  // can be validated directly instead of guessing whether an invisible shadow
+  // is caused by map contents, projection, depth compare, or option plumbing.
+  if (moh_csm_flags.w >= 1 && moh_csm_flags.w <= 4)
+  {
+    int cascade = moh_csm_flags.w - 1;
+    float d = SampleCSMDepth(cascade, uv);
+    // v2 diagnostic coding:
+    //   RED    = sampler returned ~0 (binding/layout/sample problem)
+    //   YELLOW = the 0.25 sentinel clear is intact (texture readable, no raster)
+    //   GREEN/BLUE shapes = real caster depths were written.
+    float is_zero = 1.0 - step(0.0000005, d);
+    float is_clear = 1.0 - step(0.002, abs(d - 0.25));
+    float is_written = (1.0 - is_zero) * (1.0 - is_clear);
+    float visible_depth = pow(clamp(d, 0.0, 1.0), 0.20);
+    float3 debug_rgb =
+        is_zero * float3(1.0, 0.0, 0.0) +
+        is_clear * float3(1.0, 1.0, 0.0) +
+        is_written * float3(0.0, 1.0, visible_depth);
+    SetOutput(float4(debug_rgb, 1.0));
+    return;
+  }
+  if (moh_csm_flags.w == 5)
+  {
+    float mask = 0.0;
+    if (HasSceneDepth() && HasTrueCSM())
+      mask = ComputeMOHTrueCSMShadow(uv, DepthAt(uv));
+    SetOutput(float4(mask, mask, mask, 1.0));
+    return;
+  }
 
   // Shared neighbourhood for the remaster lighting/material approximation.
   float3 n  = SampleLocation(uv + float2( 0.0, -1.0) * px).rgb;
@@ -400,31 +510,17 @@ void main()
 
   if (OptionEnabled(CONTACT_SHADOW_ENABLE))
   {
-    float shadow;
-    if (HasSceneDepth())
-    {
-      float2 dpx = max(GetInvDepthResolution(), float2(0.00001));
-      shadow = ComputePS3DepthShadow(uv, DepthAt(uv), dpx);
-    }
-    else
-    {
-      // Preserve the old luminance fallback when live depth is unavailable.
-      float2 shadow_dir = normalize(float2(0.42, 0.50));
-      float l1 = Luma(SampleLocation(uv + shadow_dir * px * 2.5).rgb);
-      float l2 = Luma(SampleLocation(uv + shadow_dir * px * 5.0).rgb);
-      float l3 = Luma(SampleLocation(uv + shadow_dir * px * 8.0).rgb);
-      float occluder = max(max(l1, l2), l3);
-      float directional_shadow = clamp((occluder - lc) * 1.65, 0.0, 1.0);
-      float gx = abs(Luma(e) - Luma(w));
-      float gy = abs(Luma(s1) - Luma(n));
-      float edge = clamp((gx + gy) * 2.0, 0.0, 1.0);
-      float edge_shadow = edge * clamp(ll - lc + 0.04, 0.0, 1.0) * 0.65;
-      shadow = max(directional_shadow, edge_shadow);
-    }
+    // This is a real geometry shadow receiver.  Every perspective GX batch was
+    // replayed from the .lit sun into four 1024x1024 D32F maps before this
+    // pre-HUD pass.  No luminance tracing or screen-space shadow ray is used.
+    float shadow = 0.0;
+    if (HasSceneDepth() && HasTrueCSM())
+      shadow = ComputeMOHTrueCSMShadow(uv, DepthAt(uv));
 
-    // Existing slider now controls actual depth-aware shadows.  0.86 keeps
-    // them visible at the old default 0.18 while still allowing a soft look.
-    center *= 1.0 - shadow * CONTACT_SHADOW_STRENGTH * 0.86;
+    // The old option name is retained so existing UI/config plumbing keeps
+    // working, but it now controls only the true CSM result.
+    float csm_strength = clamp(CONTACT_SHADOW_STRENGTH * 1.60, 0.0, 0.85);
+    center *= 1.0 - shadow * csm_strength;
   }
 
   if (OptionEnabled(BLOOM_ENABLE))

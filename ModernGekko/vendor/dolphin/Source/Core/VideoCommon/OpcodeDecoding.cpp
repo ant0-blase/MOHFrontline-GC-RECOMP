@@ -13,6 +13,8 @@
 // vertices.
 
 #include "VideoCommon/OpcodeDecoding.h"
+#include "VideoCommon/PS3MeshPort.h"
+#include "VideoCommon/VertexManagerBase.h"
 
 #include "Common/Assert.h"
 #include "Common/Logging/Log.h"
@@ -187,7 +189,18 @@ public:
           // temporarily swap dl and non-dl (small "hack" for the stats)
           g_stats.SwapDL();
 
+          const auto mesh = PS3MeshPort::FindDisplayList(address, {start_address, size});
+          if (mesh)
+          {
+            g_vertex_manager->Flush();
+            PS3MeshPort::SetDisplayListMatch(mesh);
+          }
           Run(start_address, size, *this);
+          if (mesh)
+          {
+            g_vertex_manager->Flush();
+            PS3MeshPort::SetDisplayListMatch({});
+          }
           INCSTAT(g_stats.this_frame.num_dlists_called);
 
           // un-swap

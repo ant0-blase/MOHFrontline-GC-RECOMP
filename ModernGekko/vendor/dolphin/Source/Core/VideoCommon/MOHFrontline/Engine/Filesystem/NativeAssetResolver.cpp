@@ -115,6 +115,7 @@ std::vector<std::string> Names(const std::string& path, Domain domain)
   static const std::map<std::string, std::string> mappings = {{".gsh", ".ssh"}, {".gfn", ".sfn"},
       {".xfn", ".sfn"}, {".abk", ".abkx"}, {".ast", ".astx"}, {".asf", ".asfx"},
       {".mus", ".musx"}, {".mpf", ".mpfx"}, {".bpd", ".xpd"}, {".mpk", ".msh"}};
+  if (ext == ".msf") return {stem + ".msh", path};
   if (auto it = mappings.find(ext); it != mappings.end()) return {stem + it->second, path};
   if (ext.empty())
   {
@@ -133,7 +134,7 @@ Domain Classify(std::string_view path)
   if (e == ".sfn" || e == ".gfn" || e == ".xfn") return Domain::Font;
   if (e == ".abk" || e == ".abkx" || e == ".ast" || e == ".astx" || e == ".asf" || e == ".asfx" ||
       e == ".mus" || e == ".musx" || e == ".mpf" || e == ".mpfx" || e == ".bnk") return Domain::Audio;
-  if (e == ".msh" || e == ".mpk") return Domain::StaticMesh;
+  if (e == ".msh" || e == ".msf" || e == ".mpk") return Domain::StaticMesh;
   if (e == ".dmf") return Domain::SkinnedMesh;
   if (e == ".skl") return Domain::Skeleton;
   if (e == ".mvd" || e == ".emt" || e == ".aem" || e == ".aemx") return Domain::Animation;

@@ -57,6 +57,7 @@ Class Classify(std::string_view path);
 bool IsTPKRSXEnabled();
 bool IsMSHEnabled();
 bool IsDMFEnabled();
+bool IsSKLEnabled();
 
 // PS3 .lit lighting bridge.
 //

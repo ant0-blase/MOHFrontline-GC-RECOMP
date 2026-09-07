@@ -2772,6 +2772,87 @@ BuildCustomTextureFromPS3Levels(const std::vector<PS3TextureDecoder::Level>& lev
   }
   return decoded;
 }
+bool UnsafeTPKUVOverrideEnabled()
+{
+  const char* value = std::getenv("MOH_PS3_TPK_UNSAFE_UV");
+  if (!value || !*value)
+    return false;
+
+  const std::string lower = Lower(std::string(value));
+  return lower == "1" || lower == "true" || lower == "on" || lower == "yes";
+}
+
+// The live TPK bridge currently replaces texture payloads on the original
+// GameCube draw calls.  Until PS3 MSH vertices/UVs are submitted natively,
+// applying a PS3 atlas whose aspect/layout changed can put the right image on
+// the wrong part of a model (for example Thompson wood/metal).
+//
+// Equal-aspect upscales (128->256, 256->512, etc.) are safe with normalized GC
+// UVs.  A material with a substantially different aspect is kept on the
+// original GC texture until the MSH draw bridge can provide the matching PS3
+// UV set.
+bool NeedsNativeMSHUV(
+    u32 gc_width,
+    u32 gc_height,
+    const std::shared_ptr<VideoCommon::CustomTextureData>& decoded,
+    std::string_view material)
+{
+  // v5.1: do NOT hide PS3 materials by default.  The previous v5 guard was
+  // useful diagnostically, but it made the Thompson PS3 textures disappear
+  // completely because TOM_01WO256/TOM_02MET256 are 432x336 while the GC
+  // source textures are 256x256.
+  //
+  // Keep the guard available as an explicit debug switch while the native
+  // MSH vertex/UV submission bridge is being implemented.
+  const char* guard_value = std::getenv("MOH_PS3_TPK_UV_GUARD");
+  if (!guard_value || !*guard_value)
+    return false;
+  const std::string guard = Lower(std::string(guard_value));
+  if (guard != "1" && guard != "true" && guard != "on" && guard != "yes")
+    return false;
+
+  if (UnsafeTPKUVOverrideEnabled() || !decoded || !gc_width || !gc_height ||
+      decoded->m_slices.empty() || decoded->m_slices[0].m_levels.empty())
+  {
+    return false;
+  }
+
+  const auto& ps3 = decoded->m_slices[0].m_levels.front();
+  if (!ps3.width || !ps3.height)
+    return false;
+
+  const u64 lhs =
+      static_cast<u64>(gc_width) * static_cast<u64>(ps3.height);
+  const u64 rhs =
+      static_cast<u64>(ps3.width) * static_cast<u64>(gc_height);
+
+  const u64 lo = std::min(lhs, rhs);
+  const u64 hi = std::max(lhs, rhs);
+
+  // Allow small padding/rounding differences.  More than 12.5% aspect drift
+  // means the PS3 material cannot safely reuse the GC UV layout.
+  if (!lo || hi <= lo + lo / 8u)
+    return false;
+
+  static unsigned mismatch_logs = 0;
+  if (mismatch_logs++ < 160)
+  {
+    std::fprintf(
+        stderr,
+        "[moh-ps3-uv] MSH UV REQUIRED: material=%.*s "
+        "GC=%ux%u PS3=%ux%u -> keep GC "
+        "(MOH_PS3_TPK_UNSAFE_UV=1 forces legacy behavior)\n",
+        static_cast<int>(material.size()),
+        material.data(),
+        gc_width,
+        gc_height,
+        ps3.width,
+        ps3.height);
+  }
+
+  return true;
+}
+
 
 bool ParsePS3TPKRecord(std::span<const u8> tpk, std::string_view wanted_name,
                        u32* payload_offset, u32* payload_size,
@@ -2857,6 +2938,9 @@ FindExactTPK1_1(const TextureInfo& info)
       continue;
 
     auto decoded = DecodeExactPS3TPKTexture(scope, entry.name);
+    if (NeedsNativeMSHUV(info.GetRawWidth(), info.GetRawHeight(), decoded, entry.name))
+      return nullptr;
+
     if (decoded)
     {
       std::fprintf(stderr,
@@ -3315,10 +3399,52 @@ FindExactLevelPortTexture(
   const std::string scope =
       "data/" + level.substr(0, underscore) + "/" + level + "/";
 
+  // v6: the PS3 Thompson MSH uses the two legacy GC material slots in the
+  // opposite order. Keep this deliberately narrow so every other material
+  // keeps its exact manifest binding.
+  std::string material_name = found.name;
+
+  bool thompson_material_remap = true;
+  if (const char* value =
+          std::getenv("MOH_PS3_THOMPSON_MATERIAL_REMAP");
+      value && *value)
+  {
+    const std::string lower = Lower(std::string(value));
+    thompson_material_remap =
+        lower != "0" && lower != "false" &&
+        lower != "off" && lower != "no";
+  }
+
+  if (thompson_material_remap)
+  {
+    const std::string lower = Lower(material_name);
+
+    if (lower == "tom_02met256")
+      material_name = "TOM_01WO256";
+    else if (lower == "tom_01wo256")
+      material_name = "TOM_02MET256";
+
+    if (material_name != found.name)
+    {
+      static unsigned thompson_remap_logs = 0;
+      if (thompson_remap_logs++ < 32)
+      {
+        std::fprintf(
+            stderr,
+            "[moh-ps3-thompson] material bind: GC-slot=%s -> PS3=%s\n",
+            found.name.c_str(),
+            material_name.c_str());
+      }
+    }
+  }
+
   auto decoded =
       DecodeExactPS3TPKTexture(
           scope,
-          found.name);
+          material_name);
+
+  if (NeedsNativeMSHUV(width, height, decoded, material_name))
+    return nullptr;
 
   // Explicit debug-only escape hatch for comparing against an old generated
   // PS3_PORT_CACHE.  Production fallback is the original GameCube texture.
@@ -3364,7 +3490,7 @@ FindExactLevelPortTexture(
       format,
       static_cast<unsigned long long>(
           texture_hash),
-      found.name.c_str(),
+      material_name.c_str(),
       found.normal_path.empty() ?
           "" :
           " normal=",

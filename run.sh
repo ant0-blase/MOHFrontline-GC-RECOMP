@@ -413,6 +413,20 @@ if [[ "$PS3_ASSETS" == "1" ]]; then
   echo "PS3 remaster assets: $PS3_FILES"
 fi
 
+# ModernGekko/Dolphin loads post-process shaders from <user-dir>/Shaders first.
+# The runtime executable lives in runtime/, while the project shader we edit lives
+# in ModernGekko/vendor/dolphin/Data/Sys/Shaders.  Keep the runtime copy in sync
+# so CSM/debug shader changes are actually the code executed by the game.
+MOH_PP_SHADER_SRC="$ROOT/ModernGekko/vendor/dolphin/Data/Sys/Shaders/MOHFrontlineEnhanced.glsl"
+MOH_PP_SHADER_DST="$USER_DIR/Shaders/MOHFrontlineEnhanced.glsl"
+if [[ -f "$MOH_PP_SHADER_SRC" ]]; then
+  mkdir -p "$USER_DIR/Shaders"
+  if [[ ! -f "$MOH_PP_SHADER_DST" ]] || ! cmp -s "$MOH_PP_SHADER_SRC" "$MOH_PP_SHADER_DST"; then
+    install -m644 "$MOH_PP_SHADER_SRC" "$MOH_PP_SHADER_DST"
+  fi
+  echo "[moh-ps3-csm] runtime shader synced: $MOH_PP_SHADER_DST (debug=${MOH_PS3_CSM_DEBUG:-0})"
+fi
+
 PLATFORM_ARGS=()
 if [[ "$(uname -s)" == "Linux" ]]; then
   if [[ -n "${WAYLAND_DISPLAY:-}" && "${XDG_SESSION_TYPE:-}" != "x11" ]]; then

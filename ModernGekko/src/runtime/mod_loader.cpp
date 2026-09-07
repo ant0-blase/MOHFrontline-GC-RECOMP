@@ -4,6 +4,7 @@
 #include "Core/Config/MainSettings.h"
 #include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/PS3Compass.h"
+#include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/PS3NamedSky.h"
 #include "VideoCommon/TextureDecoder.h"
 #endif
@@ -1336,6 +1337,23 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     std::string lower_name = name;
     std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower_name.ends_with(".msh"))
+    {
+      const u32 file = state->gpr[3];
+      if (IsMem1Address(file) && file <= 0x817ffff8u)
+      {
+        const u32 size = ReadGuestU32(state, file + 4);
+        if (ReadGuestU32(state, file) == 9 && size >= 48 &&
+            size <= 0x1000000 && size <= 0x81800000u - file)
+        {
+          std::vector<u8> bytes(size);
+          for (u32 i = 0; i < size; ++i)
+            bytes[i] = state->external_read(state, file + i, 1);
+          PS3MeshPort::RegisterGuestStaticMesh(name, file, bytes);
+        }
+      }
+      return true;
+    }
     if (lower_name.ends_with(".tpk"))
     {
       RegisterGuestTexturePack(state, state->gpr[3]);

@@ -477,6 +477,7 @@ bool IsTPKRSXEnabled()
 }
 bool IsMSHEnabled() { return EnvSwitch("MOH_PS3_MSH", true); }
 bool IsDMFEnabled() { return EnvSwitch("MOH_PS3_DMF", true); }
+bool IsSKLEnabled() { return EnvSwitch("MOH_PS3_SKL", true); }
 bool IsLightingEnabled() { return s_lighting_enabled; }
 
 void Initialize()
@@ -498,6 +499,7 @@ void Initialize()
 
 void Shutdown()
 {
+  PS3MeshPort::PrintDrawStatistics();
   {
     std::scoped_lock lock(s_lit_load_mutex);
     s_lit_attempted_level.clear();
@@ -505,6 +507,7 @@ void Shutdown()
   s_lit_scene.store(std::shared_ptr<const LitScene>{}, std::memory_order_release);
   PS3MeshPort::ClearMSHCache();
   PS3MeshPort::ClearDMFCache();
+  PS3MeshPort::ClearSKLCache();
   Native::Shutdown();
 }
 
@@ -518,11 +521,13 @@ void SetCurrentLevel(std::string_view level)
   {
     PS3MeshPort::ClearMSHCache();
     PS3MeshPort::ClearDMFCache();
+    PS3MeshPort::ClearSKLCache();
     return;
   }
 
   PS3MeshPort::PreloadCurrentLevelMSH(active_level);
   PS3MeshPort::PreloadCurrentLevelDMF(active_level);
+  PS3MeshPort::PreloadCurrentLevelSKL(active_level);
 }
 
 void SyncLightingLevel(std::string_view level) { SyncLevelLighting(level); }

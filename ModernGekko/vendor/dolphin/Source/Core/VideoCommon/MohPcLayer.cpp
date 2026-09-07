@@ -580,8 +580,24 @@ void UpdateEnhancedPostProcess()
   SetPostOptionFloat(config, "LIGHTING_STRENGTH", s.gfx_lighting_strength.load());
   SetPostOptionBool(config, "SSAO_ENABLE", s.gfx_ssao.load());
   SetPostOptionFloat(config, "SSAO_STRENGTH", s.gfx_ssao_strength.load());
-  SetPostOptionBool(config, "CONTACT_SHADOW_ENABLE", s.gfx_contact_shadows.load());
-  SetPostOptionFloat(config, "CONTACT_SHADOW_STRENGTH", s.gfx_contact_shadow_strength.load());
+  // TRUE CSM is consumed by the FINAL-XFB presenter path.  This is the path
+  // actually used by Frontline during gameplay; the dedicated scene post path
+  // may not run at all.  Do not let the old UI contact-shadow toggle disable
+  // real geometry shadow maps when MOH_PS3_CSM=1.
+  const bool final_true_csm = EnvTrue("MOH_PS3_CSM", true);
+  SetPostOptionBool(config, "CONTACT_SHADOW_ENABLE",
+                    final_true_csm ? true : s.gfx_contact_shadows.load());
+  SetPostOptionFloat(config, "CONTACT_SHADOW_STRENGTH",
+                     final_true_csm ? std::max(s.gfx_contact_shadow_strength.load(), 0.85f) :
+                                      s.gfx_contact_shadow_strength.load());
+
+  static bool final_csm_option_logged = false;
+  if (final_true_csm && !final_csm_option_logged)
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-csm] FINAL-XFB option FORCED ON: CSM receiver shader branch enabled\n");
+    final_csm_option_logged = true;
+  }
   SetPostOptionBool(config, "VIGNETTE_ENABLE", s.gfx_vignette.load());
   SetPostOptionFloat(config, "VIGNETTE_STRENGTH", s.gfx_vignette_strength.load());
   SetPostOptionBool(config, "FILM_GRAIN_ENABLE", s.gfx_film_grain.load());
@@ -1409,16 +1425,30 @@ bool RunScenePostProcessOnGpu()
       "SSAO_STRENGTH",
       s.gfx_ssao_strength.load());
 
+  // TRUE CSM is not part of the old screen-space/contact-shadow path.  The
+  // PS3 material renderer being active must NOT disable it: the CSM receiver
+  // consumes the four real host shadow maps produced by VertexManagerBase.
+  const bool true_csm = EnvTrue("MOH_PS3_CSM", true);
+
   SetPostOptionBool(
       scene_config,
       "CONTACT_SHADOW_ENABLE",
-      s.gfx_contact_shadows.load() &&
-          !engine_materials);
+      true_csm);
 
   SetPostOptionFloat(
       scene_config,
       "CONTACT_SHADOW_STRENGTH",
-      s.gfx_contact_shadow_strength.load());
+      true_csm ? std::max(s.gfx_contact_shadow_strength.load(), 0.85f) :
+                 s.gfx_contact_shadow_strength.load());
+
+  static bool csm_receiver_logged = false;
+  if (true_csm && !csm_receiver_logged)
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-csm] scene receiver FORCED ON: 4 real CSM maps will be sampled "
+                 "(UI contact-shadow toggle ignored)\n");
+    csm_receiver_logged = true;
+  }
 
   SetPostOptionBool(
       scene_config,

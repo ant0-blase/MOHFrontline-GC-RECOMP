@@ -527,12 +527,27 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
     moh_depth_tex = g_framebuffer_manager->ResolveEFBDepthTexture(efb_rect, true);
   }
 
+  MOHCSMReceiverData moh_csm_data{};
+  bool moh_csm_ready = false;
+  if (m_config.GetShader() == "MOHFrontlineEnhanced" && MohPcLayer::IsGameplayActive() &&
+      g_vertex_manager)
+  {
+    moh_csm_ready = g_vertex_manager->PrepareMOHCSMForSampling(&moh_csm_data);
+  }
+
   g_gfx->SetSamplerState(0, RenderState::GetLinearSamplerState());
   g_gfx->SetSamplerState(1, RenderState::GetPointSamplerState());
   g_gfx->SetSamplerState(2, RenderState::GetPointSamplerState());
+  for (u32 i = 0; i < 4; ++i)
+    g_gfx->SetSamplerState(3 + i, RenderState::GetPointSamplerState());
   g_gfx->SetTexture(0, src_tex);
   g_gfx->SetTexture(1, src_tex);
   g_gfx->SetTexture(2, moh_depth_tex ? moh_depth_tex : src_tex);
+  for (u32 i = 0; i < 4; ++i)
+  {
+    const AbstractTexture* shadow = moh_csm_ready ? g_vertex_manager->GetMOHCSMTexture(i) : nullptr;
+    g_gfx->SetTexture(3 + i, shadow ? shadow : (moh_depth_tex ? moh_depth_tex : src_tex));
+  }
 
   const bool needs_color_correction = IsColorCorrectionActive();
   // Rely on the default (bi)linear sampler with the default mode
@@ -587,7 +602,7 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
 
     FillUniformBuffer(src_rect, src_tex, src_layer, g_gfx->GetCurrentFramebuffer()->GetRect(),
                       present_rect, uniform_staging_buffer->data(), !default_uniform_staging_buffer,
-                      true, moh_depth_tex);
+                      true, moh_depth_tex, moh_csm_ready ? &moh_csm_data : nullptr);
     g_vertex_manager->UploadUtilityUniforms(uniform_staging_buffer->data(),
                                             static_cast<u32>(uniform_staging_buffer->size()));
 
@@ -602,6 +617,11 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
     g_gfx->SetTexture(0, src_tex);
     g_gfx->SetTexture(1, src_tex);
     g_gfx->SetTexture(2, moh_depth_tex ? moh_depth_tex : src_tex);
+    for (u32 i = 0; i < 4; ++i)
+    {
+      const AbstractTexture* shadow = moh_csm_ready ? g_vertex_manager->GetMOHCSMTexture(i) : nullptr;
+      g_gfx->SetTexture(3 + i, shadow ? shadow : (moh_depth_tex ? moh_depth_tex : src_tex));
+    }
     // The "m_intermediary_color_texture" has already copied
     // from the specified source layer onto its first one.
     // If we query for a layer that the source texture doesn't have,
@@ -639,7 +659,7 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
   {
     FillUniformBuffer(src_rect, src_tex, src_layer, g_gfx->GetCurrentFramebuffer()->GetRect(),
                       present_rect, uniform_staging_buffer->data(), !default_uniform_staging_buffer,
-                      false, moh_depth_tex);
+                      false, moh_depth_tex, moh_csm_ready ? &moh_csm_data : nullptr);
     g_vertex_manager->UploadUtilityUniforms(uniform_staging_buffer->data(),
                                             static_cast<u32>(uniform_staging_buffer->size()));
 
@@ -685,6 +705,11 @@ std::string PostProcessing::GetUniformBufferHeader(bool user_post_process) const
   ss << "  int moh_depth_pad;\n";
   ss << "  float4 moh_depth_resolution;\n";
   ss << "  int4 moh_depth_flags;\n";
+  ss << "  float4 moh_csm_matrix[16];\n";
+  ss << "  float4 moh_csm_splits;\n";
+  ss << "  float4 moh_csm_camera0;\n";
+  ss << "  float4 moh_csm_camera1;\n";
+  ss << "  int4 moh_csm_flags;\n";
 
   if (user_post_process)
   {
@@ -736,7 +761,13 @@ std::string PostProcessing::GetHeader(bool user_post_process) const
   ss << "SAMPLER_BINDING(0) uniform sampler2DArray samp0;\n";
   ss << "SAMPLER_BINDING(1) uniform sampler2DArray samp1;\n";
   if (user_post_process)
+  {
     ss << "SAMPLER_BINDING(2) uniform sampler2DArray samp_depth;\n";
+    ss << "SAMPLER_BINDING(3) uniform sampler2DArray samp_csm0;\n";
+    ss << "SAMPLER_BINDING(4) uniform sampler2DArray samp_csm1;\n";
+    ss << "SAMPLER_BINDING(5) uniform sampler2DArray samp_csm2;\n";
+    ss << "SAMPLER_BINDING(6) uniform sampler2DArray samp_csm3;\n";
+  }
 
   if (g_backend_info.bSupportsGeometryShaders)
   {
@@ -771,6 +802,7 @@ float SampleRawDepthLocation(float2 location)
 float SampleSceneDepth() { return SampleRawDepthLocation(v_tex0.xy); }
 float2 GetDepthResolution() { return moh_depth_resolution.xy; }
 float2 GetInvDepthResolution() { return moh_depth_resolution.zw; }
+bool HasTrueCSM() { return moh_csm_flags.x != 0; }
 )";
   }
 
@@ -1001,6 +1033,7 @@ void PostProcessing::BlitFromTextureDefault(
       m_default_uniform_staging_buffer.data(),
       false,
       false,
+      nullptr,
       nullptr);
 
   g_vertex_manager
@@ -1025,7 +1058,7 @@ void PostProcessing::BlitFromTextureDefault(
 size_t PostProcessing::CalculateUniformsSize(bool user_post_process) const
 {
   // Allocate a vec4 for each uniform to simplify allocation.
-  return sizeof(BuiltinUniforms) + sizeof(MohDepthUniforms) +
+  return sizeof(BuiltinUniforms) + sizeof(MohDepthUniforms) + sizeof(MOHCSMReceiverData) +
          (user_post_process ? m_config.GetOptions().size() : 0) * sizeof(float) * 4;
 }
 
@@ -1034,7 +1067,8 @@ void PostProcessing::FillUniformBuffer(const MathUtil::Rectangle<int>& src,
                                        const MathUtil::Rectangle<int>& dst,
                                        const MathUtil::Rectangle<int>& wnd, u8* buffer,
                                        bool user_post_process, bool intermediary_buffer,
-                                       const AbstractTexture* depth_tex)
+                                       const AbstractTexture* depth_tex,
+                                       const MOHCSMReceiverData* csm_data)
 {
   const float rcp_src_width = 1.0f / src_tex->GetWidth();
   const float rcp_src_height = 1.0f / src_tex->GetHeight();
@@ -1100,6 +1134,12 @@ void PostProcessing::FillUniformBuffer(const MathUtil::Rectangle<int>& src,
 
   std::memcpy(buffer, &depth_uniforms, sizeof(depth_uniforms));
   buffer += sizeof(depth_uniforms);
+
+  MOHCSMReceiverData csm_uniforms{};
+  if (csm_data)
+    csm_uniforms = *csm_data;
+  std::memcpy(buffer, &csm_uniforms, sizeof(csm_uniforms));
+  buffer += sizeof(csm_uniforms);
 
   // Don't include the custom pp shader options if they are not necessary,
   // having mismatching uniforms between different shaders can cause issues on some backends

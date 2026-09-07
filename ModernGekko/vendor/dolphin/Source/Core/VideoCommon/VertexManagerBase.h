@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -19,10 +20,26 @@ struct CustomPixelShaderContents;
 class CustomShaderCache;
 class DataReader;
 class GeometryShaderManager;
+class AbstractTexture;
+class VertexShaderManager;
+struct MOHCSMState;
 class NativeVertexFormat;
 class PixelShaderManager;
 class PointerWrap;
 struct PortableVertexDeclaration;
+
+
+// Receiver payload for Medal of Honor: Frontline's host-side PS3-style CSM.
+// All members are vec4-sized so this can be copied directly into a std140 UBO.
+struct MOHCSMReceiverData
+{
+  std::array<std::array<float, 4>, 16> matrix_rows{};
+  std::array<float, 4> splits{};
+  std::array<float, 4> camera0{};
+  std::array<float, 4> camera1{};
+  std::array<s32, 4> flags{};
+};
+static_assert(sizeof(MOHCSMReceiverData) == 320);
 
 struct Slope
 {
@@ -171,6 +188,12 @@ public:
   // Call at the end of a frame.
   void OnEndFrame();
 
+  // True 3D cascaded shadow maps used by the MOH PS3 renderer.  The caster
+  // replays perspective GX geometry into four 1024x1024 depth targets; the
+  // pre-HUD compositor later samples these targets exactly as a shadow receiver.
+  bool PrepareMOHCSMForSampling(MOHCSMReceiverData* out_data);
+  const AbstractTexture* GetMOHCSMTexture(u32 cascade) const;
+
 protected:
   // When utility uniforms are used, the GX uniforms need to be re-written afterwards.
   static void InvalidateConstants();
@@ -230,6 +253,9 @@ private:
                       const AbstractPipeline* current_pipeline);
   void UpdatePipelineConfig();
   void UpdatePipelineObject();
+  void RenderMOHCSMCasters(VertexShaderManager& vertex_shader_manager, u32 base_index,
+                           u32 num_indices, u32 base_vertex, PrimitiveType primitive_type,
+                           const AbstractPipeline* current_pipeline);
 
   const AbstractPipeline*
   GetCustomPipeline(const CustomPixelShaderContents& custom_pixel_shader_contents,
@@ -249,6 +275,7 @@ private:
   bool m_allow_background_execution = true;
 
   std::unique_ptr<CustomShaderCache> m_custom_shader_cache;
+  std::unique_ptr<MOHCSMState> m_moh_csm;
   u64 m_ticks_elapsed = 0;
 
   Common::EventHook m_frame_end_event;
