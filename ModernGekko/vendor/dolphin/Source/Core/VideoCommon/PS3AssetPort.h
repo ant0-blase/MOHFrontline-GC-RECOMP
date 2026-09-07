@@ -48,6 +48,12 @@ std::string GetCurrentLevel();
 
 Class Classify(std::string_view path);
 
+// Independent PS3 asset switches. Defaults are intentionally diagnostic:
+// TPK/RSX + static MSH ON, skinned DMF OFF.
+bool IsTPKRSXEnabled();
+bool IsMSHEnabled();
+bool IsDMFEnabled();
+
 // General resolver. This is the one entry point that every future file-load
 // hook should use instead of maintaining separate hard-coded tables.
 Match Resolve(std::string_view guest_path, Class wanted = Class::Unknown);

@@ -1,8 +1,10 @@
 #include "VideoCommon/PS3MeshPort.h"
+#include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/MSH.h"
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 
 namespace PS3MeshPort
 {
@@ -26,12 +28,25 @@ u32 LE32(const u8* p)
 
 bool ParseMSHv8(std::span<const u8> bytes, StaticMesh* out)
 {
-  return MOHFrontline::PS3::MSH::Decode(bytes, out);
+  if (!PS3AssetPort::IsMSHEnabled())
+    return false;
+
+  const bool ok = MOHFrontline::PS3::MSH::Decode(bytes, out);
+  static unsigned logs = 0;
+  if (ok && out && logs++ < 64)
+  {
+    std::fprintf(stderr, "[moh-ps3-msh] decoded static MSH: submeshes=%zu\n",
+                 out->submeshes.size());
+  }
+  return ok;
 }
 
 DMFInfo InspectDMF(std::span<const u8> bytes)
 {
   DMFInfo out;
+
+  if (!PS3AssetPort::IsDMFEnabled())
+    return out;
 
   if (bytes.size() < 0x5c || std::memcmp(bytes.data(), "DMF\0", 4) != 0)
     return out;
@@ -73,6 +88,14 @@ DMFInfo InspectDMF(std::span<const u8> bytes)
     return {};
 
   out.valid = true;
+
+  static unsigned logs = 0;
+  if (logs++ < 32)
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-dmf] inspected DMF: version=%u meshes=%u materials=%u bones=%u\n",
+                 out.version, out.mesh_count, out.material_count, out.bone_ref_count);
+  }
   return out;
 }
 

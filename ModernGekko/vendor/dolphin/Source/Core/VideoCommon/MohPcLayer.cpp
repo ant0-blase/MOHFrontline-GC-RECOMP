@@ -97,7 +97,7 @@ struct State
   std::atomic<bool> gamepad_enabled{true};
   std::atomic<bool> invert_x{false};
   std::atomic<bool> invert_y{false};
-  std::atomic<bool> ui_safe{true};
+  std::atomic<bool> ui_safe{false};
   std::atomic<bool> adaptive_fps{false};
   std::atomic<u32> armed_present_xfb{0};
   std::atomic<u32> direct_presented_xfb{0};
@@ -267,7 +267,7 @@ std::vector<PS3FontDrawRequest>
     s_ps3_font_draw_requests;
 
 std::atomic<bool>
-    s_ps3_font_replace_enabled{true};
+    s_ps3_font_replace_enabled{false};
 
 std::atomic<bool>
     s_ps3_texture_replace_enabled{true};
@@ -1101,7 +1101,7 @@ void ResetDefaults()
   s.gamepad_deadzone = 0.10f;
   s.adaptive_fps = false;
   s.adaptive_profile = 0;
-  s.ui_safe = true;
+  s.ui_safe = false;
   s.hud_scale = 1.0f;
   s.hud_safe_width = 1.0f;
   s.fire_button = 0;
@@ -1137,6 +1137,7 @@ void SyncFromEnvironment()
   s.enhanced_graphics = EnvTrue("MOH_ENHANCED_GRAPHICS", s.enhanced_graphics.load());
   s.invert_x = EnvTrue("MOH_MOUSE_INVERT_X", s.invert_x.load());
   s.invert_y = EnvTrue("MOH_MOUSE_INVERT_Y", s.invert_y.load());
+  s_ps3_font_replace_enabled.store(EnvTrue("MOH_PS3_FONTS", false), std::memory_order_relaxed);
   s.ui_safe = EnvTrue("MOH_UI_SAFE", s.ui_safe.load());
   s.hud_scale = static_cast<float>(std::clamp(EnvDouble("MOH_HUD_SCALE", s.hud_scale.load()), 0.50, 1.50));
   s.hud_safe_width = static_cast<float>(std::clamp(EnvDouble("MOH_HUD_SAFE_WIDTH", s.hud_safe_width.load()), 0.70, 1.0));

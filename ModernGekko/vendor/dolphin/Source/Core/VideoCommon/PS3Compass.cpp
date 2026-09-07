@@ -1,4 +1,5 @@
 #include "VideoCommon/PS3Compass.h"
+#include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 
@@ -879,6 +880,21 @@ std::unordered_map<
 
 std::unordered_set<u64> auto3d_rejected;
 
+std::unordered_map<
+    u64,
+    std::shared_ptr<VideoCommon::CustomTextureData>>
+    strict_level_matches;
+std::unordered_set<u64> strict_level_rejected;
+
+bool StrictLevelTexturesEnabled()
+{
+  const char* value = std::getenv("MOH_PS3_STRICT_LEVEL_TEXTURES");
+  if (!value || !*value)
+    return true;
+  const std::string lower = Lower(std::string(value));
+  return lower != "0" && lower != "false" && lower != "off" && lower != "no";
+}
+
 bool Auto3DEnabled()
 {
   const char* value = std::getenv("MOH_PS3_AUTO_3D");
@@ -1079,6 +1095,8 @@ void ResetAuto3DCacheLocked()
   auto3d_candidates.clear();
   auto3d_matches.clear();
   auto3d_rejected.clear();
+  strict_level_matches.clear();
+  strict_level_rejected.clear();
 }
 
 void SetAuto3DLevelScope(
@@ -1106,6 +1124,37 @@ void SetAuto3DLevelScope(
           "<frontend>" :
           auto3d_level_scope.c_str(),
       reason ? reason : "unknown");
+}
+
+void UpdateLevelScopeFromGuestName(std::string_view guest_name)
+{
+  const std::string path = Normalize(std::string(guest_name));
+  const std::string filename = Filename(guest_name);
+
+  if (filename == "start.gsh" || filename == "return.gsh")
+  {
+    SetAuto3DLevelScope({}, "frontend guest request");
+    return;
+  }
+
+  for (const std::string& level : MOHFrontline::NativeAssets::GetLevels())
+  {
+    const std::string load_gsh = "load" + level + ".gsh";
+    const std::string load_ssh = "load" + level + ".ssh";
+    const std::string level_component = "/" + level + "/";
+
+    if (filename != load_gsh && filename != load_ssh &&
+        path.find(level_component) == std::string::npos)
+      continue;
+
+    const auto underscore = level.find('_');
+    if (underscore == std::string::npos || underscore == 0)
+      continue;
+
+    SetAuto3DLevelScope("data/" + level.substr(0, underscore) + "/" + level + "/",
+                        "guest level identity");
+    return;
+  }
 }
 
 void UpdateAuto3DScope(
@@ -1449,6 +1498,138 @@ DecodeAuto3DWinner(
   return DecodeResource(&temporary);
 }
 
+std::shared_ptr<VideoCommon::CustomTextureData>
+FindStrictCurrentLevelTexture(const TextureInfo& info)
+{
+  if (!StrictLevelTexturesEnabled() ||
+      !MohPcLayer::IsPS3TextureReplacementEnabled() ||
+      !PS3RemasterAssets::IsReady() ||
+      !info.IsDataValid() || info.IsFromTmem() ||
+      info.GetTextureFormat() == TextureFormat::XFB ||
+      !info.GetData() || !info.GetTextureSize())
+    return nullptr;
+
+  const u32 width = info.GetRawWidth();
+  const u32 height = info.GetRawHeight();
+  if (width < 32 || height < 16 || width > 2048 || height > 2048)
+    return nullptr;
+
+  const u64 key = Auto3DKey(info);
+  {
+    std::scoped_lock lock(auto3d_mutex);
+    if (auto3d_level_scope.empty())
+      return nullptr;
+    if (const auto it = strict_level_matches.find(key); it != strict_level_matches.end())
+      return it->second;
+    if (strict_level_rejected.contains(key))
+      return nullptr;
+    BuildAuto3DCandidatesLocked();
+  }
+
+  std::vector<u8> gc_rgba(std::size_t(width) * height * 4u);
+  TexDecoder_Decode(gc_rgba.data(), info.GetData(), static_cast<int>(width),
+                    static_cast<int>(height), info.GetTextureFormat(),
+                    info.GetTlutAddress(), info.GetTlutFormat());
+
+  const Auto3DFingerprint gc = MakeAuto3DFingerprint(gc_rgba.data(), width, height);
+  if (gc.contrast < 0.018f)
+    return nullptr;
+
+  const float gc_aspect = static_cast<float>(width) / static_cast<float>(height);
+  struct Winner
+  {
+    std::string path;
+    float best = std::numeric_limits<float>::infinity();
+    float second = std::numeric_limits<float>::infinity();
+  };
+  Winner sky;
+  Winner level;
+
+  {
+    std::scoped_lock lock(auto3d_mutex);
+    for (const auto& candidate : auto3d_candidates)
+    {
+      // Strict level fallback is level-local only. Global weapon/character
+      // materials belong to the exact TPK/RSX path below.
+      if (!candidate.relative_path.starts_with(auto3d_level_scope) ||
+          (candidate.relative_path.find("level.viv::") == std::string::npos &&
+           candidate.relative_path.find("comp.viv::") == std::string::npos))
+        continue;
+
+      const float candidate_aspect = static_cast<float>(candidate.width) / candidate.height;
+      const float aspect_error = std::abs(std::log(std::max(gc_aspect, 0.0001f) /
+                                                   std::max(candidate_aspect, 0.0001f)));
+      if (aspect_error > 0.08f)
+        continue;
+
+      const float scale_x = static_cast<float>(candidate.width) / width;
+      const float scale_y = static_cast<float>(candidate.height) / height;
+      if (!IsPowerOfTwoLikeScale(scale_x) || !IsPowerOfTwoLikeScale(scale_y))
+        continue;
+
+      const float scale_shape = std::abs(std::log(std::max(scale_x, 0.001f) /
+                                                  std::max(scale_y, 0.001f)));
+      if (scale_shape > 0.10f)
+        continue;
+
+      const float score = Auto3DDistance(gc, candidate.fingerprint) +
+                          aspect_error * 0.30f + scale_shape * 0.12f;
+      Winner& target = IsLikelyCubeFaceCandidate(candidate.relative_path) ? sky : level;
+      if (score < target.best)
+      {
+        target.second = target.best;
+        target.best = score;
+        target.path = candidate.relative_path;
+      }
+      else if (score < target.second)
+      {
+        target.second = score;
+      }
+    }
+  }
+
+  const bool sky_confident = !sky.path.empty() && sky.best <= 0.20f &&
+      (!std::isfinite(sky.second) || sky.second - sky.best >= 0.020f);
+  const bool level_confident = !level.path.empty() && level.best <= 0.12f &&
+      (!std::isfinite(level.second) || level.second - level.best >= 0.055f);
+  const bool choose_sky = sky_confident &&
+      (!level_confident || sky.best + 0.015f < level.best);
+  const std::string chosen = choose_sky ? sky.path :
+      (level_confident ? level.path : std::string{});
+
+  if (chosen.empty())
+  {
+    std::scoped_lock lock(auto3d_mutex);
+    strict_level_rejected.insert(key);
+    return nullptr;
+  }
+
+  auto decoded = DecodeAuto3DWinner(chosen);
+  if (!decoded)
+  {
+    std::scoped_lock lock(auto3d_mutex);
+    strict_level_rejected.insert(key);
+    return nullptr;
+  }
+
+  {
+    std::scoped_lock lock(auto3d_mutex);
+    strict_level_matches[key] = decoded;
+  }
+
+  static unsigned strict_logs = 0;
+  if (strict_logs++ < 160)
+  {
+    std::fprintf(stderr, choose_sky ?
+        "[moh-ps3-sky] STRICT MATCH: GC=%ux%u fmt=%u -> %s score=%.3f\n" :
+        "[moh-ps3-level] STRICT MATCH: GC=%ux%u fmt=%u -> %s score=%.3f\n",
+        width, height, static_cast<unsigned>(info.GetTextureFormat()), chosen.c_str(),
+        choose_sky ? sky.best : level.best);
+  }
+
+  return decoded;
+}
+
 
 struct ExactTPKEntry
 {
@@ -1609,6 +1790,9 @@ DecodeExactPS3TPKTexture(std::string_view scope, std::string_view name)
 std::shared_ptr<VideoCommon::CustomTextureData>
 FindExactTPK1_1(const TextureInfo& info)
 {
+  if (!PS3AssetPort::IsTPKRSXEnabled())
+    return nullptr;
+
   std::string scope;
   {
     std::scoped_lock lock(auto3d_mutex);
@@ -1674,26 +1858,18 @@ std::unordered_map<
 
 bool LevelPortEnabled()
 {
-  const char* value =
-      std::getenv("MOH_PS3_LEVEL_PORT");
-
-  // UV-safe default:
-  // PS3 TPK textures frequently use a different atlas/UV layout than GC.
-  // Applying them to the original GC mesh causes white/purple/striped
-  // surfaces. Keep exact level-material replacement opt-in until the
-  // matching PS3 MSH/DMF geometry path is active.
-  if (!value || !*value)
+  if (!PS3AssetPort::IsTPKRSXEnabled())
     return false;
 
-  const std::string lower =
-      Lower(std::string(value));
+  const char* value = std::getenv("MOH_PS3_LEVEL_PORT");
 
-  return lower == "1" ||
-         lower == "true" ||
-         lower == "on" ||
-         lower == "yes" ||
-         lower == "experimental" ||
-         lower == "unsafe";
+  // Exact all-level TPK/RSX material replacement is enabled with the TPK/RSX
+  // path by default. Keep the legacy variable as an explicit kill switch.
+  if (!value || !*value)
+    return true;
+
+  const std::string lower = Lower(std::string(value));
+  return lower != "0" && lower != "false" && lower != "off" && lower != "no";
 }
 
 std::filesystem::path ResolveLevelPortRoot()
@@ -2002,9 +2178,8 @@ FindExactLevelPortTexture(
 
       std::fprintf(
           stderr,
-          "[moh-ps3-port] UV-safe mode: exact PS3 TPK materials are OFF "
-          "until PS3 mesh/UV replacement is active; "
-          "set MOH_PS3_LEVEL_PORT=experimental to force them\n");
+          "[moh-ps3-port] exact PS3 TPK/RSX materials are OFF "
+          "(MOH_PS3_TPK_RSX=0 or MOH_PS3_LEVEL_PORT=0)\n");
     }
 
     return nullptr;
@@ -2131,6 +2306,18 @@ bool Auto3DFuzzyEnabled()
 std::shared_ptr<VideoCommon::CustomTextureData>
 FindAuto3D(const TextureInfo& info)
 {
+  static bool mode_logged = false;
+  if (!mode_logged)
+  {
+    mode_logged = true;
+    std::fprintf(stderr,
+                 "[moh-ps3-policy] TPK/RSX=%s MSH-decoder=%s DMF-decoder=%s strict-level=%s\n",
+                 PS3AssetPort::IsTPKRSXEnabled() ? "ON" : "OFF",
+                 PS3AssetPort::IsMSHEnabled() ? "ON" : "OFF",
+                 PS3AssetPort::IsDMFEnabled() ? "ON" : "OFF",
+                 StrictLevelTexturesEnabled() ? "ON" : "OFF");
+  }
+
   if (!Auto3DEnabled() ||
       !MohPcLayer::IsPS3TextureReplacementEnabled() ||
       !PS3RemasterAssets::IsReady() ||
@@ -2156,6 +2343,11 @@ FindAuto3D(const TextureInfo& info)
   {
     return exact;
   }
+
+  // Exact TPK/RSX has priority. Sky/current-level SSH matching is next; the
+  // broad fuzzy matcher remains opt-in only.
+  if (auto strict = FindStrictCurrentLevelTexture(info))
+    return strict;
 
   if (!Auto3DFuzzyEnabled())
     return nullptr;
@@ -2413,6 +2605,8 @@ FindAuto3D(const TextureInfo& info)
 
 int NameIndex(std::string_view name)
 {
+  UpdateLevelScopeFromGuestName(name);
+
   const auto* asset =
       FindBestAsset(
           name);
@@ -2621,6 +2815,8 @@ void Shutdown()
     auto3d_candidates.clear();
     auto3d_matches.clear();
     auto3d_rejected.clear();
+    strict_level_matches.clear();
+    strict_level_rejected.clear();
     exact_tpk_decoded.clear();
     level_port_decoded.clear();
     level_port_textures.clear();
