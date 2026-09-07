@@ -33,6 +33,8 @@ u32 LE32(const u8* p)
 }
 std::mutex g_msh_cache_mutex;
 std::unordered_map<std::string, std::shared_ptr<StaticMesh>> g_msh_cache;
+std::mutex g_dmf_cache_mutex;
+std::unordered_map<std::string, DMFInfo> g_dmf_cache;
 
 std::string Lower(std::string text)
 {
@@ -63,6 +65,12 @@ void ClearMSHCache()
 {
   std::scoped_lock lock(g_msh_cache_mutex);
   g_msh_cache.clear();
+}
+
+void ClearDMFCache()
+{
+  std::scoped_lock lock(g_dmf_cache_mutex);
+  g_dmf_cache.clear();
 }
 
 void PreloadCurrentLevelMSH(std::string_view level)
@@ -98,6 +106,20 @@ void PreloadCurrentLevelMSH(std::string_view level)
     }
 
     ++decoded;
+    if (decoded <= 32)
+    {
+      std::size_t vertices = 0;
+      std::size_t indices = 0;
+      for (const auto& sub : mesh->submeshes)
+      {
+        vertices += sub.vertex_count;
+        indices += sub.index_count;
+      }
+      std::fprintf(stderr,
+                   "[moh-ps3-msh] READY: %s submeshes=%zu vertices=%zu indices=%zu\n",
+                   asset.relative_path.c_str(), mesh->submeshes.size(), vertices, indices);
+    }
+
     next[filename] = mesh;
     next[Lower(asset.relative_path)] = mesh;
   }
@@ -111,6 +133,67 @@ void PreloadCurrentLevelMSH(std::string_view level)
                "[moh-ps3-msh] ALL-MSH cache ready: level=%.*s candidates=%zu decoded=%zu rejected=%zu keys=%zu\n",
                static_cast<int>(level.size()), level.data(), candidates, decoded, rejected,
                CachedMSHCount());
+}
+
+void PreloadCurrentLevelDMF(std::string_view level)
+{
+  if (!PS3AssetPort::IsDMFEnabled() || !PS3RemasterAssets::IsReady() || level.empty())
+    return;
+
+  std::unordered_map<std::string, DMFInfo> next;
+  std::size_t candidates = 0;
+  std::size_t decoded = 0;
+  std::size_t rejected = 0;
+  std::size_t total_meshes = 0;
+  std::size_t total_materials = 0;
+
+  for (const auto& asset : PS3RemasterAssets::GetAssets())
+  {
+    const std::string filename = Lower(asset.filename);
+    if (!filename.ends_with(".dmf") || !BelongsToLevel(asset, level))
+      continue;
+
+    ++candidates;
+    const std::vector<u8> bytes = PS3RemasterAssets::ReadBinary(asset);
+    if (bytes.empty())
+    {
+      ++rejected;
+      continue;
+    }
+
+    DMFInfo info = InspectDMF(bytes);
+    if (!info.valid)
+    {
+      ++rejected;
+      continue;
+    }
+
+    ++decoded;
+    total_meshes += info.mesh_count;
+    total_materials += info.material_count;
+
+    if (decoded <= 32)
+    {
+      std::fprintf(stderr,
+                   "[moh-ps3-dmf] READY: %s model=%s version=0x%X meshes=%u materials=%u bones=%u\n",
+                   asset.relative_path.c_str(), info.model_name.c_str(), info.version,
+                   info.mesh_count, info.material_count, info.bone_ref_count);
+    }
+
+    next[filename] = info;
+    next[Lower(asset.relative_path)] = std::move(info);
+  }
+
+  {
+    std::scoped_lock lock(g_dmf_cache_mutex);
+    g_dmf_cache = std::move(next);
+  }
+
+  std::fprintf(stderr,
+               "[moh-ps3-dmf] cache ready: level=%.*s candidates=%zu decoded=%zu rejected=%zu "
+               "meshes=%zu materials=%zu keys=%zu\n",
+               static_cast<int>(level.size()), level.data(), candidates, decoded, rejected,
+               total_meshes, total_materials, CachedDMFCount());
 }
 
 const StaticMesh* FindCachedMSH(std::string_view name_or_path)
@@ -130,6 +213,12 @@ std::size_t CachedMSHCount()
 {
   std::scoped_lock lock(g_msh_cache_mutex);
   return g_msh_cache.size();
+}
+
+std::size_t CachedDMFCount()
+{
+  std::scoped_lock lock(g_dmf_cache_mutex);
+  return g_dmf_cache.size();
 }
 
 bool ParseMSHv8(std::span<const u8> bytes, StaticMesh* out)
@@ -154,8 +243,12 @@ DMFInfo InspectDMF(std::span<const u8> bytes)
   if (!PS3AssetPort::IsDMFEnabled())
     return out;
 
+  // Binary magic is D M F NUL.  "DMF\\0" is five source characters and
+  // comparing its first four bytes checks D M F '\\', rejecting every valid
+  // Frontline DMF before the PS3 0x0502 parser can run.
+  static constexpr std::array<u8, 4> dmf_magic = {'D', 'M', 'F', 0};
   if (bytes.size() < 0x5c ||
-      std::memcmp(bytes.data(), "DMF\\0", 4) != 0)
+      !std::equal(dmf_magic.begin(), dmf_magic.end(), bytes.begin()))
   {
     return out;
   }

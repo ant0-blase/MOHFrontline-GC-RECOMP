@@ -38,6 +38,9 @@ bool IsHostRenderable(const StaticMesh& mesh);
 // instead of resolving one guessed prop at a time.
 void PreloadCurrentLevelMSH(std::string_view level);
 void ClearMSHCache();
+void PreloadCurrentLevelDMF(std::string_view level);
+void ClearDMFCache();
 const StaticMesh* FindCachedMSH(std::string_view name_or_path);
 std::size_t CachedMSHCount();
+std::size_t CachedDMFCount();
 }  // namespace PS3MeshPort

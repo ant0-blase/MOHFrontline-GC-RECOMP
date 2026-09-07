@@ -476,7 +476,7 @@ bool IsTPKRSXEnabled()
          EnvSwitch("MOH_PS3_RSX", true) && EnvSwitch("MOH_PS3_LEVEL_PORT", true);
 }
 bool IsMSHEnabled() { return EnvSwitch("MOH_PS3_MSH", true); }
-bool IsDMFEnabled() { return EnvSwitch("MOH_PS3_DMF", false); }
+bool IsDMFEnabled() { return EnvSwitch("MOH_PS3_DMF", true); }
 bool IsLightingEnabled() { return s_lighting_enabled; }
 
 void Initialize()
@@ -490,6 +490,7 @@ void Initialize()
   }
   s_lit_scene.store(std::shared_ptr<const LitScene>{}, std::memory_order_release);
   PS3MeshPort::ClearMSHCache();
+  PS3MeshPort::ClearDMFCache();
 
   std::fprintf(stderr, "[moh-ps3-lit] bridge %s (strength=%.2f)\n",
                s_lighting_enabled ? "ON" : "OFF", s_lighting_strength);
@@ -503,14 +504,25 @@ void Shutdown()
   }
   s_lit_scene.store(std::shared_ptr<const LitScene>{}, std::memory_order_release);
   PS3MeshPort::ClearMSHCache();
+  PS3MeshPort::ClearDMFCache();
   Native::Shutdown();
 }
 
 void SetCurrentLevel(std::string_view level)
 {
   Native::SetCurrentLevel(level);
-  SyncLevelLighting(level);
-  PS3MeshPort::PreloadCurrentLevelMSH(level);
+  const std::string active_level = Native::GetCurrentLevel();
+  SyncLevelLighting(active_level);
+
+  if (active_level.empty())
+  {
+    PS3MeshPort::ClearMSHCache();
+    PS3MeshPort::ClearDMFCache();
+    return;
+  }
+
+  PS3MeshPort::PreloadCurrentLevelMSH(active_level);
+  PS3MeshPort::PreloadCurrentLevelDMF(active_level);
 }
 
 void SyncLightingLevel(std::string_view level) { SyncLevelLighting(level); }

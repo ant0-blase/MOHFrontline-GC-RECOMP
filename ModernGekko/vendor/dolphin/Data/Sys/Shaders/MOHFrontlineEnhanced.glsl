@@ -159,6 +159,69 @@ float HashNoise(float2 p)
   return frac(sin(dot(p, float2(12.9898, 78.233)) + float(GetTime()) * 0.017) * 43758.5453);
 }
 
+// Live GameCube EFB depth exposed by PostProcessing.cpp.  The PS3 capture uses
+// a camera-depth reconstruction + shadow-map PCF receiver.  Until the host
+// caster pass is replaying the scene four times, this path uses the same depth
+// information to provide geometry-aware directional/contact shadows instead of
+// the old luminance-only fake.
+float DepthAt(float2 uv)
+{
+  return SampleRawDepthLocation(clamp(uv, float2(0.0), float2(1.0)));
+}
+
+float ComputeDepthAO(float2 uv, float depth, float2 px)
+{
+  float occ = 0.0;
+  float2 o1 = px * 2.0;
+  float2 o2 = px * 5.0;
+  float ds;
+
+  ds = DepthAt(uv + float2( o1.x, 0.0)); occ += smoothstep(0.00030, 0.0090, depth - ds);
+  ds = DepthAt(uv + float2(-o1.x, 0.0)); occ += smoothstep(0.00030, 0.0090, depth - ds);
+  ds = DepthAt(uv + float2(0.0,  o1.y)); occ += smoothstep(0.00030, 0.0090, depth - ds);
+  ds = DepthAt(uv + float2(0.0, -o1.y)); occ += smoothstep(0.00030, 0.0090, depth - ds);
+  ds = DepthAt(uv + float2( o2.x,  o2.y)); occ += smoothstep(0.00055, 0.0180, depth - ds);
+  ds = DepthAt(uv + float2(-o2.x,  o2.y)); occ += smoothstep(0.00055, 0.0180, depth - ds);
+  ds = DepthAt(uv + float2( o2.x, -o2.y)); occ += smoothstep(0.00055, 0.0180, depth - ds);
+  ds = DepthAt(uv + float2(-o2.x, -o2.y)); occ += smoothstep(0.00055, 0.0180, depth - ds);
+  return clamp(occ * 0.125, 0.0, 1.0);
+}
+
+float PS3ShadowPCF(float2 uv, float receiver_depth, float2 px,
+                   float2 ray_dir, float travel_px, float bias, float thickness)
+{
+  float2 p = uv + ray_dir * px * travel_px;
+  float2 side = float2(-ray_dir.y, ray_dir.x) * px * 0.85;
+
+  // Four taps, mirroring the 4-tap PCF footprint recovered from the RSX
+  // receiver shader.  Here the taps compare against live scene depth.
+  float s0 = smoothstep(bias, thickness, receiver_depth - DepthAt(p + side));
+  float s1 = smoothstep(bias, thickness, receiver_depth - DepthAt(p - side));
+  float s2 = smoothstep(bias, thickness, receiver_depth - DepthAt(p + side * 0.35 + px * 0.85));
+  float s3 = smoothstep(bias, thickness, receiver_depth - DepthAt(p - side * 0.35 - px * 0.85));
+  return (s0 + s1 + s2 + s3) * 0.25;
+}
+
+float ComputePS3DepthShadow(float2 uv, float depth, float2 px)
+{
+  // Screen-space projection of the same presentation sun direction already
+  // used by the remaster lighting path.  The four travel bands emulate the
+  // near->far coverage of the four 1024x1024 PS3 cascades while the real host
+  // CSM caster is being brought online.
+  float2 ray_dir = normalize(float2(0.42, 0.50));
+
+  float c0 = PS3ShadowPCF(uv, depth, px, ray_dir,  2.5, 0.00030, 0.0065);
+  float c1 = PS3ShadowPCF(uv, depth, px, ray_dir,  5.0, 0.00040, 0.0090);
+  float c2 = PS3ShadowPCF(uv, depth, px, ray_dir, 10.0, 0.00055, 0.0130);
+  float c3 = PS3ShadowPCF(uv, depth, px, ray_dir, 18.0, 0.00075, 0.0190);
+
+  float shadow = max(max(c0, c1 * 0.92), max(c2 * 0.78, c3 * 0.62));
+
+  // Reject sky/far-plane noise and soften tiny depth discontinuities.
+  float valid = 1.0 - smoothstep(0.996, 1.0, depth);
+  return clamp(shadow * valid, 0.0, 1.0);
+}
+
 float3 BrightPass(float3 c)
 {
   float l = Luma(c);
@@ -316,91 +379,52 @@ void main()
 
   if (OptionEnabled(SSAO_ENABLE))
   {
-    float cavity =
-        clamp((ll - lc) * 2.35,
-              0.0,
-              1.0);
+    float cavity;
+    if (HasSceneDepth())
+    {
+      float2 dpx = max(GetInvDepthResolution(), float2(0.00001));
+      cavity = ComputeDepthAO(uv, DepthAt(uv), dpx);
+    }
+    else
+    {
+      // Safe fallback for backends/situations where an EFB depth resolve is
+      // unavailable.
+      cavity = clamp((ll - lc) * 2.35, 0.0, 1.0);
+      float diagonal =
+          (Luma(ne) + Luma(nw) + Luma(se) + Luma(sw)) * 0.25;
+      cavity = max(cavity, clamp((diagonal - lc) * 1.65, 0.0, 1.0));
+    }
 
-    float diagonal =
-        (Luma(ne) +
-         Luma(nw) +
-         Luma(se) +
-         Luma(sw)) * 0.25;
-
-    cavity =
-        max(
-            cavity,
-            clamp((diagonal - lc) * 1.65,
-                  0.0,
-                  1.0));
-
-    center *=
-        1.0 -
-        cavity *
-        SSAO_STRENGTH *
-        0.46;
+    center *= 1.0 - cavity * SSAO_STRENGTH * 0.62;
   }
 
   if (OptionEnabled(CONTACT_SHADOW_ENABLE))
   {
-    // Short-range directional shadowing aligned with the presentation light.
-    //
-    // This is still screen-space. The real long-term solution is a host-side
-    // remaster light/shadow pass driven by the PS3 .lit files.
+    float shadow;
+    if (HasSceneDepth())
+    {
+      float2 dpx = max(GetInvDepthResolution(), float2(0.00001));
+      shadow = ComputePS3DepthShadow(uv, DepthAt(uv), dpx);
+    }
+    else
+    {
+      // Preserve the old luminance fallback when live depth is unavailable.
+      float2 shadow_dir = normalize(float2(0.42, 0.50));
+      float l1 = Luma(SampleLocation(uv + shadow_dir * px * 2.5).rgb);
+      float l2 = Luma(SampleLocation(uv + shadow_dir * px * 5.0).rgb);
+      float l3 = Luma(SampleLocation(uv + shadow_dir * px * 8.0).rgb);
+      float occluder = max(max(l1, l2), l3);
+      float directional_shadow = clamp((occluder - lc) * 1.65, 0.0, 1.0);
+      float gx = abs(Luma(e) - Luma(w));
+      float gy = abs(Luma(s1) - Luma(n));
+      float edge = clamp((gx + gy) * 2.0, 0.0, 1.0);
+      float edge_shadow = edge * clamp(ll - lc + 0.04, 0.0, 1.0) * 0.65;
+      shadow = max(directional_shadow, edge_shadow);
+    }
 
-    float2 shadow_dir =
-        normalize(float2(0.42, 0.50));
-
-    float l1 =
-        Luma(
-            SampleLocation(
-                uv + shadow_dir * px * 2.5).rgb);
-
-    float l2 =
-        Luma(
-            SampleLocation(
-                uv + shadow_dir * px * 5.0).rgb);
-
-    float l3 =
-        Luma(
-            SampleLocation(
-                uv + shadow_dir * px * 8.0).rgb);
-
-    float occluder =
-        max(max(l1, l2), l3);
-
-    float directional_shadow =
-        clamp((occluder - lc) * 1.65,
-              0.0,
-              1.0);
-
-    float gx =
-        abs(Luma(e) - Luma(w));
-
-    float gy =
-        abs(Luma(s1) - Luma(n));
-
-    float edge =
-        clamp((gx + gy) * 2.0,
-              0.0,
-              1.0);
-
-    float edge_shadow =
-        edge *
-        clamp(ll - lc + 0.04,
-              0.0,
-              1.0) *
-        0.65;
-
-    float shadow =
-        max(directional_shadow,
-            edge_shadow);
-
-    center *=
-        1.0 -
-        shadow *
-        CONTACT_SHADOW_STRENGTH *
-        0.48;
+    // Existing slider now controls actual depth-aware shadows.  0.86 keeps
+    // them visible at the old default 0.18 while still allowing a soft look.
+    center *= 1.0 - shadow * CONTACT_SHADOW_STRENGTH * 0.86;
   }
 
   if (OptionEnabled(BLOOM_ENABLE))

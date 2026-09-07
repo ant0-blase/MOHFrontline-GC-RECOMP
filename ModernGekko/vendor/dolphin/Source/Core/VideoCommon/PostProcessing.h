@@ -139,7 +139,7 @@ protected:
   void FillUniformBuffer(const MathUtil::Rectangle<int>& src, const AbstractTexture* src_tex,
                          int src_layer, const MathUtil::Rectangle<int>& dst,
                          const MathUtil::Rectangle<int>& wnd, u8* buffer, bool user_post_process,
-                         bool intermediary_buffer);
+                         bool intermediary_buffer, const AbstractTexture* depth_tex);
 
   // Timer for determining our time value
   Common::Timer m_timer;

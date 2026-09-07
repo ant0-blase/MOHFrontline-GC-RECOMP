@@ -24,6 +24,8 @@
 #include "VideoCommon/AbstractPipeline.h"
 #include "VideoCommon/AbstractShader.h"
 #include "VideoCommon/AbstractTexture.h"
+#include "VideoCommon/FramebufferManager.h"
+#include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/Present.h"
 #include "VideoCommon/ShaderCache.h"
 #include "VideoCommon/ShaderCompileUtils.h"
@@ -513,10 +515,24 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
   src_layer = std::max(src_layer, 0);
 
   MathUtil::Rectangle<int> src_rect = src;
+
+  // Feed live EFB depth to the MOH user shader only. This is deliberately
+  // scoped to gameplay so ordinary Dolphin post-processing pays no resolve cost.
+  AbstractTexture* moh_depth_tex = nullptr;
+  if (m_config.GetShader() == "MOHFrontlineEnhanced" && MohPcLayer::IsGameplayActive() &&
+      g_framebuffer_manager)
+  {
+    const MathUtil::Rectangle<int> efb_rect(0, 0, g_framebuffer_manager->GetEFBWidth(),
+                                            g_framebuffer_manager->GetEFBHeight());
+    moh_depth_tex = g_framebuffer_manager->ResolveEFBDepthTexture(efb_rect, true);
+  }
+
   g_gfx->SetSamplerState(0, RenderState::GetLinearSamplerState());
   g_gfx->SetSamplerState(1, RenderState::GetPointSamplerState());
+  g_gfx->SetSamplerState(2, RenderState::GetPointSamplerState());
   g_gfx->SetTexture(0, src_tex);
   g_gfx->SetTexture(1, src_tex);
+  g_gfx->SetTexture(2, moh_depth_tex ? moh_depth_tex : src_tex);
 
   const bool needs_color_correction = IsColorCorrectionActive();
   // Rely on the default (bi)linear sampler with the default mode
@@ -571,7 +587,7 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
 
     FillUniformBuffer(src_rect, src_tex, src_layer, g_gfx->GetCurrentFramebuffer()->GetRect(),
                       present_rect, uniform_staging_buffer->data(), !default_uniform_staging_buffer,
-                      true);
+                      true, moh_depth_tex);
     g_vertex_manager->UploadUtilityUniforms(uniform_staging_buffer->data(),
                                             static_cast<u32>(uniform_staging_buffer->size()));
 
@@ -585,6 +601,7 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
     src_tex = m_intermediary_color_texture.get();
     g_gfx->SetTexture(0, src_tex);
     g_gfx->SetTexture(1, src_tex);
+    g_gfx->SetTexture(2, moh_depth_tex ? moh_depth_tex : src_tex);
     // The "m_intermediary_color_texture" has already copied
     // from the specified source layer onto its first one.
     // If we query for a layer that the source texture doesn't have,
@@ -622,7 +639,7 @@ void PostProcessing::BlitFromTexture(const MathUtil::Rectangle<int>& dst,
   {
     FillUniformBuffer(src_rect, src_tex, src_layer, g_gfx->GetCurrentFramebuffer()->GetRect(),
                       present_rect, uniform_staging_buffer->data(), !default_uniform_staging_buffer,
-                      false);
+                      false, moh_depth_tex);
     g_vertex_manager->UploadUtilityUniforms(uniform_staging_buffer->data(),
                                             static_cast<u32>(uniform_staging_buffer->size()));
 
@@ -665,6 +682,9 @@ std::string PostProcessing::GetUniformBufferHeader(bool user_post_process) const
   ss << "  int hdr_output;\n";
   ss << "  float hdr_paper_white_nits;\n";
   ss << "  float hdr_sdr_white_nits;\n";
+  ss << "  int moh_depth_pad;\n";
+  ss << "  float4 moh_depth_resolution;\n";
+  ss << "  int4 moh_depth_flags;\n";
 
   if (user_post_process)
   {
@@ -715,6 +735,8 @@ std::string PostProcessing::GetHeader(bool user_post_process) const
   ss << GetUniformBufferHeader(user_post_process);
   ss << "SAMPLER_BINDING(0) uniform sampler2DArray samp0;\n";
   ss << "SAMPLER_BINDING(1) uniform sampler2DArray samp1;\n";
+  if (user_post_process)
+    ss << "SAMPLER_BINDING(2) uniform sampler2DArray samp_depth;\n";
 
   if (g_backend_info.bSupportsGeometryShaders)
   {
@@ -734,7 +756,25 @@ float4 Sample() { return texture(samp0, v_tex0); }
 float4 SampleLocation(float2 location) { return texture(samp0, float3(location, float(v_tex0.z))); }
 float4 SampleLayer(int layer) { return texture(samp0, float3(v_tex0.xy, float(layer))); }
 #define SampleOffset(offset) textureOffset(samp0, v_tex0, offset)
+)";
 
+  if (user_post_process)
+  {
+    ss << R"(
+bool HasSceneDepth() { return moh_depth_flags.x != 0; }
+float SampleRawDepthLocation(float2 location)
+{
+  float d = texture(samp_depth,
+                    float3(clamp(location, float2(0.0), float2(1.0)), 0.0)).r;
+  return moh_depth_flags.y != 0 ? 1.0 - d : d;
+}
+float SampleSceneDepth() { return SampleRawDepthLocation(v_tex0.xy); }
+float2 GetDepthResolution() { return moh_depth_resolution.xy; }
+float2 GetInvDepthResolution() { return moh_depth_resolution.zw; }
+)";
+  }
+
+  ss << R"(
 float2 GetTargetResolution()
 {
   return target_resolution.xy;
@@ -884,7 +924,16 @@ struct BuiltinUniforms
   s32 hdr_output;
   float hdr_paper_white_nits;
   float hdr_sdr_white_nits;
+  s32 moh_depth_pad;
 };
+
+struct MohDepthUniforms
+{
+  std::array<float, 4> resolution;
+  std::array<s32, 4> flags;
+};
+static_assert(sizeof(MohDepthUniforms) == 32,
+              "MOH depth uniforms must occupy two std140 vec4 slots");
 
 void PostProcessing::BlitFromTextureDefault(
     const MathUtil::Rectangle<int>& dst,
@@ -951,7 +1000,8 @@ void PostProcessing::BlitFromTextureDefault(
       present_rect,
       m_default_uniform_staging_buffer.data(),
       false,
-      false);
+      false,
+      nullptr);
 
   g_vertex_manager
       ->UploadUtilityUniforms(
@@ -975,7 +1025,7 @@ void PostProcessing::BlitFromTextureDefault(
 size_t PostProcessing::CalculateUniformsSize(bool user_post_process) const
 {
   // Allocate a vec4 for each uniform to simplify allocation.
-  return sizeof(BuiltinUniforms) +
+  return sizeof(BuiltinUniforms) + sizeof(MohDepthUniforms) +
          (user_post_process ? m_config.GetOptions().size() : 0) * sizeof(float) * 4;
 }
 
@@ -983,7 +1033,8 @@ void PostProcessing::FillUniformBuffer(const MathUtil::Rectangle<int>& src,
                                        const AbstractTexture* src_tex, int src_layer,
                                        const MathUtil::Rectangle<int>& dst,
                                        const MathUtil::Rectangle<int>& wnd, u8* buffer,
-                                       bool user_post_process, bool intermediary_buffer)
+                                       bool user_post_process, bool intermediary_buffer,
+                                       const AbstractTexture* depth_tex)
 {
   const float rcp_src_width = 1.0f / src_tex->GetWidth();
   const float rcp_src_height = 1.0f / src_tex->GetHeight();
@@ -1026,9 +1077,29 @@ void PostProcessing::FillUniformBuffer(const MathUtil::Rectangle<int>& src,
   builtin_uniforms.hdr_paper_white_nits = g_ActiveConfig.color_correction.fHDRPaperWhiteNits;
   // A value of 1 1 1 usually matches 80 nits in HDR
   builtin_uniforms.hdr_sdr_white_nits = 80.f;
+  builtin_uniforms.moh_depth_pad = 0;
 
   std::memcpy(buffer, &builtin_uniforms, sizeof(builtin_uniforms));
   buffer += sizeof(builtin_uniforms);
+
+  MohDepthUniforms depth_uniforms{};
+  if (depth_tex)
+  {
+    depth_uniforms.resolution = {
+        static_cast<float>(depth_tex->GetWidth()),
+        static_cast<float>(depth_tex->GetHeight()),
+        1.0f / static_cast<float>(depth_tex->GetWidth()),
+        1.0f / static_cast<float>(depth_tex->GetHeight())};
+    depth_uniforms.flags[0] = 1;
+    depth_uniforms.flags[1] = g_backend_info.bSupportsReversedDepthRange ? 1 : 0;
+  }
+  else
+  {
+    depth_uniforms.resolution = {1.0f, 1.0f, 1.0f, 1.0f};
+  }
+
+  std::memcpy(buffer, &depth_uniforms, sizeof(depth_uniforms));
+  buffer += sizeof(depth_uniforms);
 
   // Don't include the custom pp shader options if they are not necessary,
   // having mismatching uniforms between different shaders can cause issues on some backends

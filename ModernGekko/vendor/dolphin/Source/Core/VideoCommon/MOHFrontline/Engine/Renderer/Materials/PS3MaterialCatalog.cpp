@@ -3,6 +3,7 @@
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 #include <cstdio>
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <mutex>
 #include <set>
@@ -10,6 +11,22 @@ namespace MOHFrontline::Materials
 {
 namespace
 {
+std::string CanonicalTPKName(std::string_view input)
+{
+  std::string name(input);
+  const auto slash = name.find_last_of("/\\:");
+  if (slash != std::string::npos)
+    name.erase(0, slash + 1);
+
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+  if (name.ends_with(".gsh") || name.ends_with(".ssh"))
+    name.resize(name.size() - 4);
+
+  return name;
+}
+
 struct Catalog
 {
   const PS3RemasterAssets::AssetInfo* rsx = nullptr;
@@ -44,7 +61,13 @@ Catalog& Get(std::string_view level)
   for (auto& r : records)
   {
     if (r.offset > c.rsx->size || r.size > c.rsx->size - r.offset) { ++stats.failures; continue; }
-    const auto name = r.name;
+    const auto name = CanonicalTPKName(r.name);
+    if (name.empty())
+    {
+      ++stats.failures;
+      continue;
+    }
+    r.name = name;
     if (ambiguous.contains(name)) continue;
     if (auto existing = c.records.find(name); existing != c.records.end())
     {
@@ -59,21 +82,24 @@ Catalog& Get(std::string_view level)
     else c.records.emplace(name, std::move(r));
   }
   ++stats.catalogs; stats.records += c.records.size();
-  std::fprintf(stderr, "[moh-ps3-tpk] loaded level=%.*s records=%zu (awaiting guest material binding)\n",
+  std::fprintf(stderr, "[moh-ps3-tpk] loaded level=%.*s records=%zu (exact guest-name binding ready)\n",
                int(level.size()), level.data(), c.records.size());
   return c;
 }
 }
 bool HasTexture(std::string_view level, std::string_view name)
 {
-  std::scoped_lock lock(mutex); return Get(level).records.contains(name);
+  std::scoped_lock lock(mutex);
+  return Get(level).records.contains(CanonicalTPKName(name));
 }
 std::shared_ptr<const std::vector<PS3TextureDecoder::Level>> LoadTexture(std::string_view level, std::string_view name)
 {
   std::scoped_lock lock(mutex);
   auto& c = Get(level);
-  if (auto it = c.decoded.find(name); it != c.decoded.end()) return it->second;
-  const auto found = c.records.find(name);
+  const std::string key = CanonicalTPKName(name);
+  if (key.empty()) return {};
+  if (auto it = c.decoded.find(key); it != c.decoded.end()) return it->second;
+  const auto found = c.records.find(key);
   if (found == c.records.end()) return {};
   const auto& r = found->second;
   auto decoded = DecodeRSXTexture(*c.rsx, r.offset, r.size, r.descriptor);
@@ -81,16 +107,16 @@ std::shared_ptr<const std::vector<PS3TextureDecoder::Level>> LoadTexture(std::st
   {
     ++stats.failures;
     std::fprintf(stderr, "[moh-ps3-tpk] FAIL level=%.*s record=%.*s reason=RSX range or texture decode\n",
-                 int(level.size()), level.data(), int(name.size()), name.data());
+                 int(level.size()), level.data(), int(key.size()), key.data());
   }
   else
   {
     ++stats.decoded;
     std::fprintf(stderr, "[moh-ps3-tpk] material=%.*s texture=%.*s size=%ux%u\n",
-                 int(name.size()), name.data(), int(name.size()), name.data(),
+                 int(key.size()), key.data(), int(key.size()), key.data(),
                  decoded->front().width, decoded->front().height);
   }
-  c.decoded[std::string(name)] = decoded;
+  c.decoded[key] = decoded;
   return decoded;
 }
 std::shared_ptr<const std::vector<PS3TextureDecoder::Level>> DecodeRSXTexture(

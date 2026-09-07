@@ -1220,8 +1220,7 @@ void SetAuto3DLevelScope(
   if (auto3d_level_scope == scope)
     return;
 
-  MOHFrontline::NativeAssets::SetCurrentLevel(scope);
-  PS3AssetPort::SyncLightingLevel(scope);
+  PS3AssetPort::SetCurrentLevel(scope);
   auto3d_level_scope = std::move(scope);
   ResetAuto3DCacheLocked();
   {
@@ -3303,18 +3302,62 @@ FindExactLevelPortTexture(
   if (!has_found)
     return nullptr;
 
+  // The manifest remains useful as an exact GC identity table, but the cached
+  // texture payloads were produced by an older TPK extractor which pre-dates
+  // the corrected TPAC data-base handling.  Do not upload those stale files.
+  //
+  // Resolve the material name back through the live TPK catalog and decode the
+  // texture directly from the current level's rsx.viv instead.
+  const auto underscore = level.find('_');
+  if (underscore == std::string::npos || underscore == 0)
+    return nullptr;
+
+  const std::string scope =
+      "data/" + level.substr(0, underscore) + "/" + level + "/";
+
   auto decoded =
-      DecodeLevelPortFile(
-          found.texture_path);
+      DecodeExactPS3TPKTexture(
+          scope,
+          found.name);
+
+  // Explicit debug-only escape hatch for comparing against an old generated
+  // PS3_PORT_CACHE.  Production fallback is the original GameCube texture.
+  if (!decoded)
+  {
+    const char* legacy_cache =
+        std::getenv("MOH_PS3_LEGACY_PORT_CACHE");
+
+    if (legacy_cache &&
+        std::string_view(legacy_cache) == "1")
+    {
+      decoded =
+          DecodeLevelPortFile(
+              found.texture_path);
+    }
+  }
 
   if (!decoded)
+  {
+    static unsigned live_fail_logs = 0;
+    if (live_fail_logs++ < 64)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-ps3-tpk] LIVE EXACT fallback to GC: "
+          "level=%s material=%s hash=%016llX\n",
+          level.c_str(),
+          found.name.c_str(),
+          static_cast<unsigned long long>(
+              texture_hash));
+    }
     return nullptr;
+  }
 
   std::fprintf(
       stderr,
-      "[moh-ps3-port] EXACT MATERIAL: "
+      "[moh-ps3-tpk] LIVE EXACT MATERIAL: "
       "level=%s GC=%ux%u fmt=%u hash=%016llX "
-      "-> %s%s%s\n",
+      "-> TPK::%s%s%s\n",
       level.c_str(),
       width,
       height,
@@ -3372,17 +3415,24 @@ FindAuto3D(const TextureInfo& info)
     return nullptr;
   }
 
-  // Legacy offline hashes are diagnostic only. Production TPK identities
-  // arrive from the guest pack loader, with the original texture name.
-  if (const char* legacy = std::getenv("MOH_PS3_LEGACY_TPK_HASH");
-      legacy && std::string_view(legacy) == "1")
+  // Exact TPK/RSX material replacements are safe to run by default: both
+  // paths require an exact GC identity (level + dimensions/format + hash).
+  // Keeping them behind MOH_PS3_LEGACY_TPK_HASH made TPK/RSX report ON while
+  // no TPK texture could reach the renderer.
+  if (PS3AssetPort::IsTPKRSXEnabled())
   {
+    static bool exact_tpk_logged = false;
+    if (!exact_tpk_logged)
+    {
+      exact_tpk_logged = true;
+      std::fprintf(stderr, "[moh-ps3-tpk] exact runtime bridge ON\n");
+    }
+
     if (auto exact = FindExactLevelPortTexture(info)) return exact;
     if (auto exact = FindExactTPK1_1(info)) return exact;
   }
 
-  // Exact TPK/RSX has priority. Sky/current-level SSH matching is next; the
-  // broad fuzzy matcher remains opt-in only.
+  // Sky/current-level SSH matching is next; broad fuzzy matching remains opt-in.
   if (auto strict = FindStrictCurrentLevelTexture(info))
     return strict;
 
@@ -3663,6 +3713,38 @@ int NameIndex(std::string_view name)
   }
   else
   {
+    // Prefer exact current-level TPK material data while the original GC name
+    // is still available. TPKIndex() creates a decoded Resource backed by the
+    // PS3 rsx.viv payload; Register()/Find() keep the normal exact GC
+    // address/hash validation before the replacement reaches TextureCache.
+    const std::string normalized_guest = Normalize(std::string(name));
+    const std::string guest_file = Filename(name);
+
+    const bool frontend_or_global =
+        normalized_guest.find("mohfl_exports/") != std::string::npos ||
+        normalized_guest.find("pausescreen/") != std::string::npos ||
+        normalized_guest.find("bitmaps/") != std::string::npos ||
+        normalized_guest.find("loading/") != std::string::npos ||
+        normalized_guest.find("shell/") != std::string::npos;
+
+    if (!frontend_or_global && guest_file.ends_with(".gsh"))
+    {
+      std::string tpk_name = guest_file;
+      tpk_name.resize(tpk_name.size() - 4);
+
+      if (const int tpk_index = TPKIndex(tpk_name); tpk_index >= 0)
+      {
+        static unsigned tpk_bind_logs = 0;
+        if (tpk_bind_logs++ < 160)
+        {
+          std::fprintf(stderr,
+                       "[moh-ps3-tpk] NAME BIND: guest=%.*s -> current-level TPK::%s\n",
+                       static_cast<int>(name.size()), name.data(), tpk_name.c_str());
+        }
+        return tpk_index;
+      }
+    }
+
     asset = FindBestAsset(name);
   }
 
