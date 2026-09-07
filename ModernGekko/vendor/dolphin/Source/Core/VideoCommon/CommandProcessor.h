@@ -178,6 +178,7 @@ public:
   void SetCPStatusFromGPU();
   void SetCPStatusFromCPU();
   void GatherPipeBursted();
+  void ServicePendingFifoInterrupt();
   void UpdateInterrupts(u64 userdata);
   void UpdateInterruptsFromVideoBackend(u64 userdata);
 
@@ -227,6 +228,8 @@ private:
 
   Common::Flag m_interrupt_set;
   Common::Flag m_interrupt_waiting;
+  std::atomic<u64> m_pending_fifo_interrupt{0};
+  u64 m_fifo_interrupt_serial = 0;
 
   // CPU writes are rare; GPU wakeups are extremely frequent. The generation
   // itself is atomic because it crosses threads, while the seen value belongs

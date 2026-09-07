@@ -3399,12 +3399,13 @@ FindExactLevelPortTexture(
   const std::string scope =
       "data/" + level.substr(0, underscore) + "/" + level + "/";
 
-  // v6: the PS3 Thompson MSH uses the two legacy GC material slots in the
-  // opposite order. Keep this deliberately narrow so every other material
-  // keeps its exact manifest binding.
+  // Texture-cache entries are shared by rigid and animated Thompson draws.
+  // A global wood/metal swap corrupts the GC viewmodel retained by the DMF
+  // safety gate. Preserve the exact authored material identity by default;
+  // any future MSH material reassignment belongs to its draw, not this cache.
   std::string material_name = found.name;
 
-  bool thompson_material_remap = true;
+  bool thompson_material_remap = false;
   if (const char* value =
           std::getenv("MOH_PS3_THOMPSON_MATERIAL_REMAP");
       value && *value)

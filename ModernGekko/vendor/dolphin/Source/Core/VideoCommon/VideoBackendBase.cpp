@@ -43,6 +43,7 @@
 #endif
 
 #include "VideoCommon/AbstractGfx.h"
+#include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/AsyncRequests.h"
 #include "VideoCommon/BPStructs.h"
 #include "VideoCommon/BoundingBox.h"
@@ -380,6 +381,7 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
 
 void VideoBackendBase::ShutdownShared()
 {
+  PS3MeshPort::PrintDrawStatistics();
   auto& system = Core::System::GetInstance();
   system.GetCustomResourceManager().Shutdown();
 

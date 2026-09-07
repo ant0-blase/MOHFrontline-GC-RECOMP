@@ -255,7 +255,7 @@ private:
   void UpdatePipelineObject();
   void RenderMOHCSMCasters(VertexShaderManager& vertex_shader_manager, u32 base_index,
                            u32 num_indices, u32 base_vertex, PrimitiveType primitive_type,
-                           const AbstractPipeline* current_pipeline);
+                           const AbstractPipeline* current_pipeline, bool ps3_static_replacement);
 
   const AbstractPipeline*
   GetCustomPipeline(const CustomPixelShaderContents& custom_pixel_shader_contents,

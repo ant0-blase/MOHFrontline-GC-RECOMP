@@ -189,21 +189,20 @@ public:
           // temporarily swap dl and non-dl (small "hack" for the stats)
           g_stats.SwapDL();
 
-          // Keep the real DL address/hash visible while its GX commands are decoded.
-          // This lets the MSH bridge bootstrap a missing loader identity once and
-          // then use an exact address+hash lookup on later frames.
-          PS3MeshPort::SetDisplayListContext(address, {start_address, size});
           const auto mesh = PS3MeshPort::FindDisplayList(address, {start_address, size});
-          if (mesh)
-          {
+          const auto skin = PS3MeshPort::CurrentSkinnedDraw();
+          // Dormant DMF analysis needs no batch boundary. Only validated draw
+          // replacement (or explicit geometry-bootstrap diagnostics) does.
+          const bool isolate = mesh || PS3MeshPort::IsStaticBootstrapEnabled() ||
+                               (skin.prepared && skin.prepared->readiness.Ready());
+          PS3MeshPort::SetDisplayListContext(0, {});
+          if (isolate)
             g_vertex_manager->Flush();
-            PS3MeshPort::SetDisplayListMatch(mesh);
-          }
+          PS3MeshPort::SetDisplayListContext(address, {start_address, size});
+          PS3MeshPort::SetDisplayListMatch(mesh);
+          PS3MeshPort::SetSkinnedDrawMatch(skin);
           Run(start_address, size, *this);
-
-          // A bootstrap match can be discovered during Run(), so flush before
-          // clearing the context even when FindDisplayList() was initially empty.
-          if (mesh || PS3MeshPort::IsStaticDrawReplacementEnabled())
+          if (isolate)
             g_vertex_manager->Flush();
           PS3MeshPort::SetDisplayListContext(0, {});
           INCSTAT(g_stats.this_frame.num_dlists_called);

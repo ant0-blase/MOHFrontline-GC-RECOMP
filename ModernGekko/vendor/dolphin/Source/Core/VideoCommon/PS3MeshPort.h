@@ -1,4 +1,5 @@
 #pragma once
+#include "VideoCommon/MOHFrontline/Assets/PS3/Formats/SkinBind.h"
 
 #include <memory>
 #include <array>
@@ -94,20 +95,6 @@ struct EMTResource
   std::shared_ptr<const std::vector<u8>> bytes;
 };
 
-struct SkinnedDrawMatch
-{
-  std::shared_ptr<const DMFResource> owner;
-  std::string gc_name;
-  u32 display_list = 0;
-  u32 material_index = 0;
-  u32 cluster_index = 0;
-  std::string gc_material_name;
-  std::vector<u8> gc_palette_groups;
-  std::vector<s16> ps3_group_to_gc;
-  std::string skeleton_name;
-
-  explicit operator bool() const { return owner != nullptr; }
-};
 
 
 struct SkinnedPaletteAnalysis
@@ -121,6 +108,47 @@ struct SkinnedPaletteAnalysis
   std::size_t selected_vertices = 0;
   std::size_t matrix_slots = 0;
 };
+
+struct DMFReplacementReadiness
+{
+  bool geometry_valid = false;
+  bool skeleton_valid = false;
+  bool bind_valid = false;
+  bool palettes_valid = false;
+  bool materials_valid = false;
+  bool all_required_parts_mapped = false;
+  bool Ready() const
+  {
+    return geometry_valid && skeleton_valid && bind_valid && palettes_valid &&
+           materials_valid && all_required_parts_mapped;
+  }
+};
+
+struct PreparedDMFDraw
+{
+  std::string gc_name, material_name, skeleton_name;
+  std::vector<u8> palette;
+  std::vector<s16> group_map;
+  SkinnedPaletteAnalysis analysis;
+  DMFReplacementReadiness readiness;
+};
+
+struct SkinnedDrawMatch
+{
+  std::shared_ptr<const DMFResource> owner;
+  std::string_view gc_name;
+  std::shared_ptr<const PreparedDMFDraw> prepared;
+  u32 display_list = 0;
+  u32 material_index = 0;
+  u32 cluster_index = 0;
+  std::string_view gc_material_name;
+  std::span<const u8> gc_palette_groups;
+  std::span<const s16> ps3_group_to_gc;
+  std::string_view skeleton_name;
+
+  explicit operator bool() const { return owner != nullptr; }
+};
+
 
 // Strict v16.9 proof-of-life replacement.  It is returned only when the
 // current GC DMF material has exactly one authored GX display list, exactly
@@ -150,6 +178,7 @@ struct SKLInfo
   u32 names_end = 0;
   std::string source_name;
   std::vector<std::string> bone_names;
+  MOHFrontline::PS3::SkinBind::Hierarchy hierarchy;
 };
 
 enum class ReplacementKind
@@ -187,6 +216,8 @@ struct StaticDrawMatch
   const Submesh* submesh = nullptr;
   std::size_t submesh_index = 0;
   float score = 0.0f;
+  bool bounds_valid = false;
+  std::array<float, 3> bounds_min{}, bounds_max{};
 
   explicit operator bool() const { return mesh != nullptr && submesh != nullptr; }
 };
@@ -196,7 +227,10 @@ void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const
 StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands);
 void SetDisplayListContext(u32 address, std::span<const u8> commands);
 void SetDisplayListMatch(StaticDrawMatch match);
+const StaticDrawMatch& CurrentStaticDraw();
 SkinnedDrawMatch CurrentSkinnedDraw();
+void SetSkinnedDrawMatch(SkinnedDrawMatch match);
+bool IsStaticBootstrapEnabled();
 SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette();
 SkinnedDrawReplacement BuildCurrentSkinnedReplacement();
 void NotifyStaticDrawSubmitted();

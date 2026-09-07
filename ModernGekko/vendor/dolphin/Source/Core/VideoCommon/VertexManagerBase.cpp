@@ -58,7 +58,21 @@ std::unique_ptr<VertexManagerBase> g_vertex_manager;
 namespace
 {
 constexpr u32 MOH_CSM_CASCADES = 4;
-constexpr u32 MOH_CSM_RESOLUTION = 1024;
+struct MohCSMQuality
+{
+  u32 cascades = 3;
+  u32 resolution = 768;
+};
+const MohCSMQuality& GetMohCSMQuality()
+{
+  static const MohCSMQuality quality = [] {
+    const char* value = std::getenv("MOH_CSM_QUALITY");
+    if (value && std::string_view(value) == "low") return MohCSMQuality{2, 512};
+    if (value && std::string_view(value) == "high") return MohCSMQuality{4, 1024};
+    return MohCSMQuality{};
+  }();
+  return quality;
+}
 
 struct MohVec3
 {
@@ -216,7 +230,7 @@ std::array<float, 16> BuildCascadeMatrix(float p0, float p2, float p5, float p6,
   extent = std::max(extent, 1.0f);
   float center_x = (min_x + max_x) * 0.5f;
   float center_y = (min_y + max_y) * 0.5f;
-  const float units_per_texel = extent / static_cast<float>(MOH_CSM_RESOLUTION);
+  const float units_per_texel = extent / static_cast<float>(GetMohCSMQuality().resolution);
   center_x = std::floor(center_x / units_per_texel + 0.5f) * units_per_texel;
   center_y = std::floor(center_y / units_per_texel + 0.5f) * units_per_texel;
 
@@ -1306,7 +1320,8 @@ const AbstractTexture* VertexManagerBase::GetMOHCSMTexture(u32 cascade) const
   {
     return nullptr;
   }
-  return m_moh_csm->depth_textures[m_moh_csm->sample_set][cascade].get();
+  return m_moh_csm->depth_textures[m_moh_csm->sample_set]
+      [std::min(cascade, GetMohCSMQuality().cascades - 1)].get();
 }
 
 bool VertexManagerBase::PrepareMOHCSMForSampling(MOHCSMReceiverData* out_data)
@@ -1330,7 +1345,7 @@ bool VertexManagerBase::PrepareMOHCSMForSampling(MOHCSMReceiverData* out_data)
   if (!csm.finished_for_sampling[set])
   {
     for (auto& depth : csm.depth_textures[set])
-      depth->FinishedRendering();
+      if (depth) depth->FinishedRendering();
     csm.finished_for_sampling[set] = true;
   }
 
@@ -1361,7 +1376,8 @@ bool VertexManagerBase::PrepareMOHCSMForSampling(MOHCSMReceiverData* out_data)
 void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_manager,
                                              u32 base_index, u32 num_indices, u32 base_vertex,
                                              PrimitiveType primitive_type,
-                                             const AbstractPipeline* current_pipeline)
+                                             const AbstractPipeline* current_pipeline,
+                                             bool ps3_static_replacement)
 {
   const bool camera_projection_test = MohEnvSwitch("MOH_PS3_CSM_CAMERA_TEST", false);
   // v2.7: WORLD_PROBE is intentionally independent from CAMERA_TEST.
@@ -1500,13 +1516,13 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
 
   if (!csm.resources_ready)
   {
-    const TextureConfig depth_config(MOH_CSM_RESOLUTION, MOH_CSM_RESOLUTION, 1, 1, 1,
+    const TextureConfig depth_config(GetMohCSMQuality().resolution, GetMohCSMQuality().resolution, 1, 1, 1,
                                      AbstractTextureFormat::D32F,
                                      AbstractTextureFlag_RenderTarget,
                                      AbstractTextureType::Texture_2DArray);
     for (u32 set = 0; set < MOHCSMState::SET_COUNT; ++set)
     {
-      for (u32 i = 0; i < MOH_CSM_CASCADES; ++i)
+      for (u32 i = 0; i < GetMohCSMQuality().cascades; ++i)
       {
         csm.depth_textures[set][i] =
             g_gfx->CreateTexture(depth_config, "MOH Frontline PS3 CSM depth");
@@ -1558,9 +1574,9 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
     const float lambda = std::clamp(MohEnvFloat("MOH_PS3_CSM_LAMBDA", 0.65f), 0.0f, 1.0f);
 
     std::array<float, MOH_CSM_CASCADES> splits{};
-    for (u32 i = 0; i < MOH_CSM_CASCADES; ++i)
+    for (u32 i = 0; i < GetMohCSMQuality().cascades; ++i)
     {
-      const float t = static_cast<float>(i + 1) / static_cast<float>(MOH_CSM_CASCADES);
+      const float t = static_cast<float>(i + 1) / static_cast<float>(GetMohCSMQuality().cascades);
       const float logarithmic = camera_near * std::pow(camera_far / camera_near, t);
       const float uniform = camera_near + (camera_far - camera_near) * t;
       splits[i] = logarithmic * lambda + uniform * (1.0f - lambda);
@@ -1576,7 +1592,7 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
     }
 
     float split_near = camera_near;
-    for (u32 i = 0; i < MOH_CSM_CASCADES; ++i)
+    for (u32 i = 0; i < GetMohCSMQuality().cascades; ++i)
     {
       const auto matrix = BuildCascadeMatrix(p0, p2, p5, p6, split_near, splits[i], sun);
       for (u32 row = 0; row < 4; ++row)
@@ -1601,7 +1617,7 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
         (MohEnvSwitch("MOH_PS3_CSM_FLIP_Y", false) ? 1 : 0) |
         (MohEnvSwitch("MOH_PS3_CSM_DEPTH_FLIP", false) ? 2 : 0) |
         (MohEnvSwitch("MOH_PS3_CSM_COMPARE_FLIP", false) ? 4 : 0);
-    receiver.flags = {0, static_cast<s32>(MOH_CSM_CASCADES), receiver_transform_flags, 0};
+    receiver.flags = {0, static_cast<s32>(GetMohCSMQuality().cascades), receiver_transform_flags, 0};
 
     const s32 debug_mode =
         std::clamp(static_cast<s32>(MohEnvFloat("MOH_PS3_CSM_DEBUG", 0.0f)), 0, 5);
@@ -1612,7 +1628,7 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
     //   0.25 -> texture is readable but no caster touched the texel,
     //   other -> real rasterized caster depth.
     const float clear_depth = debug_depth_view ? 0.25f : 0.0f;
-    for (u32 i = 0; i < MOH_CSM_CASCADES; ++i)
+    for (u32 i = 0; i < GetMohCSMQuality().cascades; ++i)
     {
       g_gfx->SetAndClearFramebuffer(csm.framebuffers[csm.render_set][i].get(), {}, clear_depth);
       g_gfx->SetViewportAndScissor(csm.depth_textures[csm.render_set][i]->GetRect(), 0.0f, 1.0f);
@@ -1632,8 +1648,9 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
     if (!csm.logged_active)
     {
       std::fprintf(stderr,
-                   "[moh-ps3-csm] TRUE caster ON: 4x1024 D32F | sun=(%.3f %.3f %.3f) "
+                   "[moh-ps3-csm] TRUE caster ON: %ux%u D32F | sun=(%.3f %.3f %.3f) "
                    "splits=(%.1f %.1f %.1f %.1f) bias=%.6f%s\n",
+                   GetMohCSMQuality().cascades, GetMohCSMQuality().resolution,
                    sun.x, sun.y, sun.z, splits[0], splits[1], splits[2], splits[3],
                    receiver.camera1[2], from_gx ? " [GX view light]" : " [fallback]");
       csm.logged_active = true;
@@ -1735,8 +1752,67 @@ void main()
     }
   }
 
-  const AbstractPipeline* shadow_pipeline = pipeline_it->second.get();
+  // Protection against pathological draw counts; reject before touching any
+  // projection, viewport, pixel-center or pipeline state for this caster.
   MOHCSMReceiverData& receiver = csm.receivers[csm.render_set];
+  u32 cascade_mask = (1u << GetMohCSMQuality().cascades) - 1;
+  const auto& static_draw = PS3MeshPort::CurrentStaticDraw();
+  if (!camera_projection_test && ps3_static_replacement && static_draw.bounds_valid)
+  {
+    // Bounds were computed at preload, and the MSH stream validator proved a
+    // single rigid XF matrix. Transform only eight corners, never triangles.
+    const auto& decl = VertexLoaderManager::GetCurrentVertexFormat()->GetVertexDeclaration();
+    const auto& constants = vertex_shader_manager.constants;
+    u32 matrix_index = 0;
+    if (decl.posmtx.enable)
+      matrix_index = m_base_buffer_pointer[decl.posmtx.offset];
+    if (!decl.posmtx.enable || matrix_index + 2 < constants.transformmatrices.size())
+    {
+      std::array<std::array<float, 3>, 8> view_corners{};
+      for (u32 corner = 0; corner < 8; ++corner)
+      {
+        std::array<float, 3> point{};
+        for (u32 axis = 0; axis < 3; ++axis)
+          point[axis] = (corner & (1u << axis)) ? static_draw.bounds_max[axis] : static_draw.bounds_min[axis];
+        for (u32 row = 0; row < 3; ++row)
+        {
+          const auto& m = decl.posmtx.enable ? constants.transformmatrices[matrix_index+row] : constants.posnormalmatrix[row];
+          view_corners[corner][row] = m[0]*point[0]+m[1]*point[1]+m[2]*point[2]+m[3];
+        }
+      }
+      for (u32 cascade = 0; cascade < GetMohCSMQuality().cascades; ++cascade)
+      {
+        std::array<float, 3> minimum{INFINITY, INFINITY, INFINITY};
+        std::array<float, 3> maximum{-INFINITY, -INFINITY, -INFINITY};
+        bool finite = true;
+        for (const auto& point : view_corners)
+          for (u32 row = 0; row < 3; ++row)
+          {
+            const auto& m = receiver.matrix_rows[cascade*4+row];
+            const float value = m[0]*point[0]+m[1]*point[1]+m[2]*point[2]+m[3];
+            finite &= std::isfinite(value);
+            minimum[row] = std::min(minimum[row], value);
+            maximum[row] = std::max(maximum[row], value);
+          }
+        // Orthographic light bounds include the full caster depth extent.
+        const bool outside = maximum[0] < -1 || minimum[0] > 1 ||
+                             maximum[1] < -1 || minimum[1] > 1 ||
+                             maximum[2] < -1 || minimum[2] > 0;
+        const float pixels = std::max(maximum[0]-minimum[0], maximum[1]-minimum[1]) *
+                             0.5f * GetMohCSMQuality().resolution;
+        if (finite && (outside || pixels < 0.25f))
+          cascade_mask &= ~(1u << cascade);
+      }
+    }
+  }
+  if (!cascade_mask)
+    return;
+  static const u64 caster_budget = static_cast<u64>(std::clamp(
+      MohEnvFloat("MOH_CSM_CASTER_BUDGET", 8192.0f), 64.0f, 1000000.0f));
+  if (csm.caster_batches[csm.render_set] + GetMohCSMQuality().cascades > caster_budget)
+    return;
+
+  const AbstractPipeline* shadow_pipeline = pipeline_it->second.get();
   const auto saved_projection = vertex_shader_manager.constants.projection;
   const auto saved_pixel_center = vertex_shader_manager.constants.pixelcentercorrection;
   static bool logged_camera_projection_test = false;
@@ -1751,8 +1827,8 @@ void main()
   // vertex shader uses sign(pixelcentercorrection.xy) to preserve viewport
   // orientation.  v1 wrote 0 here, so sign(0)==0 collapsed every caster vertex
   // to the centre of the shadow map and produced no visible shadows.
-  constexpr float csm_pixel_center =
-      (7.0f / 12.0f - 0.5f) * (2.0f / static_cast<float>(MOH_CSM_RESOLUTION));
+  const float csm_pixel_center =
+      (7.0f / 12.0f - 0.5f) * (2.0f / static_cast<float>(GetMohCSMQuality().resolution));
   vertex_shader_manager.constants.pixelcentercorrection[0] =
       std::copysign(csm_pixel_center, saved_pixel_center[0] == 0.0f ? 1.0f : saved_pixel_center[0]);
   vertex_shader_manager.constants.pixelcentercorrection[1] =
@@ -1786,8 +1862,10 @@ void main()
     logged_camera_depth_range = true;
   }
 
-  for (u32 cascade = 0; cascade < MOH_CSM_CASCADES; ++cascade)
+  for (u32 cascade = 0; cascade < GetMohCSMQuality().cascades; ++cascade)
   {
+    if (!(cascade_mask & (1u << cascade)))
+      continue;
     // Diagnostic escape hatch: render the exact same geometry with the guest
     // camera projection into the CSM target.  If this produces a stable depth
     // image while the light-space matrix does not, the backend/pipeline/texture
@@ -1874,7 +1952,8 @@ void VertexManagerBase::RenderDrawCall(
   // GXCallDisplayList.  Therefore the current XF position-matrix palette is the
   // authoritative animated pose for this exact DMF draw.  Keep this one-shot
   // diagnostic in v16.9 so the first real replacements remain auditable.
-  if (const auto skin = PS3MeshPort::CurrentSkinnedDraw(); skin)
+  if (const auto skin = PS3MeshPort::CurrentSkinnedDraw();
+      skin && MohEnvSwitch("MOH_PS3_DMF_VERBOSE", false))
   {
     static std::unordered_map<u32, bool> s_logged_ps3_dmf_draws;
     const bool first_for_dl =
@@ -1917,8 +1996,8 @@ void VertexManagerBase::RenderDrawCall(
       };
       std::fprintf(stderr,
                    "[moh-ps3-skin] GX DRAW DECL: gc=%s material=%s DL=%08x verts=%u stride=%u primitive=%u pos=(%d,t%u,c%d,o%d) nrm=(%d,t%u,c%d,o%d) uv0=(%d,t%u,c%d,o%d) posmtx=(%d,t%u,c%d,o%d)\n",
-                   skin.gc_name.c_str(),
-                   skin.gc_material_name.empty() ? "<unnamed>" : skin.gc_material_name.c_str(),
+                   skin.gc_name.data(),
+                   skin.gc_material_name.empty() ? "<unnamed>" : skin.gc_material_name.data(),
                    skin.display_list, skin_vertices, skin_stride,
                    static_cast<unsigned>(primitive_type), skin_decl.position.enable ? 1 : 0,
                    type_value(skin_decl.position.type), skin_decl.position.components,
@@ -1932,8 +2011,8 @@ void VertexManagerBase::RenderDrawCall(
 
       std::fprintf(stderr,
                    "[moh-ps3-skin] GX PALETTE ANALYSIS: gc=%s material=%s DL=%08x ps3_clusters=%zu triangles=%zu selected=%zu ambiguous=%zu unmapped=%zu vertices=%zu matrix_slots=%zu finite_matrices=%zu firstT=(%.4f %.4f %.4f) valid=%d | palette validation\n",
-                   skin.gc_name.c_str(),
-                   skin.gc_material_name.empty() ? "<unnamed>" : skin.gc_material_name.c_str(),
+                   skin.gc_name.data(),
+                   skin.gc_material_name.empty() ? "<unnamed>" : skin.gc_material_name.data(),
                    skin.display_list, analysis.ps3_material_clusters, analysis.total_triangles,
                    analysis.selected_triangles, analysis.ambiguous_triangles,
                    analysis.unmapped_triangles, analysis.selected_vertices,
@@ -2093,7 +2172,7 @@ void VertexManagerBase::RenderDrawCall(
           const auto skin = PS3MeshPort::CurrentSkinnedDraw();
           std::fprintf(stderr,
                        "[moh-ps3-skin] SKINNED STREAM REJECT: gc=%s material=%s DL=%08x | strict fallback GC\n",
-                       skin.gc_name.c_str(), skin.gc_material_name.c_str(), skin.display_list);
+                       skin.gc_name.data(), skin.gc_material_name.data(), skin.display_list);
         }
       }
     }
@@ -2312,7 +2391,8 @@ void VertexManagerBase::RenderDrawCall(
   // not a screen-space shadow approximation.
   auto& vertex_shader_manager = Core::System::GetInstance().GetVertexShaderManager();
   RenderMOHCSMCasters(vertex_shader_manager, base_index, m_index_generator.GetIndexLen(),
-                      base_vertex, primitive_type, current_pipeline);
+                      base_vertex, primitive_type, current_pipeline,
+                      submitted_ps3_mesh && !submitted_ps3_skinned);
 
   g_gfx->SetPipeline(current_pipeline);
 

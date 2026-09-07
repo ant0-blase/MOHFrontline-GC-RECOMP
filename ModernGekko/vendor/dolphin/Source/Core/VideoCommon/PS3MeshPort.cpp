@@ -1,4 +1,5 @@
 #include "VideoCommon/PS3MeshPort.h"
+#include "VideoCommon/Fifo.h"
 #include "Common/Hash.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
@@ -172,6 +173,8 @@ struct ExactDMFPair
   std::size_t mapped_skin_groups = 0;
   std::string skeleton_name;
   std::size_t skeleton_name_matches = 0;
+  std::shared_ptr<const MOHFrontline::PS3::SkinBind::Binding> bind;
+  bool bind_vertices_valid = false;
 };
 std::unordered_map<std::string, ExactDMFPair> g_dmf_pairs;
 struct OriginalGCDMFDrawCandidate
@@ -179,6 +182,7 @@ struct OriginalGCDMFDrawCandidate
   std::shared_ptr<DMFResource> ps3;
   std::string gc_name;
   u32 file_size = 0;
+  std::array<u8, 8> model_tag{};
   u32 group_count = 0;
   u32 group_offset = 0;
   u32 material_count = 0;
@@ -188,11 +192,25 @@ struct OriginalGCDMFDrawCandidate
   u32 cluster_index = 0;
   std::string gc_material_name;
   std::vector<u8> gc_palette_groups;
+  std::shared_ptr<const PreparedDMFDraw> prepared;
 };
 std::unordered_map<DisplayListSignatureKey, std::vector<OriginalGCDMFDrawCandidate>,
                    DisplayListSignatureKeyHash>
     g_dmf_display_list_candidates;
+// Exact first-eight-byte filter: rejects unrelated DLs without hashing their
+// entire contents. Passing this filter still requires the full signature.
+std::unordered_set<DisplayListSignatureKey, DisplayListSignatureKeyHash> g_dmf_prefixes;
+struct DMFAddressCacheEntry
+{
+  u32 address = 0, size = 0;
+  const OriginalGCDMFDrawCandidate* candidate = nullptr;
+};
+// Fixed storage: even a first runtime address does not allocate a cache node.
+std::array<DMFAddressCacheEntry, 8192> g_dmf_address_cache{};
 thread_local SkinnedDrawMatch g_current_dmf_draw;
+std::atomic<u64> g_dmf_lookups{0}, g_dmf_hits{0}, g_dmf_misses{0};
+SkinnedPaletteAnalysis AnalyzeSkinnedPaletteAtLoad(const SkinnedDrawMatch& draw);
+void PrepareDMFDraws();
 std::mutex g_skl_cache_mutex;
 std::unordered_map<std::string, std::shared_ptr<SKLInfo>> g_skl_cache;
 std::mutex g_emt_cache_mutex;
@@ -408,6 +426,10 @@ StaticDrawMatch BuildStaticDrawMatch(const std::shared_ptr<StaticMesh>& mesh,
   match.mesh = mesh.get();
   match.submesh = &mesh->submeshes[submesh_index];
   match.submesh_index = submesh_index;
+  const auto bounds = BoundsFromPS3(sub);
+  match.bounds_valid = bounds.valid;
+  match.bounds_min = bounds.minimum;
+  match.bounds_max = bounds.maximum;
   return match;
 }
 
@@ -598,67 +620,81 @@ bool ValidateOriginalGCDMFCandidate(const OriginalGCDMFDrawCandidate& candidate,
   const u8* header = memory.GetPointerForRange(base, 0x50);
   if (!header || header[0] != 'D' || header[1] != 'M' || header[2] != 'F' || header[3] != 0)
     return false;
-  return BE32(header + 0x20) == candidate.group_count &&
-         BE32(header + 0x24) == candidate.group_offset &&
+  const auto pointer_matches = [base](u32 value, u32 offset) {
+    return value == offset || (value & 0x1fffffff) == base + offset;
+  };
+  return std::equal(candidate.model_tag.begin(), candidate.model_tag.end(), header + 12) &&
+         BE32(header + 0x20) == candidate.group_count &&
+         pointer_matches(BE32(header + 0x24), candidate.group_offset) &&
          BE32(header + 0x28) == candidate.material_count &&
-         BE32(header + 0x2c) == candidate.material_offset;
+         pointer_matches(BE32(header + 0x2c), candidate.material_offset);
 }
 
 void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
 {
   g_current_dmf_draw = {};
-  if (!EnvSwitchLocal("MOH_PS3_DMF_DRAW", true) || commands.empty())
+  static const bool draw_enabled = PS3AssetPort::IsDMFEnabled() &&
+                                   EnvSwitchLocal("MOH_PS3_DMF_DRAW", true);
+  if (!draw_enabled || commands.size() < sizeof(u64))
     return;
 
   const u32 runtime_address = address & 0x1fffffff;
-  const DisplayListSignatureKey key{static_cast<u32>(commands.size()),
-                                    Common::GetHash64(commands.data(), commands.size(), 0)};
-  std::vector<OriginalGCDMFDrawCandidate> candidates;
+  std::scoped_lock lock(g_dmf_cache_mutex);
+  if (g_dmf_display_list_candidates.empty())
+    return;
+  ++g_dmf_lookups;
+  auto& cached = g_dmf_address_cache[(runtime_address >> 5) % g_dmf_address_cache.size()];
+  const OriginalGCDMFDrawCandidate* resolved = nullptr;
+  const u32 command_size = static_cast<u32>(commands.size());
+  if (cached.address == runtime_address && cached.size == command_size && cached.candidate &&
+      ValidateOriginalGCDMFCandidate(*cached.candidate, runtime_address))
   {
-    std::scoped_lock lock(g_dmf_cache_mutex);
+    // Authored DMF DLs are immutable. Revalidate resource identity on every hit;
+    // morph output uses different DL storage and cannot pass this header check.
+    resolved = cached.candidate;
+    ++g_dmf_hits;
+  }
+  else
+  {
+    ++g_dmf_misses;
+    u64 prefix;
+    std::memcpy(&prefix, commands.data(), sizeof(prefix));
+    if (!g_dmf_prefixes.contains({command_size, prefix}))
+      return;
+    const DisplayListSignatureKey key{command_size,
+                                      Common::GetHash64(commands.data(), commands.size(), 0)};
     const auto it = g_dmf_display_list_candidates.find(key);
     if (it == g_dmf_display_list_candidates.end())
       return;
-    candidates = it->second;
-  }
-
-  const OriginalGCDMFDrawCandidate* resolved = nullptr;
-  for (const auto& candidate : candidates)
-  {
-    if (candidates.size() > 1 && !ValidateOriginalGCDMFCandidate(candidate, runtime_address))
-      continue;
-    if (resolved)
+    for (const auto& candidate : it->second)
     {
-      static unsigned collision_logs = 0;
-      if (collision_logs++ < 32)
-        std::fprintf(stderr,
-                     "[moh-ps3-dmf] GC DMF DL COLLISION unresolved: DL=%08x size=%u candidates=%zu -> keep GC\n",
-                     runtime_address, key.size, candidates.size());
-      return;
+      if (!ValidateOriginalGCDMFCandidate(candidate, runtime_address))
+        continue;
+      if (resolved)
+        return;  // ambiguous identity always retains GC
+      resolved = &candidate;
     }
-    resolved = &candidate;
+    if (!resolved)
+      return;
+    cached = {runtime_address, command_size, resolved};
   }
-  if (!resolved)
+  if (!resolved->prepared)
     return;
-
+  const auto& prepared = *resolved->prepared;
   g_current_dmf_draw.owner = resolved->ps3;
-  g_current_dmf_draw.gc_name = resolved->gc_name;
+  g_current_dmf_draw.prepared = resolved->prepared;
+  g_current_dmf_draw.gc_name = prepared.gc_name;
   g_current_dmf_draw.display_list = runtime_address;
   g_current_dmf_draw.material_index = resolved->material_index;
   g_current_dmf_draw.cluster_index = resolved->cluster_index;
-  g_current_dmf_draw.gc_material_name = resolved->gc_material_name;
-  g_current_dmf_draw.gc_palette_groups = resolved->gc_palette_groups;
-  {
-    std::scoped_lock lock(g_dmf_cache_mutex);
-    if (const auto it = g_dmf_pairs.find(resolved->gc_name); it != g_dmf_pairs.end())
-    {
-      g_current_dmf_draw.ps3_group_to_gc = it->second.ps3_group_to_gc;
-      g_current_dmf_draw.skeleton_name = it->second.skeleton_name;
-    }
-  }
+  g_current_dmf_draw.gc_material_name = prepared.material_name;
+  g_current_dmf_draw.gc_palette_groups = prepared.palette;
+  g_current_dmf_draw.ps3_group_to_gc = prepared.group_map;
+  g_current_dmf_draw.skeleton_name = prepared.skeleton_name;
 
   static unsigned logs = 0;
-  if (logs++ < 128)
+  static const bool verbose = EnvSwitchLocal("MOH_PS3_DMF_VERBOSE", false);
+  if (logs++ < 1 || verbose)
   {
     std::fprintf(stderr,
                  "[moh-ps3-dmf] LIVE EXACT GC DMF: gc=%s ps3=%s material=%u(%s) cluster=%u DL=%08x size=%u palette=%zu mapped_groups=%zu skeleton=%s\n",
@@ -666,12 +702,12 @@ void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
                  resolved->ps3 ? resolved->ps3->source_name.c_str() : "<missing>",
                  resolved->material_index,
                  resolved->gc_material_name.empty() ? "<unnamed>" : resolved->gc_material_name.c_str(),
-                 resolved->cluster_index, runtime_address, key.size,
+                 resolved->cluster_index, runtime_address, command_size,
                  resolved->gc_palette_groups.size(),
                  std::count_if(g_current_dmf_draw.ps3_group_to_gc.begin(),
                                g_current_dmf_draw.ps3_group_to_gc.end(),
                                [](s16 value) { return value >= 0; }),
-                 g_current_dmf_draw.skeleton_name.empty() ? "<unbound>" : g_current_dmf_draw.skeleton_name.c_str());
+                 g_current_dmf_draw.skeleton_name.empty() ? "<unbound>" : g_current_dmf_draw.skeleton_name.data());
   }
 }
 
@@ -988,6 +1024,52 @@ void BindDMFPairsToSkeletons()
 
     pair.skeleton_name = best ? best->source_name : std::string{};
     pair.skeleton_name_matches = best_matches;
+    if (best && pair.ps3->bytes)
+    {
+      namespace Bind = MOHFrontline::PS3::SkinBind;
+      auto binding = std::make_shared<Bind::Binding>(Bind::Validate(*pair.ps3->bytes, best->hierarchy));
+      bool valid = binding->valid;
+      double max_error = 0;
+      std::size_t vertices = 0;
+      const auto& decoded = *pair.ps3->decoded;
+      for (const auto& cluster : decoded.clusters)
+      {
+        for (std::size_t i = 0; valid && i < cluster.positions.size(); ++i)
+        {
+          const auto slot = cluster.vertex_palette_slots[i];
+          const auto group = decoded.skin_groups[cluster.palette_groups[slot]];
+          if (group.bone_a >= binding->ref_to_bone.size() || binding->ref_to_bone[group.bone_a] < 0)
+          {
+            valid = false;
+            binding->reason = "required vertex bone missing";
+            break;
+          }
+          const auto& bone = binding->bones[binding->ref_to_bone[group.bone_a]];
+          const auto& position = cluster.positions[i];
+          const Bind::Vector vertex{position[0], position[1], position[2]};
+          const auto result = Bind::Transform(bone.world_bind, Bind::Transform(bone.inverse_bind, vertex));
+          double scale = 1;
+          for (unsigned axis = 0; axis < 3; ++axis)
+            scale = std::max(scale, std::abs(vertex[axis]));
+          for (unsigned axis = 0; axis < 3; ++axis)
+          {
+            const double error = std::abs(result[axis]-vertex[axis]);
+            max_error = std::max(max_error, error);
+            if (!std::isfinite(error) || error > 0.002*scale)
+            {
+              valid = false;
+              binding->reason = "vertex bind roundtrip";
+            }
+          }
+          ++vertices;
+        }
+      }
+      pair.bind_vertices_valid = valid && vertices != 0;
+      std::fprintf(stderr, "[moh-ps3-skin] PS3 BIND %s: model=%s skeleton=%s vertices=%zu max_error=%.9g matrix_error=%.9g reason=%s | GC conversion still unvalidated\n",
+          pair.bind_vertices_valid ? "VALID" : "REJECT", name.c_str(), best->source_name.c_str(),
+          vertices, max_error, binding->max_matrix_error, binding->reason.c_str());
+      pair.bind = std::move(binding);
+    }
     static unsigned logs = 0;
     if (best && logs++ < 32)
     {
@@ -1001,8 +1083,11 @@ void BindDMFPairsToSkeletons()
 
 void IndexOriginalGCLevelDMFPairs(std::string_view level)
 {
+  std::scoped_lock index_lock(g_dmf_cache_mutex);
+  g_dmf_address_cache.fill({});
   g_dmf_pairs.clear();
   g_dmf_display_list_candidates.clear();
+  g_dmf_prefixes.clear();
   if (level.empty())
     return;
 
@@ -1076,7 +1161,6 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
 
     std::shared_ptr<DMFResource> ps3;
     {
-      std::scoped_lock lock(g_dmf_cache_mutex);
       if (const auto it = g_dmf_cache.find(filename); it != g_dmf_cache.end())
         ps3 = it->second;
     }
@@ -1131,6 +1215,7 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
           candidate.ps3 = ps3;
           candidate.gc_name = filename;
           candidate.file_size = packed_size;
+          std::copy_n(bytes + 12, 8, candidate.model_tag.begin());
           candidate.group_count = gc_groups;
           candidate.group_offset = gc_group_off;
           candidate.material_count = gc_materials;
@@ -1142,6 +1227,9 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
           candidate.gc_palette_groups.assign(record + 8, record + 8 + palette_count);
           const DisplayListSignatureKey dl_key{
               dl_size, Common::GetHash64(bytes + dl_offset, dl_size, 0)};
+          u64 prefix;
+          std::memcpy(&prefix, bytes + dl_offset, sizeof(prefix));
+          g_dmf_prefixes.insert({dl_size, prefix});
           g_dmf_display_list_candidates[dl_key].push_back(std::move(candidate));
         }
       }
@@ -1178,9 +1266,11 @@ void ClearMSHCache()
 void ClearDMFCache()
 {
   std::scoped_lock lock(g_dmf_cache_mutex);
+  g_dmf_address_cache.fill({});
   g_dmf_cache.clear();
   g_dmf_pairs.clear();
   g_dmf_display_list_candidates.clear();
+  g_dmf_prefixes.clear();
   g_current_dmf_draw = {};
 }
 
@@ -1366,6 +1456,7 @@ void PreloadCurrentLevelDMF(std::string_view level)
 
 
   IndexOriginalGCLevelDMFPairs(level);
+  PrepareDMFDraws();
 }
 
 void PreloadCurrentLevelSKL(std::string_view level)
@@ -1425,6 +1516,7 @@ void PreloadCurrentLevelSKL(std::string_view level)
                CachedSKLCount());
 
   BindDMFPairsToSkeletons();
+  PrepareDMFDraws();
 }
 
 
@@ -1561,8 +1653,9 @@ std::size_t CachedEMTCount()
 
 bool IsStaticDrawReplacementEnabled()
 {
-  return PS3AssetPort::IsMSHEnabled() && EnvSwitchLocal("MOH_PS3_MSH_DRAW", true) &&
-         EnvSwitchLocal("MOH_PS3_MSH_REPLACE", true);
+  static const bool enabled = PS3AssetPort::IsMSHEnabled() &&
+      EnvSwitchLocal("MOH_PS3_MSH_DRAW", true) && EnvSwitchLocal("MOH_PS3_MSH_REPLACE", true);
+  return enabled;
 }
 
 void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const u8> bytes)
@@ -1731,7 +1824,7 @@ void SetDisplayListContext(u32 address, std::span<const u8> commands)
   g_current_draw = {};
   g_current_dmf_draw = {};
   g_active_display_list = {};
-  if (!IsStaticDrawReplacementEnabled() || !address || commands.size() <= 52)
+  if (!IsStaticBootstrapEnabled() || !address || commands.size() <= 52)
     return;
 
   g_active_display_list.address = address & 0x1fffffff;
@@ -1741,13 +1834,23 @@ void SetDisplayListContext(u32 address, std::span<const u8> commands)
 }
 
 void SetDisplayListMatch(StaticDrawMatch match) { g_current_draw = std::move(match); }
+const StaticDrawMatch& CurrentStaticDraw() { return g_current_draw; }
 
 SkinnedDrawMatch CurrentSkinnedDraw() { return g_current_dmf_draw; }
+void SetSkinnedDrawMatch(SkinnedDrawMatch match) { g_current_dmf_draw = std::move(match); }
+bool IsStaticBootstrapEnabled()
+{
+  // Exact archive signatures are the normal path. Geometry guessing is a
+  // diagnostic fallback and must not scan every resource on unknown draws.
+  static const bool enabled = EnvSwitchLocal("MOH_PS3_MSH_BOOTSTRAP", false);
+  return enabled && IsStaticDrawReplacementEnabled();
+}
 
-SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette()
+namespace
+{
+SkinnedPaletteAnalysis AnalyzeSkinnedPaletteAtLoad(const SkinnedDrawMatch& draw)
 {
   SkinnedPaletteAnalysis analysis;
-  const SkinnedDrawMatch draw = g_current_dmf_draw;
   if (!draw || !draw.owner || !draw.owner->decoded || draw.gc_material_name.empty() ||
       draw.ps3_group_to_gc.empty() || draw.gc_palette_groups.empty())
     return analysis;
@@ -1762,7 +1865,6 @@ SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette()
   // ambiguity merely because the authored file split them for index limits.
   std::vector<std::vector<u8>> gc_palettes;
   {
-    std::scoped_lock lock(g_dmf_cache_mutex);
     for (const auto& [key, candidates] : g_dmf_display_list_candidates)
     {
       (void)key;
@@ -1863,7 +1965,7 @@ SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette()
         ++analysis.ambiguous_triangles;
         continue;
       }
-      if (*unique_palette != draw.gc_palette_groups)
+      if (!std::ranges::equal(*unique_palette, draw.gc_palette_groups))
         continue;
 
       ++analysis.selected_triangles;
@@ -1880,124 +1982,72 @@ SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette()
   return analysis;
 }
 
+void PrepareDMFDraws()
+{
+  std::scoped_lock lock(g_dmf_cache_mutex);
+  // CPU level-load phase only. Prepared objects own every view used by the GPU.
+  std::size_t draws = 0;
+  for (auto& [signature, candidates] : g_dmf_display_list_candidates)
+  {
+    (void)signature;
+    for (auto& candidate : candidates)
+    {
+      const auto pair = g_dmf_pairs.find(candidate.gc_name);
+      if (pair == g_dmf_pairs.end())
+        continue;
+      auto prepared = std::make_shared<PreparedDMFDraw>();
+      prepared->gc_name = candidate.gc_name;
+      prepared->material_name = candidate.gc_material_name;
+      prepared->skeleton_name = pair->second.skeleton_name;
+      prepared->palette = candidate.gc_palette_groups;
+      prepared->group_map = pair->second.ps3_group_to_gc;
+      SkinnedDrawMatch draw;
+      draw.owner = candidate.ps3;
+      draw.gc_name = prepared->gc_name;
+      draw.gc_material_name = prepared->material_name;
+      draw.gc_palette_groups = prepared->palette;
+      draw.ps3_group_to_gc = prepared->group_map;
+      prepared->analysis = candidate.prepared ? candidate.prepared->analysis :
+                                               AnalyzeSkinnedPaletteAtLoad(draw);
+      prepared->readiness.geometry_valid = candidate.ps3 && candidate.ps3->decoded;
+      prepared->readiness.palettes_valid = prepared->analysis.valid &&
+          !prepared->analysis.ambiguous_triangles && !prepared->analysis.unmapped_triangles;
+      prepared->readiness.skeleton_valid = pair->second.bind && pair->second.bind->valid;
+      prepared->readiness.bind_valid = pair->second.bind_vertices_valid;
+      // PS3 bind validation alone does not establish GC conversion or whole-model coverage.
+      candidate.prepared = std::move(prepared);
+      ++draws;
+    }
+  }
+  std::fprintf(stderr, "[moh-ps3-dmf] PRECOMPUTED: draws=%zu; bind validation pending, GC preserved\n", draws);
+}
+}  // namespace
+
+SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette()
+{
+  return g_current_dmf_draw.prepared ? g_current_dmf_draw.prepared->analysis :
+                                      SkinnedPaletteAnalysis{};
+}
+
 SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
 {
-  SkinnedDrawReplacement replacement;
-  if (!EnvSwitchLocal("MOH_PS3_DMF_REPLACE", true))
-    return replacement;
-
-  // v16.9 proved that exact draw identity + a finite GX/XF palette is not
-  // sufficient to reuse the GameCube skin matrix directly on PS3 bind-pose
-  // vertices.  The matrix loaded by the GC renderer already contains the GC
-  // bind-pose correction.  A PS3 DMF may use a different bind pose, so feeding
-  // its bind vertices to that matrix can produce floating/exploded pieces even
-  // when material/palette matching is otherwise exact.
-  //
-  // Keep the whole DMF/SKL/EMT identification and palette validation pipeline
-  // active, but make the old direct-GC-skin path an explicit unsafe opt-in
-  // until we apply PS3 inverse-bind (or reconstruct current bone-world)
-  // matrices.  This makes v16.9.1 safe by default while preserving the useful
-  // instrumentation for the real bind-correction implementation.
-  if (!EnvSwitchLocal("MOH_PS3_DMF_UNSAFE_DIRECT_GC_SKIN", false))
-  {
-    static std::unordered_set<std::string> s_bind_gate_logged;
-    const SkinnedDrawMatch& blocked = g_current_dmf_draw;
-    if (blocked && s_bind_gate_logged.insert(blocked.gc_name).second)
-    {
-      std::fprintf(stderr,
-                   "[moh-ps3-dmf] BIND SAFETY GATE: gc=%s ps3=%s | direct GC skin matrix -> PS3 bind vertices disabled; GC draw preserved (set MOH_PS3_DMF_UNSAFE_DIRECT_GC_SKIN=1 only to reproduce v16.9 experimental rendering)\n",
-                   blocked.gc_name.c_str(),
-                   blocked.owner ? blocked.owner->source_name.c_str() : "<none>");
-    }
-    return replacement;
-  }
-
-  const SkinnedDrawMatch draw = g_current_dmf_draw;
-  if (!draw || !draw.owner || !draw.owner->decoded || draw.gc_material_name.empty() ||
-      draw.ps3_group_to_gc.empty() || draw.gc_palette_groups.empty())
-    return replacement;
-
-  // v16.9 proof-of-life is deliberately strict.  Only a material with one
-  // authored GC display list and one PS3 cluster can replace the current draw.
-  // This excludes shared materials such as gi_256/mohf_body whose triangles
-  // need a later per-DL partition fingerprint.
-  std::unordered_set<u32> gc_draw_offsets;
-  {
-    std::scoped_lock lock(g_dmf_cache_mutex);
-    for (const auto& [key, candidates] : g_dmf_display_list_candidates)
-    {
-      (void)key;
-      for (const auto& candidate : candidates)
-      {
-        if (candidate.gc_name == draw.gc_name &&
-            candidate.gc_material_name == draw.gc_material_name)
-          gc_draw_offsets.insert(candidate.dl_offset);
-      }
-    }
-  }
-  replacement.gc_material_draws = gc_draw_offsets.size();
-  if (replacement.gc_material_draws != 1)
+  // No legacy unsafe bypass: finite XF values and names never prove a bind.
+  // Partial debugging cannot bypass the mathematical validation either.
+  static const bool replace = EnvSwitchLocal("MOH_PS3_DMF_REPLACE", false);
+  static const bool allow_partial = EnvSwitchLocal("MOH_PS3_DMF_ALLOW_PARTIAL", false);
+  const auto& draw = g_current_dmf_draw;
+  if (!replace || !draw.prepared)
     return {};
-
-  const DMFCluster* ps3_cluster = nullptr;
-  std::size_t ps3_clusters = 0;
-  for (const DMFCluster& cluster : draw.owner->decoded->clusters)
-  {
-    if (cluster.material_name != draw.gc_material_name)
-      continue;
-    ++ps3_clusters;
-    ps3_cluster = &cluster;
-  }
-  if (ps3_clusters != 1 || !ps3_cluster || !ps3_cluster->has_position ||
-      !ps3_cluster->has_normal || !ps3_cluster->has_uv0 ||
-      ps3_cluster->positions.size() != ps3_cluster->vertex_palette_slots.size() ||
-      ps3_cluster->normals.size() != ps3_cluster->positions.size() ||
-      ps3_cluster->uv0.size() != ps3_cluster->positions.size() ||
-      ps3_cluster->indices.empty() || (ps3_cluster->indices.size() % 3) != 0)
+  const auto& ready = draw.prepared->readiness;
+  if (!ready.bind_valid || !ready.skeleton_valid || (!allow_partial && !ready.Ready()))
     return {};
-
-  const SkinnedPaletteAnalysis analysis = AnalyzeCurrentSkinnedPalette();
-  if (!analysis.valid || analysis.ps3_material_clusters != 1 ||
-      analysis.selected_triangles != analysis.total_triangles ||
-      analysis.ambiguous_triangles != 0 || analysis.unmapped_triangles != 0)
-    return {};
-
-  replacement.owner = draw.owner;
-  replacement.cluster = ps3_cluster;
-  replacement.position_matrix_indices.reserve(ps3_cluster->positions.size());
-  for (std::size_t vertex = 0; vertex < ps3_cluster->positions.size(); ++vertex)
-  {
-    const u16 local_slot = ps3_cluster->vertex_palette_slots[vertex];
-    if (local_slot >= ps3_cluster->palette_groups.size())
-      return {};
-    const u16 ps3_group = ps3_cluster->palette_groups[local_slot];
-    if (ps3_group >= draw.ps3_group_to_gc.size())
-      return {};
-    const s16 gc_group = draw.ps3_group_to_gc[ps3_group];
-    if (gc_group < 0 || gc_group > 255)
-      return {};
-
-    const auto it = std::find(draw.gc_palette_groups.begin(), draw.gc_palette_groups.end(),
-                              static_cast<u8>(gc_group));
-    if (it == draw.gc_palette_groups.end())
-      return {};
-    const std::size_t palette_slot =
-        static_cast<std::size_t>(std::distance(draw.gc_palette_groups.begin(), it));
-    if (palette_slot >= 10)
-      return {};
-    replacement.position_matrix_indices.push_back(static_cast<u8>(palette_slot * 3));
-  }
-
-  return replacement;
+  // Prepared corrected vertex buffers are required before this gate can open.
+  return {};
 }
 
 StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 stride, u32 offset)
 {
-  if (!IsStaticDrawReplacementEnabled() || count < 3)
-    return {};
-
-  const auto gc = BoundsFromGC(gc_vertices, count, stride, offset);
-  if (!gc.valid)
+  if (g_current_dmf_draw || !IsStaticDrawReplacementEnabled() || count < 3)
     return {};
 
   if (g_current_draw)
@@ -2013,7 +2063,11 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
   // Bootstrap the identity once, inside the *actual* GX display list, using the
   // previous strict geometry test. Once learned, later frames use only
   // display-list address + command hash.
-  if (!g_active_display_list || !EnvSwitchLocal("MOH_PS3_MSH_BOOTSTRAP", true))
+  if (!g_active_display_list || !IsStaticBootstrapEnabled())
+    return {};
+
+  const auto gc = BoundsFromGC(gc_vertices, count, stride, offset);
+  if (!gc.valid)
     return {};
 
   const float maximum_score =
@@ -2164,13 +2218,13 @@ void NotifySkinnedDrawSubmitted(const SkinnedDrawReplacement& replacement)
   ++g_dmf_draws;
   g_dmf_vertices += replacement.cluster->positions.size();
   g_dmf_indices += replacement.cluster->indices.size();
-  const std::string key = draw.gc_name + "|" + draw.gc_material_name;
+  const std::string key = std::string(draw.gc_name) + "|" + std::string(draw.gc_material_name);
   if (g_dmf_draw_logged.insert(key).second)
   {
     std::fprintf(stderr,
                  "[moh-ps3-dmf] FIRST REAL PS3 SKINNED DRAW: gc=%s ps3=%s material=%s vertices=%zu indices=%zu palette=%zu DL=%08x | GX/XF animation palette + current TPK/GX state preserved\n",
-                 draw.gc_name.c_str(), replacement.owner->source_name.c_str(),
-                 draw.gc_material_name.c_str(), replacement.cluster->positions.size(),
+                 draw.gc_name.data(), replacement.owner->source_name.c_str(),
+                 draw.gc_material_name.data(), replacement.cluster->positions.size(),
                  replacement.cluster->indices.size(), draw.gc_palette_groups.size(),
                  draw.display_list);
   }
@@ -2178,6 +2232,12 @@ void NotifySkinnedDrawSubmitted(const SkinnedDrawReplacement& replacement)
 
 void PrintDrawStatistics()
 {
+  std::fprintf(stderr, "[moh-ps3-perf] dmf_lookup=%llu dmf_cache_hit=%llu dmf_cache_miss=%llu dmf_runtime_triangle_scans=0 dmf_runtime_allocations=0 fifo_backpressure_events=%llu fifo_peak_distance=%u\n",
+      static_cast<unsigned long long>(g_dmf_lookups.load()),
+      static_cast<unsigned long long>(g_dmf_hits.load()),
+      static_cast<unsigned long long>(g_dmf_misses.load()),
+      static_cast<unsigned long long>(Core::System::GetInstance().GetFifo().GetBackpressureEvents()),
+      Core::System::GetInstance().GetFifo().GetPeakFifoDistance());
   std::fprintf(stderr, "[moh-ps3-msh] stats: matches=%llu replacements=%llu draws=%llu vertices=%llu indices=%llu fallbacks=%llu\n",
                (unsigned long long)g_matches.load(), (unsigned long long)g_draws.load(),
                (unsigned long long)g_draws.load(), (unsigned long long)g_vertices.load(),
@@ -2622,6 +2682,7 @@ SKLInfo InspectSKL(std::span<const u8> bytes)
     out.bone_names.push_back(name);
   }
 
+  out.hierarchy = MOHFrontline::PS3::SkinBind::DecodeHierarchy(bytes);
   out.valid = true;
   return out;
 }

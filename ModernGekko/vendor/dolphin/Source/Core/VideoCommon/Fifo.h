@@ -69,6 +69,14 @@ public:
   void* PopFifoAuxBuffer(size_t size);
 
   void FlushGpu();
+  void WaitForFifoSpace(u32 high_water);
+  u64 GetBackpressureEvents() const { return m_backpressure_events.load(); }
+  u32 GetPeakFifoDistance() const { return m_peak_fifo_distance.load(); }
+  void ObserveFifoDistance(u32 distance)
+  {
+    if (distance > m_peak_fifo_distance.load(std::memory_order_relaxed))
+      m_peak_fifo_distance.store(distance, std::memory_order_relaxed);
+  }
   void RunGpu();
   void GpuMaySleep();
   void RunGpuLoop();
@@ -87,6 +95,11 @@ private:
   static constexpr u32 FIFO_SIZE = 2 * 1024 * 1024;
 
   Common::BlockingLoop m_gpu_mainloop;
+  std::atomic<bool> m_fifo_space_waiting{false};
+  std::atomic<u32> m_fifo_space_target{0};
+  Common::Event m_fifo_space_event;
+  std::atomic<u64> m_backpressure_events{0};  // CPU-owned, reported after shutdown.
+  std::atomic<u32> m_peak_fifo_distance{0};
 
   Common::Flag m_emu_running_state;
 

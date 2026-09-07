@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/Present.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include "VideoCommon/PS3AssetPort.h"
 
 #include "Common/ChunkFile.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -172,6 +176,27 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
                        TimePoint presentation_time)
 {
   bool is_duplicate = FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
+  static const bool profile = [] {
+    const char* value = std::getenv("MOH_PS3_PROFILE");
+    return value && std::string_view(value) == "1";
+  }();
+  if (profile)
+  {
+    static auto start = std::chrono::steady_clock::now();
+    static u64 unique_frames = 0, presents = 0;
+    ++presents;
+    unique_frames += !is_duplicate;
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - start).count();
+    if (seconds >= 10.0)
+    {
+      std::fprintf(stderr, "[moh-ps3-profile] level=%s seconds=%.2f unique_fps=%.2f vi_fps=%.2f\n",
+          PS3AssetPort::GetCurrentLevel().c_str(), seconds,
+          unique_frames / seconds, presents / seconds);
+      start = now;
+      unique_frames = presents = 0;
+    }
+  }
 
   PresentInfo present_info{
       .present_count = m_present_count++,

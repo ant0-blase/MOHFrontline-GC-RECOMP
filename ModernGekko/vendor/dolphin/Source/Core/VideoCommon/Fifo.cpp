@@ -10,6 +10,8 @@
 #include "Common/BlockingLoop.h"
 #include "Common/ChunkFile.h"
 #include "Common/Event.h"
+#include <chrono>
+#include <cstdio>
 #include "Common/FPURoundMode.h"
 #include "Common/MemoryUtil.h"
 #include "Common/MsgHandler.h"
@@ -96,6 +98,9 @@ void FifoManager::Init()
   if (m_system.IsDualCoreMode())
     m_gpu_mainloop.Prepare();
   m_sync_ticks.store(0);
+  m_backpressure_events = 0;
+  m_peak_fifo_distance = 0;
+  m_fifo_space_waiting.store(false);
 }
 
 void FifoManager::Shutdown()
@@ -128,6 +133,7 @@ void FifoManager::ExitGpuLoop()
 
   // This should break the wait loop in CPU thread
   fifo.bFF_GPReadEnable.store(0, std::memory_order_relaxed);
+  m_fifo_space_event.Set();
   FlushGpu();
 
   // Terminate GPU thread loop
@@ -138,6 +144,7 @@ void FifoManager::ExitGpuLoop()
 void FifoManager::EmulatorState(bool running)
 {
   m_emu_running_state.Set(running);
+  m_fifo_space_event.Set();
   if (running)
     m_gpu_mainloop.Wakeup();
   else
@@ -328,7 +335,8 @@ void FifoManager::RunGpuLoop()
                  fifo.CPReadWriteDistance.load(std::memory_order_relaxed) &&
                  !AtBreakpoint(m_system))
           {
-            if (m_config_sync_gpu && m_sync_ticks.load() < m_config_sync_gpu_min_distance)
+            if (m_config_sync_gpu && m_sync_ticks.load() < m_config_sync_gpu_min_distance &&
+                !m_fifo_space_waiting.load(std::memory_order_relaxed))
               break;
 
             processed_fifo = true;
@@ -355,6 +363,10 @@ void FifoManager::RunGpuLoop()
                        "Negative fifo.CPReadWriteDistance = {} in FIFO Loop !\nThat can produce "
                        "instability in the game. Please report it.",
                        distance_after);
+
+            if (m_fifo_space_waiting.load(std::memory_order_acquire) &&
+                static_cast<u32>(distance_after) < m_fifo_space_target.load(std::memory_order_relaxed))
+              m_fifo_space_event.Set();
 
             if ((write_ptr - m_video_buffer_read_ptr) == 0)
             {
@@ -449,6 +461,38 @@ void FifoManager::FlushGpu()
     return;
 
   m_gpu_mainloop.Wait();
+}
+
+void FifoManager::WaitForFifoSpace(u32 high_water)
+{
+  if (!m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread || !high_water)
+    return;
+  auto& cp = m_system.GetCommandProcessor();
+  auto& fifo = cp.GetFifo();
+  const u32 distance = fifo.CPReadWriteDistance.load(std::memory_order_acquire);
+  ObserveFifoDistance(distance);
+  if (distance < high_water)
+    return;
+  ++m_backpressure_events;
+  m_fifo_space_target.store(high_water, std::memory_order_relaxed);
+  m_fifo_space_waiting.store(true, std::memory_order_release);
+  RunGpu();
+  while (fifo.CPReadWriteDistance.load(std::memory_order_acquire) >= high_water)
+  {
+    cp.ServicePendingFifoInterrupt();
+    // Never ignore an emulated breakpoint or wait through shutdown/pause.
+    if (!fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ||
+        !m_emu_running_state.IsSet() || AtBreakpoint(m_system))
+    {
+      m_system.GetCoreTiming().ForceExceptionCheck(0);
+      break;
+    }
+    RunGpu();
+    // The event wakes immediately when the consumer makes space. The bounded
+    // timeout only services a CPU IRQ queued while the producer was asleep.
+    m_fifo_space_event.WaitFor(std::chrono::milliseconds(1));
+  }
+  m_fifo_space_waiting.store(false, std::memory_order_release);
 }
 
 void FifoManager::GpuMaySleep()

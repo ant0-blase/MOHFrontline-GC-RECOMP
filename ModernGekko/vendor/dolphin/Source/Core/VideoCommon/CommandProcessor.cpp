@@ -92,6 +92,8 @@ void CommandProcessorManager::DoState(PointerWrap& p)
 
   p.Do(m_interrupt_set);
   p.Do(m_interrupt_waiting);
+  p.Do(m_pending_fifo_interrupt);
+  p.Do(m_fifo_interrupt_serial);
 
   // A loaded state (and harmlessly, a saved state) needs one fresh GPU-side
   // CP status evaluation before normal transition-only tracking resumes.
@@ -124,6 +126,8 @@ void CommandProcessorManager::Init()
 
   m_interrupt_set.Clear();
   m_interrupt_waiting.Clear();
+  m_pending_fifo_interrupt.store(0, std::memory_order_relaxed);
+  m_fifo_interrupt_serial = 0;
   m_gpu_status_seen_generation = 0;
   m_gpu_status_generation.store(1u, std::memory_order_relaxed);
 
@@ -396,6 +400,7 @@ void CommandProcessorManager::GatherPipeBursted()
   const u32 distance_before_burst =
       m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
   const u32 distance_after_burst = distance_before_burst + GPFifo::GATHER_PIPE_SIZE;
+  m_system.GetFifo().ObserveFifoDistance(distance_after_burst);
 
   if (distance_before_burst > m_fifo.CPHiWatermark)
     m_system.GetCoreTiming().ForceExceptionCheck(0);
@@ -421,18 +426,18 @@ void CommandProcessorManager::GatherPipeBursted()
 
   m_system.GetFifo().RunGpu();
 
-  // The static-recompiled CPU can fill the ring before its next timing check,
-  // even when watermark interrupts are disabled. Waking the GPU alone does
-  // not apply backpressure. Drain at the capacity limit, leaving the final
-  // 32-byte slot free before UpdateGatherPipe copies another burst to RAM.
-  // Use the published distance so a concurrent GPU read can only cause an
-  // unnecessary wait, never hide a full FIFO.
-  const u32 fifo_capacity = m_fifo.CPEnd.load(std::memory_order_relaxed) -
-                           m_fifo.CPBase.load(std::memory_order_relaxed);
-  if (distance_after_burst >= fifo_capacity && m_cp_ctrl_reg.GPReadEnable &&
-      IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
+  // Reserve two gather bursts before the ring limit. FlushGpu only waits for
+  // an iteration: that iteration may stop on a pending CPU interrupt or on
+  // sync-GPU timing, without consuming the queued bytes.
+  const u32 fifo_base = m_fifo.CPBase.load(std::memory_order_relaxed);
+  const u32 fifo_end = m_fifo.CPEnd.load(std::memory_order_relaxed);
+  const u32 fifo_capacity = fifo_end >= fifo_base ? fifo_end - fifo_base : 0;
+  constexpr u32 margin = 2 * GPFifo::GATHER_PIPE_SIZE;
+  if (fifo_capacity >= margin && distance_after_burst >= fifo_capacity - margin &&
+      m_cp_ctrl_reg.GPReadEnable && IsOnThread(m_system) &&
+      !m_system.GetFifo().UseDeterministicGPUThread())
   {
-    m_system.GetFifo().FlushGpu();
+    m_system.GetFifo().WaitForFifoSpace(fifo_capacity - margin);
   }
 
   ASSERT_MSG(COMMANDPROCESSOR,
@@ -456,6 +461,15 @@ void CommandProcessorManager::GatherPipeBursted()
 
 void CommandProcessorManager::UpdateInterrupts(u64 userdata)
 {
+  if (userdata >= 2)
+  {
+    // A blocked producer may already have serviced this CPU-side interrupt.
+    // Do not let its later CoreTiming callback overwrite a newer IRQ state.
+    u64 expected = userdata;
+    if (!m_pending_fifo_interrupt.compare_exchange_strong(expected, 0))
+      return;
+    userdata &= 1;
+  }
   if (userdata)
   {
     m_interrupt_set.Set();
@@ -482,9 +496,19 @@ void CommandProcessorManager::UpdateInterruptsFromVideoBackend(u64 userdata)
 {
   if (!m_system.GetFifo().UseDeterministicGPUThread())
   {
+    userdata = (++m_fifo_interrupt_serial << 1) | (userdata & 1);
+    m_pending_fifo_interrupt.store(userdata, std::memory_order_release);
     m_system.GetCoreTiming().ScheduleEvent(0, m_event_type_update_interrupts, userdata,
                                            CoreTiming::FromThread::NON_CPU);
   }
+}
+
+void CommandProcessorManager::ServicePendingFifoInterrupt()
+{
+  // CPU thread only; do not run arbitrary timing callbacks from GatherPipe.
+  const u64 pending = m_pending_fifo_interrupt.load(std::memory_order_acquire);
+  if (pending)
+    UpdateInterrupts(pending);
 }
 
 bool CommandProcessorManager::IsInterruptWaiting() const
