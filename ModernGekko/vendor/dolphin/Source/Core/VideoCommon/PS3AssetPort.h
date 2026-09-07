@@ -47,6 +47,7 @@ void Initialize();
 void Shutdown();
 
 void SetCurrentLevel(std::string_view level);
+void SyncLightingLevel(std::string_view level);
 std::string GetCurrentLevel();
 
 Class Classify(std::string_view path);

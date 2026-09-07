@@ -1042,7 +1042,7 @@ ShaderCode GeneratePixelShaderCode(APIType api_type, const ShaderHostConfig& hos
     // We do not consume RSX resources here. Instead we reimplement the
     // corresponding material response using the real GX geometry normal,
     // position and the already emulated material/TEV result.
-    out.Write(R"MOHPS3(
+    out.Write("{}", R"MOHPS3(
 	// ------------------------------------------------------------
 	// Medal of Honor: Frontline - PS3-style 3D material renderer
 	// ------------------------------------------------------------
@@ -1076,6 +1076,17 @@ ShaderCode GeneratePixelShaderCode(APIType api_type, const ShaderHostConfig& hos
 	// response representing the stronger PS3 remaster directional light.
 	float3 moh_key_dir =
 	    normalize(float3(-0.38, 0.46, 0.80));
+
+	for (int moh_li = 0; moh_li < 8; ++moh_li)
+	{
+	    if (clights[moh_li].cosatt.w <= 1000.0001)
+	        continue;
+
+	    float3 moh_lit_sun = clights[moh_li].dir.xyz;
+	    if (dot(moh_lit_sun, moh_lit_sun) > 0.00001)
+	        moh_key_dir = normalize(-moh_lit_sun);
+	    break;
+	}
 
 	float moh_ndotl =
 	    dot(moh_n, moh_key_dir);
@@ -1159,10 +1170,63 @@ ShaderCode GeneratePixelShaderCode(APIType api_type, const ShaderHostConfig& hos
 	        float3(1.025, 1.012, 0.985),
 	        moh_hemi);
 
+	float3 moh_local_lighting =
+	    float3(0.0, 0.0, 0.0);
+
+	for (int moh_li = 0; moh_li < 8; ++moh_li)
+	{
+	    float moh_marker = clights[moh_li].cosatt.w;
+	    if (moh_marker <= 1000.0001)
+	        continue;
+
+	    float moh_local_strength =
+	        clamp(moh_marker - 1000.0, 0.0, 4.0);
+
+	    float3 moh_to_light =
+	        clights[moh_li].pos.xyz - frag_input.position;
+
+	    float moh_dist2 =
+	        dot(moh_to_light, moh_to_light);
+
+	    if (moh_dist2 <= 0.000001)
+	        continue;
+
+	    float moh_dist = sqrt(moh_dist2);
+	    float moh_outer = max(clights[moh_li].distatt.w, 0.001);
+	    if (moh_dist >= moh_outer)
+	        continue;
+
+	    float moh_inner =
+	        clamp(clights[moh_li].dir.w, 0.0, moh_outer * 0.995);
+
+	    float moh_atten =
+	        1.0 - smoothstep(moh_inner, moh_outer, moh_dist);
+
+	    float3 moh_ldir = moh_to_light / moh_dist;
+	    float moh_local_ndotl = max(dot(moh_n, moh_ldir), 0.0);
+	    float3 moh_local_color =
+	        float3(clights[moh_li].color.rgb) / 255.0;
+
+	    moh_local_lighting +=
+	        moh_local_color *
+	        (0.18 + 0.82 * moh_local_ndotl) *
+	        moh_atten *
+	        moh_local_strength;
+	}
+
+	moh_local_lighting =
+	    clamp(moh_local_lighting, float3(0.0, 0.0, 0.0), float3(2.5, 2.5, 2.5));
+
 	float3 moh_result =
 	    moh_base *
 	    (0.955 + 0.105 * moh_wrap) *
 	    moh_ambient_tint;
+
+	moh_result +=
+	    moh_base * moh_local_lighting * 0.70;
+
+	moh_result +=
+	    moh_local_lighting * 0.035;
 
 	// Slightly warm specular highlight, matching Frontline HD's presentation
 	// better than a pure white highlight.

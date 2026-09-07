@@ -4,6 +4,7 @@
 #include "Core/Config/MainSettings.h"
 #include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/PS3Compass.h"
+#include "VideoCommon/PS3NamedSky.h"
 #include "VideoCommon/TextureDecoder.h"
 #endif
 
@@ -1261,7 +1262,12 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
       }
     }
 
-    return true;
+    // TLT_LoadFileFromLevelBigFile returns r3=SHPG and the metadata hook
+    // preserves r29=original LFC filename in r0. CSkyBox::SetTextures uses
+    // this loader directly; it never constructs a CSprite.
+    if (PS3NamedSky::RelativePath(name).empty())
+      return true;
+    address = 0xFFFFF146u;
   }
   if (address == 0xFFFFF144u ||
       address == 0xFFFFF145u)
@@ -1293,11 +1299,14 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     if (!ReadGuestCString(state, state->gpr[0], &name)) return true;
     const int index = PS3Compass::NameIndex(name);
     const u32 file = state->gpr[3];
-    if (index < 0 || !IsMem1Address(file) || file > 0x817FFFE8u ||
+    if (!IsMem1Address(file) || file > 0x817FFFE8u ||
         ReadGuestU32(state, file) != 0x53485047u) return true;
     const u32 offset = ReadGuestU32(state, file + 20);
     if (offset < 24 || offset > 0x81800000u - file - 16) return true;
     const u32 shape = file + offset;
+    if (!PS3NamedSky::RelativePath(name).empty())
+      PS3Compass::MarkNamedSkyAddress(shape + 16);
+    if (index < 0) return true;
     const u32 wh = ReadGuestU32(state, shape + 4);
     const u32 w = wh >> 16, h = wh & 65535;
     const u32 type = ReadGuestU32(state, shape) >> 24;

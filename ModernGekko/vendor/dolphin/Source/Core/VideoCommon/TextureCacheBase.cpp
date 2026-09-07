@@ -780,15 +780,13 @@ void TextureCacheBase::OnFrameEnd()
   // copies.
   FlushEFBCopies();
 
-  // v14.2: the deterministic PS3 sky assignment can become ready only after
-  // several anonymous GameCube sky textures are already cached as normal GX
-  // textures. Invalidate once so the next frame recreates those entries
-  // through PS3Compass::Find() with the solved face table.
+  // Named sky registrations may replace allocations from a previous level.
+  // Recreate cached GPU entries after the loader publishes their identity.
   if (PS3Compass::ConsumeSkyCacheInvalidation())
   {
     std::fprintf(
         stderr,
-        "[moh-ps3-sky] v14.2 reloading TextureCache for solved sky faces\n");
+        "[moh-ps3-sky] reloading TextureCache for named sky registrations\n");
     Invalidate();
   }
 
@@ -1631,6 +1629,8 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
                          has_arbitrary_mipmaps, skip_texture_dump);
   if (!entry) return entry;
   entry->is_ps3_compass = bool(ps3_compass);
+  if (ps3_compass)
+    PS3Compass::NotifyTextureUploaded(texture_info);
   entry->hires_texture = std::move(hires_texture);
   entry->last_load_time = load_time;
   entry->texture_info_name = std::move(texture_name);

@@ -1,4 +1,5 @@
 #include "VideoCommon/PS3Compass.h"
+#include "VideoCommon/PS3NamedSky.h"
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
@@ -57,6 +58,9 @@ struct Registration
 std::unordered_map<int, Resource> resources;
 std::unordered_map<std::string, int> resource_ids;
 std::unordered_map<u32, Registration> registrations;
+std::unordered_set<u32> named_sky_addresses;
+std::unordered_set<u32> uploaded_named_sky;
+bool named_sky_cache_invalidation = false;
 int next_resource_id = 0;
 std::mutex mutex;
 
@@ -301,6 +305,74 @@ const PS3RemasterAssets::AssetInfo* FindBestAsset(std::string_view guest_name)
 {
   if (!PS3RemasterAssets::IsReady())
     return nullptr;
+
+  // v14.7 FIXED2: exact named GameCube sky -> exact PS3 sky.
+  // No fingerprint/fuzzy matching for named sky faces.
+  const std::string guest_file = Filename(guest_name);
+
+  static constexpr std::array<std::string_view, 6> sky_suffixes = {
+      "_fr.gsh", "_lf.gsh", "_bk.gsh",
+      "_rt.gsh", "_up.gsh", "_dn.gsh",
+  };
+
+  bool named_sky_face = false;
+
+  for (const auto suffix : sky_suffixes)
+  {
+    if (guest_file.ends_with(suffix))
+    {
+      named_sky_face = true;
+      break;
+    }
+  }
+
+  if (named_sky_face)
+  {
+    std::string level;
+
+    if (guest_file.starts_with("level1test_"))
+    {
+      level = "1_1";
+    }
+    else if (guest_file.size() >= 7 &&
+             std::isdigit(static_cast<unsigned char>(guest_file[0])) &&
+             guest_file[1] == '_' &&
+             std::isdigit(static_cast<unsigned char>(guest_file[2])) &&
+             guest_file[3] == '_')
+    {
+      level = guest_file.substr(0, 3);
+    }
+
+    if (!level.empty())
+    {
+      std::string ps3_file = guest_file;
+      ps3_file.replace(ps3_file.size() - 4, 4, ".ssh");
+
+      const std::string relative =
+          "data/" + level.substr(0, 1) + "/" +
+          level + "/" + ps3_file;
+
+      if (const auto* exact =
+              PS3RemasterAssets::FindByRelativePath(relative))
+      {
+        std::fprintf(
+            stderr,
+            "[moh-ps3-sky] EXACT GSH->SSH: %s -> %s\n",
+            guest_file.c_str(),
+            relative.c_str());
+
+        return exact;
+      }
+
+      std::fprintf(
+          stderr,
+          "[moh-ps3-sky] EXACT GSH->SSH missing: %s -> %s (keeping GC)\n",
+          guest_file.c_str(),
+          relative.c_str());
+
+      return nullptr;
+    }
+  }
 
   // Native-PC resolver stays first: exact level/locale-aware identities should
   // win whenever the new subsystem knows the asset.
@@ -1149,8 +1221,17 @@ void SetAuto3DLevelScope(
     return;
 
   MOHFrontline::NativeAssets::SetCurrentLevel(scope);
+  PS3AssetPort::SyncLightingLevel(scope);
   auto3d_level_scope = std::move(scope);
   ResetAuto3DCacheLocked();
+  {
+    std::scoped_lock registrations_lock(mutex);
+    for (u32 address : named_sky_addresses)
+      registrations.erase(address);
+    named_sky_addresses.clear();
+    uploaded_named_sky.clear();
+    named_sky_cache_invalidation = true;
+  }
 
   std::fprintf(
       stderr,
@@ -1413,7 +1494,7 @@ bool IsExactCurrentLevelSkyFacePath(
 }
 
 
-bool UpdateDeterministicSkyAssignmentLocked(
+[[maybe_unused]] bool UpdateDeterministicSkyAssignmentLocked(
     u64 key,
     const Auto3DFingerprint& fingerprint,
     u32 width,
@@ -1426,6 +1507,18 @@ bool UpdateDeterministicSkyAssignmentLocked(
 
   if (potential_sky)
     *potential_sky = false;
+
+  // v14.6: the GameCube level files already name the six sky resources
+  // explicitly (FR/LF/BK/RT/UP/DN). Do not guess sky identity from anonymous
+  // texture fingerprints anymore. The old matcher is opt-in only for debugging.
+  const char* legacy_sky_match =
+      std::getenv("MOH_PS3_LEGACY_SKY_MATCH");
+
+  if (!legacy_sky_match ||
+      std::string_view(legacy_sky_match) != "1")
+  {
+    return false;
+  }
 
   const bool supported_sky_probe =
       width == height &&
@@ -2126,109 +2219,15 @@ void BuildAuto3DCandidatesLocked()
   std::size_t tried = 0;
   std::size_t decoded_count = 0;
 
-  // v14.3: load standalone skybox faces by their exact PS3 filenames.
-  // Explicit sky faces bypass the generic low-contrast candidate filter.
-  const std::string level =
-      CurrentLevelIdFromScope(scope);
-
-  const std::string sky_stem =
-      DirectSkyStemForLevel(level);
-
-  static constexpr std::array<std::string_view, 6> direct_faces = {
-      "fr", "bk", "lf", "rt", "up", "dn",
-  };
-
-  std::size_t direct_sky_loaded = 0;
-
-  for (const auto face : direct_faces)
-  {
-    const std::string relative_path =
-        scope + sky_stem + "_" + std::string(face) + ".ssh";
-
-    const auto* asset =
-        PS3RemasterAssets::FindByRelativePath(relative_path);
-
-    if (!asset ||
-        asset->kind != PS3RemasterAssets::Kind::Texture)
-    {
-      continue;
-    }
-
-    ++tried;
-
-    const auto binary =
-        PS3RemasterAssets::ReadBinary(*asset);
-
-    if (binary.empty())
-      continue;
-
-    std::vector<PS3TextureDecoder::Level> levels;
-
-    if (!PS3TextureDecoder::Decode(
-            std::span<const u8>(
-                binary.data(),
-                binary.size()),
-            &levels) ||
-        levels.empty())
-    {
-      std::fprintf(
-          stderr,
-          "[moh-ps3-sky] direct face decode failed: %s\n",
-          relative_path.c_str());
-      continue;
-    }
-
-    const auto& base = levels.front();
-
-    if (base.rgba.size() <
-            std::size_t(base.width) *
-                base.height *
-                4u ||
-        base.width < 8 ||
-        base.height < 8 ||
-        base.width > 4096 ||
-        base.height > 4096 ||
-        base.rgba.empty())
-    {
-      continue;
-    }
-
-    Auto3DCandidate candidate;
-    candidate.relative_path =
-        Normalize(asset->relative_path);
-    candidate.width = base.width;
-    candidate.height = base.height;
-    candidate.fingerprint =
-        MakeAuto3DFingerprint(
-            base.rgba.data(),
-            base.width,
-            base.height);
-
-    auto3d_candidates.push_back(
-        std::move(candidate));
-
-    ++decoded_count;
-    ++direct_sky_loaded;
-  }
-
-  if (direct_sky_loaded)
-  {
-    std::fprintf(
-        stderr,
-        "[moh-ps3-sky] DIRECT FACE SET: "
-        "scope=%s stem=%s loaded=%zu/6\n",
-        scope.c_str(),
-        sky_stem.c_str(),
-        direct_sky_loaded);
-  }
-
   for (const auto& asset :
        PS3RemasterAssets::GetAssets())
   {
+    // Named sky faces are never candidates for anonymous world textures.
+    if (!PS3NamedSky::RelativePath(asset.filename).empty())
+      continue;
     if (asset.kind != PS3RemasterAssets::Kind::Texture ||
         !Lower(asset.filename).ends_with(".ssh") ||
-        !Auto3DPathAllowed(asset.relative_path, scope) ||
-        IsExactCurrentLevelSkyFacePath(asset.relative_path, scope))
+        !Auto3DPathAllowed(asset.relative_path, scope))
     {
       continue;
     }
@@ -2427,70 +2426,6 @@ FindStrictCurrentLevelTexture(const TextureInfo& info)
           height);
 
   if (gc.contrast < 0.018f)
-    return nullptr;
-
-  // v13.9.1:
-  // Do NOT compare each anonymous texture independently to the cube-map.
-  // Collect the 128x128 GameCube candidates and solve the six cube faces as
-  // one one-to-one assignment.
-  std::string assigned_sky_path;
-  bool potential_sky = false;
-
-  {
-    std::scoped_lock lock(
-        auto3d_mutex);
-
-    (void)
-        UpdateDeterministicSkyAssignmentLocked(
-            key,
-            gc,
-            width,
-            height,
-            &assigned_sky_path,
-            &potential_sky);
-  }
-
-  if (!assigned_sky_path.empty())
-  {
-    auto decoded =
-        DecodeAuto3DWinner(
-            assigned_sky_path);
-
-    if (decoded)
-    {
-      {
-        std::scoped_lock lock(
-            auto3d_mutex);
-
-        strict_level_matches[
-            key] = decoded;
-      }
-
-      static unsigned sky_match_logs = 0;
-
-      if (sky_match_logs++ < 48)
-      {
-        std::fprintf(
-            stderr,
-            "[moh-ps3-sky] PS3 FACE ACTIVE v13.9.2: "
-            "GC=%ux%u fmt=%u hash=%016llX -> %s\n",
-            width,
-            height,
-            static_cast<unsigned>(
-                info.GetTextureFormat()),
-            static_cast<unsigned long long>(
-                key),
-            assigned_sky_path.c_str());
-      }
-
-      return decoded;
-    }
-  }
-
-  // A plausible cube face must remain untouched until the global six-face
-  // assignment is ready. Most importantly, do not let the old level matcher
-  // misclassify it as an ordinary SSH material.
-  if (potential_sky)
     return nullptr;
 
   const float gc_aspect =
@@ -3712,9 +3647,27 @@ int NameIndex(std::string_view name)
 {
   UpdateLevelScopeFromGuestName(name);
 
-  const auto* asset =
-      FindBestAsset(
-          name);
+  const std::string sky_path = PS3NamedSky::RelativePath(name);
+  const PS3RemasterAssets::AssetInfo* asset = nullptr;
+  if (!sky_path.empty())
+  {
+    // Missing or disabled exact faces must not enter any other resolver.
+    if (!SkyTexturesEnabled())
+      return -1;
+    asset = PS3RemasterAssets::FindByRelativePath(sky_path);
+    if (!asset)
+    {
+      std::fprintf(stderr, "[moh-ps3-sky] NAMED SKY FALLBACK: %.*s -> %s (absent)\n",
+                   static_cast<int>(name.size()), name.data(), sky_path.c_str());
+      return -1;
+    }
+    SetAuto3DLevelScope(sky_path.substr(0, sky_path.find_last_of('/') + 1),
+                        "named GC sky face");
+  }
+  else
+  {
+    asset = FindBestAsset(name);
+  }
 
   if (!asset)
   {
@@ -3759,6 +3712,13 @@ int NameIndex(std::string_view name)
     return it->second;
   }
 
+  if (!sky_path.empty())
+  {
+    std::fprintf(stderr, "[moh-ps3-sky] NAMED SKY GC: %.*s\n",
+                 static_cast<int>(name.size()), name.data());
+    std::fprintf(stderr, "[moh-ps3-sky] NAMED SKY PS3: %s\n", sky_path.c_str());
+  }
+
   const int id =
       next_resource_id++;
 
@@ -3797,6 +3757,39 @@ int NameIndex(std::string_view name)
 }
 
 
+void MarkNamedSkyAddress(u32 address)
+{
+  std::scoped_lock lock(mutex);
+  address &= 0x1FFFFFFF;
+  named_sky_addresses.insert(address);
+  registrations.erase(address);  // A reloaded level may reuse the allocation.
+  uploaded_named_sky.erase(address);
+  named_sky_cache_invalidation = true;
+}
+
+void NotifyTextureUploaded(const TextureInfo& info)
+{
+  std::scoped_lock lock(mutex);
+  const u32 address = info.GetRawAddress();
+  if (!named_sky_addresses.contains(address) || uploaded_named_sky.contains(address))
+    return;
+  const auto it = registrations.find(address);
+  if (it == registrations.end())
+    return;
+  const auto resource = resources.find(it->second.resource_id);
+  if (resource == resources.end())
+    return;
+  uploaded_named_sky.insert(address);
+  const auto& path = resource->second.relative_path;
+  std::string face = path.substr(path.size() - 6, 2);
+  std::transform(face.begin(), face.end(), face.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+  std::fprintf(stderr,
+               "[moh-ps3-sky] NAMED SKY ACTIVE: GC=%08x hash=%016llx face=%s -> %s\n",
+               address, static_cast<unsigned long long>(it->second.texture_hash),
+               face.c_str(), path.c_str());
+}
+
 void Register(int index, u32 address, u32 width, u32 height, u32 format, std::vector<u8> original,
               u32 palette_format, std::vector<u8> palette)
 {
@@ -3808,6 +3801,12 @@ void Register(int index, u32 address, u32 width, u32 height, u32 format, std::ve
   auto resource_it = resources.find(index);
   if (resource_it == resources.end())
     return;
+
+  if (PS3NamedSky::RelativePath(resource_it->second.relative_path).empty())
+  {
+    named_sky_addresses.erase(address & 0x1FFFFFFF);
+    uploaded_named_sky.erase(address & 0x1FFFFFFF);
+  }
 
   auto decoded = DecodeResource(&resource_it->second);
   if (!decoded)
@@ -3851,7 +3850,14 @@ std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
   }
 
   if (!has_exact_registration)
+  {
+    {
+      std::scoped_lock lock(mutex);
+      if (named_sky_addresses.contains(address))
+        return nullptr;
+    }
     return FindAuto3D(info);
+  }
 
   Registration registration;
   std::shared_ptr<VideoCommon::CustomTextureData> decoded;
@@ -3913,6 +3919,11 @@ std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
 
 bool ConsumeSkyCacheInvalidation()
 {
+  {
+    std::scoped_lock lock(mutex);
+    if (std::exchange(named_sky_cache_invalidation, false))
+      return true;
+  }
   std::scoped_lock lock(auto3d_mutex);
 
   if (!sky_cache_invalidation_pending)
@@ -3947,6 +3958,9 @@ void Shutdown()
 
   std::scoped_lock lock(mutex);
   registrations.clear();
+  named_sky_addresses.clear();
+  uploaded_named_sky.clear();
+  named_sky_cache_invalidation = false;
   resources.clear();
   resource_ids.clear();
   next_resource_id = 0;
