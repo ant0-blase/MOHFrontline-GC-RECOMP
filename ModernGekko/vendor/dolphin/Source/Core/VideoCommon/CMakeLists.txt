@@ -129,6 +129,12 @@ add_library(videocommon
   MohPcLayer.h
   PS3RemasterAssets.cpp
   PS3RemasterAssets.h
+  MOHFrontline/Engine/Filesystem/NativeAssetResolver.cpp
+  MOHFrontline/Assets/PS3/Formats/TPK.cpp
+  MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.cpp
+  MOHFrontline/Assets/PS3/Formats/MSH.cpp
+  PS3MeshPort.cpp
+  PS3AssetPort.cpp
   PS3Compass.cpp
   PS3Compass.h
   PS3TextureDecoder.cpp
