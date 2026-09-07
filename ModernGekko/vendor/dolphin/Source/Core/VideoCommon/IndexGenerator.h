@@ -20,6 +20,11 @@ public:
 
   void AddExternalIndices(const u16* indices, u32 num_indices, u32 num_vertices);
 
+  // Add a triangle-list index stream using the topology selected by the backend.
+  // With primitive restart Dolphin renders GX triangle primitives as TriangleStrip,
+  // so each independent triangle needs a 0xffff restart marker.
+  void AddExternalTriangles(const u16* indices, u32 num_indices, u32 num_vertices);
+
   // returns numprimitives
   u32 GetNumVerts() const { return m_base_index; }
   u32 GetIndexLen() const { return static_cast<u32>(m_index_buffer_current - m_base_index_ptr); }

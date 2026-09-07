@@ -88,6 +88,7 @@ struct StaticDrawMatch
 // CPU load metadata -> exact GPU display-list identity. No GPU calls on CPU.
 void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const u8> bytes);
 StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands);
+void SetDisplayListContext(u32 address, std::span<const u8> commands);
 void SetDisplayListMatch(StaticDrawMatch match);
 void NotifyStaticDrawSubmitted();
 void PrintDrawStatistics();

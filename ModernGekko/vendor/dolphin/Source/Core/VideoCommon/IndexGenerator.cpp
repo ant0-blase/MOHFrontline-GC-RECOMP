@@ -324,6 +324,29 @@ void IndexGenerator::AddExternalIndices(const u16* indices, u32 num_indices, u32
   m_base_index += num_vertices;
 }
 
+void IndexGenerator::AddExternalTriangles(const u16* indices, u32 num_indices, u32 num_vertices)
+{
+  if (g_backend_info.bSupportsPrimitiveRestart)
+  {
+    // primitive_from_gx_pr selects PrimitiveType::TriangleStrip for every GX
+    // triangle primitive. Preserve independent PS3 triangles by terminating
+    // every triangle with Dolphin's primitive-restart index.
+    for (u32 i = 0; i + 2 < num_indices; i += 3)
+    {
+      *m_index_buffer_current++ = indices[i + 0];
+      *m_index_buffer_current++ = indices[i + 1];
+      *m_index_buffer_current++ = indices[i + 2];
+      *m_index_buffer_current++ = s_primitive_restart;
+    }
+  }
+  else
+  {
+    std::memcpy(m_index_buffer_current, indices, sizeof(u16) * num_indices);
+    m_index_buffer_current += num_indices;
+  }
+  m_base_index += num_vertices;
+}
+
 u32 IndexGenerator::GetRemainingIndices(OpcodeDecoder::Primitive primitive) const
 {
   u32 max_index = UINT16_MAX;

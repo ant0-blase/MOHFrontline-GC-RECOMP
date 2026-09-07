@@ -19,9 +19,35 @@ if(GIT_FOUND)
       OUTPUT_VARIABLE DOLPHIN_WC_BRANCH
       OUTPUT_STRIP_TRAILING_WHITESPACE)
   # defines DOLPHIN_WC_COMMITS_AHEAD_MASTER
-  execute_process(WORKING_DIRECTORY ${PROJECT_SOURCE_DIR} COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD ^master
-      OUTPUT_VARIABLE DOLPHIN_WC_COMMITS_AHEAD_MASTER
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
+  # ModernGekko repositories commonly use `main` and do not carry Dolphin's
+  # historical local `master` ref.  `git rev-list ... ^master` prints a fatal
+  # error on every incremental build in that layout.  Prefer master when it
+  # exists, otherwise main, and finally fall back to zero for source snapshots.
+  execute_process(WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+      COMMAND ${GIT_EXECUTABLE} rev-parse --verify --quiet master
+      RESULT_VARIABLE DOLPHIN_HAS_MASTER
+      OUTPUT_QUIET ERROR_QUIET)
+  if(DOLPHIN_HAS_MASTER EQUAL 0)
+    execute_process(WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD ^master
+        OUTPUT_VARIABLE DOLPHIN_WC_COMMITS_AHEAD_MASTER
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+  else()
+    execute_process(WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${GIT_EXECUTABLE} rev-parse --verify --quiet main
+        RESULT_VARIABLE DOLPHIN_HAS_MAIN
+        OUTPUT_QUIET ERROR_QUIET)
+    if(DOLPHIN_HAS_MAIN EQUAL 0)
+      execute_process(WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+          COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD ^main
+          OUTPUT_VARIABLE DOLPHIN_WC_COMMITS_AHEAD_MASTER
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          ERROR_QUIET)
+    else()
+      set(DOLPHIN_WC_COMMITS_AHEAD_MASTER 0)
+    endif()
+  endif()
 
   # defines DOLPHIN_WC_TAG
   execute_process(WORKING_DIRECTORY ${PROJECT_SOURCE_DIR} COMMAND ${GIT_EXECUTABLE} describe --exact-match HEAD

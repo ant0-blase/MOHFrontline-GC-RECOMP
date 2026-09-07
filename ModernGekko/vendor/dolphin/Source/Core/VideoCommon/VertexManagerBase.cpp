@@ -1361,8 +1361,22 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
                                              const AbstractPipeline* current_pipeline)
 {
   const bool camera_projection_test = MohEnvSwitch("MOH_PS3_CSM_CAMERA_TEST", false);
+  // v2.7: WORLD_PROBE is intentionally independent from CAMERA_TEST.
+  // This lets us replay the exact same world-only draw set through either:
+  //   CAMERA_TEST=1 -> proven-good guest camera projection, or
+  //   CAMERA_TEST=0 -> the real light-space CSM matrix.
+  // Comparing the two is the decisive matrix-vs-overwrite test.
+  const bool world_probe = MohEnvSwitch("MOH_PS3_CSM_WORLD_PROBE", false);
+  const u32 world_probe_min_indices = static_cast<u32>(std::clamp(
+      MohEnvFloat("MOH_PS3_CSM_WORLD_PROBE_MIN_INDICES", 12.0f), 3.0f, 1000000.0f));
   const bool triangle_primitive = primitive_type == PrimitiveType::Triangles ||
                                   primitive_type == PrimitiveType::TriangleStrip;
+  const auto& guest_pipeline_cfg = current_pipeline ? current_pipeline->m_config : AbstractPipelineConfig{};
+  const bool world_signature =
+      current_pipeline && guest_pipeline_cfg.depth_state.hex == 0x0000000fu &&
+      guest_pipeline_cfg.rasterization_state.hex == 0x00000018u &&
+      guest_pipeline_cfg.framebuffer_state.hex == 0x00010c00u &&
+      guest_pipeline_cfg.blending_state.hex == 0x00004889u;
 
   // v2.1 diagnostic: the previous caster rejected every draw whose XF projection
   // type was not tagged Perspective.  The v2.0 camera test showing ONLY the
@@ -1371,7 +1385,9 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
   // 3D scene geometry.  In CAMERA_TEST we deliberately replay every triangle
   // batch with its exact guest projection so we can prove/disprove that filter.
   if (!MohCSMEnabled() || !current_pipeline || !triangle_primitive || num_indices == 0 ||
-      (!camera_projection_test && xfmem.projection.type != ProjectionType::Perspective))
+      (!camera_projection_test && xfmem.projection.type != ProjectionType::Perspective) ||
+      (world_probe && (xfmem.projection.type != ProjectionType::Perspective ||
+                       num_indices < world_probe_min_indices || !world_signature)))
   {
     return;
   }
@@ -1391,6 +1407,93 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
   if (!m_moh_csm)
     m_moh_csm = std::make_unique<MOHCSMState>();
   MOHCSMState& csm = *m_moh_csm;
+
+  // v2.6 world-signature isolation.  v2.5 selected the first large perspective
+  // batch, which can simply be a sky/viewmodel batch and therefore tells us
+  // nothing about world rasterization.  The v2.4 gameplay trace exposed a very
+  // stable world pipeline signature on MOH Frontline:
+  //   depth=0000000f rast=00000018 fb=00010c00 blend=00004889
+  // In WORLD_PROBE mode replay only those perspective draws.  This excludes the
+  // shell/HUD/sky/viewmodel noise while keeping many actual world batches, so
+  // one useless first draw can no longer poison the experiment.
+  if (world_probe)
+  {
+    static bool logged_world_probe = false;
+    static u32 logged_world_batches = 0;
+    if (!logged_world_probe)
+    {
+      std::fprintf(stderr,
+                   "[moh-ps3-csm] WORLD SIGNATURE PROBE active: "
+                   "depth=0000000f rast=00000018 fb=00010c00 blend=00004889 "
+                   "min_indices=%u projection=%s\n",
+                   world_probe_min_indices, camera_projection_test ? "CAMERA" : "LIGHT-SPACE");
+      logged_world_probe = true;
+    }
+    if (logged_world_batches < 12)
+    {
+      std::fprintf(stderr,
+                   "[moh-ps3-csm] WORLD SIGNATURE accepted: idx=%u baseI=%u baseV=%u\n",
+                   num_indices, base_index, base_vertex);
+      ++logged_world_batches;
+    }
+  }
+
+  // v2.4 diagnostic: the v2.3 trace was consumed entirely by shell/HUD
+  // orthographic batches before gameplay started.  Only begin once a real
+  // perspective batch with enough geometry appears, and keep logging only
+  // perspective batches.  This captures sky/world/viewmodel state instead of
+  // spending the trace budget on menu quads.
+  if (MohEnvSwitch("MOH_PS3_CSM_TRACE", false))
+  {
+    static bool trace_started = false;
+    static bool trace_done = false;
+    static u32 trace_count = 0;
+    constexpr u32 TRACE_LIMIT = 2400;
+
+    const bool perspective = xfmem.projection.type == ProjectionType::Perspective;
+    const bool start_candidate = perspective && num_indices >= 12;
+
+    if (!trace_done && (!trace_started ? start_candidate : perspective))
+    {
+      if (!trace_started)
+      {
+        trace_started = true;
+        std::fprintf(stderr,
+                     "[moh-ps3-csm-trace] BEGIN gameplay perspective trace "
+                     "(menu/HUD skipped, max %u batches)\n",
+                     TRACE_LIMIT);
+      }
+
+      if (trace_count < TRACE_LIMIT)
+      {
+        const auto& p = vertex_shader_manager.constants.projection;
+        const auto& pc = vertex_shader_manager.constants.pixelcentercorrection;
+        const auto& cfg = current_pipeline->m_config;
+        std::fprintf(
+            stderr,
+            "[moh-ps3-csm-trace] #%04u idx=%u baseI=%u baseV=%u prim=%u projType=%u "
+            "P=(%.6f %.6f %.6f %.6f %.8f %.8f) "
+            "VP=(wd=%.3f ht=%.3f zRange=%.3f farZ=%.3f x=%.3f y=%.3f) "
+            "PC=(%.9f %.9f %.7f %.7f) PIPE=(depth=%08x rast=%08x fb=%08x blend=%08x)\n",
+            trace_count, num_indices, base_index, base_vertex,
+            static_cast<unsigned>(primitive_type),
+            static_cast<unsigned>(xfmem.projection.type),
+            p[0][0], p[0][2], p[1][1], p[1][2], p[2][2], p[2][3],
+            xfmem.viewport.wd, xfmem.viewport.ht, xfmem.viewport.zRange,
+            xfmem.viewport.farZ, xfmem.viewport.xOrig, xfmem.viewport.yOrig,
+            pc[0], pc[1], pc[2], pc[3], cfg.depth_state.hex,
+            cfg.rasterization_state.hex, cfg.framebuffer_state.hex, cfg.blending_state.hex);
+        ++trace_count;
+      }
+      else
+      {
+        std::fprintf(stderr,
+                     "[moh-ps3-csm-trace] END perspective trace limit reached (%u batches)\n",
+                     TRACE_LIMIT);
+        trace_done = true;
+      }
+    }
+  }
 
   if (!csm.resources_ready)
   {
@@ -1690,6 +1793,20 @@ void main()
     }
   }
 
+  if (world_probe)
+  {
+    static bool logged_world_write = false;
+    if (!logged_world_write)
+    {
+      const auto& p = saved_projection;
+      std::fprintf(stderr,
+                   "[moh-ps3-csm] WORLD SIGNATURE first replay submitted: idx=%u "
+                   "P=(%.6f %.6f %.6f %.6f %.8f %.8f)\n",
+                   num_indices, p[0][0], p[0][2], p[1][1], p[1][2], p[2][2], p[2][3]);
+      logged_world_write = true;
+    }
+  }
+
   vertex_shader_manager.constants.projection = saved_projection;
   vertex_shader_manager.constants.pixelcentercorrection = saved_pixel_center;
   vertex_shader_manager.dirty = true;
@@ -1738,8 +1855,11 @@ void VertexManagerBase::RenderDrawCall(
   //   * host float position/UV/normal declaration only.
   //
   // Anything uncertain falls through to the original GameCube buffer.
+  const bool ps3_triangle_primitive =
+      primitive_type == PrimitiveType::Triangles ||
+      primitive_type == PrimitiveType::TriangleStrip;
   if (PS3MeshPort::IsStaticDrawReplacementEnabled() &&
-      primitive_type == PrimitiveType::Triangles &&
+      ps3_triangle_primitive &&
       xfmem.projection.type == ProjectionType::Perspective)
   {
     NativeVertexFormat* format = VertexLoaderManager::GetCurrentVertexFormat();
@@ -1778,6 +1898,15 @@ void VertexManagerBase::RenderDrawCall(
 
     if (declaration_ok)
     {
+      static bool s_logged_ps3_msh_draw_path = false;
+      if (!s_logged_ps3_msh_draw_path)
+      {
+        s_logged_ps3_msh_draw_path = true;
+        std::fprintf(stderr,
+                     "[moh-ps3-msh] DRAW PATH ACTIVE: primitive=%s verts=%u stride=%u restart=%d\n",
+                     primitive_type == PrimitiveType::TriangleStrip ? "triangle-strip" : "triangles",
+                     gc_vertex_count, vertex_stride, g_backend_info.bSupportsPrimitiveRestart ? 1 : 0);
+      }
       const std::span<const u8> gc_vertices(m_base_buffer_pointer, gc_vertex_bytes);
       const auto match =
           PS3MeshPort::MatchStaticDraw(gc_vertices, gc_vertex_count, vertex_stride,
@@ -1798,13 +1927,16 @@ void VertexManagerBase::RenderDrawCall(
                       vertex_stride);
         };
 
+        const std::size_t ps3_index_count =
+            submesh.indices.size() +
+            (g_backend_info.bSupportsPrimitiveRestart ? submesh.indices.size() / 3 : 0);
         bool stream_ok =
             submesh.vertex_count <= 65535 &&
             std::size_t(submesh.vertex_count) * vertex_stride <= MAXVBUFFERSIZE &&
             submesh.position_uv.size() == submesh.vertex_count &&
             !submesh.indices.empty() &&
             (submesh.indices.size() % 3) == 0 &&
-            submesh.indices.size() <= MAXIBUFFERSIZE &&
+            ps3_index_count <= MAXIBUFFERSIZE &&
             attribute_is_float(decl.normals[0], 3) &&
             attribute_is_float(decl.texcoords[0], 2) &&
             attribute_is_float(decl.texcoords[1], 2) &&
@@ -1892,7 +2024,7 @@ void VertexManagerBase::RenderDrawCall(
               m_cur_buffer_pointer += vertex_stride;
             }
 
-            m_index_generator.AddExternalIndices(
+            m_index_generator.AddExternalTriangles(
                 submesh.indices.data(), static_cast<u32>(submesh.indices.size()),
                 submesh.vertex_count);
 

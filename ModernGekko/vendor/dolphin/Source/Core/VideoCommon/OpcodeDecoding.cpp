@@ -189,6 +189,10 @@ public:
           // temporarily swap dl and non-dl (small "hack" for the stats)
           g_stats.SwapDL();
 
+          // Keep the real DL address/hash visible while its GX commands are decoded.
+          // This lets the MSH bridge bootstrap a missing loader identity once and
+          // then use an exact address+hash lookup on later frames.
+          PS3MeshPort::SetDisplayListContext(address, {start_address, size});
           const auto mesh = PS3MeshPort::FindDisplayList(address, {start_address, size});
           if (mesh)
           {
@@ -196,11 +200,12 @@ public:
             PS3MeshPort::SetDisplayListMatch(mesh);
           }
           Run(start_address, size, *this);
-          if (mesh)
-          {
+
+          // A bootstrap match can be discovered during Run(), so flush before
+          // clearing the context even when FindDisplayList() was initially empty.
+          if (mesh || PS3MeshPort::IsStaticDrawReplacementEnabled())
             g_vertex_manager->Flush();
-            PS3MeshPort::SetDisplayListMatch({});
-          }
+          PS3MeshPort::SetDisplayListContext(0, {});
           INCSTAT(g_stats.this_frame.num_dlists_called);
 
           // un-swap
