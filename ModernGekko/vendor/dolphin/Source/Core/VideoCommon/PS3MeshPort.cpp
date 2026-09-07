@@ -1,10 +1,17 @@
 #include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/MSH.h"
+#include "VideoCommon/PS3RemasterAssets.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <cstdio>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 
 namespace PS3MeshPort
 {
@@ -24,7 +31,106 @@ u32 LE32(const u8* p)
 {
   return u32(p[0]) | (u32(p[1]) << 8) | (u32(p[2]) << 16) | (u32(p[3]) << 24);
 }
+std::mutex g_msh_cache_mutex;
+std::unordered_map<std::string, std::shared_ptr<StaticMesh>> g_msh_cache;
+
+std::string Lower(std::string text)
+{
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return text;
+}
+
+std::string BaseName(std::string_view path)
+{
+  const auto slash = path.find_last_of("/\\:");
+  return Lower(std::string(slash == std::string_view::npos ? path : path.substr(slash + 1)));
+}
+
+bool BelongsToLevel(const PS3RemasterAssets::AssetInfo& asset, std::string_view level)
+{
+  if (level.empty())
+    return false;
+
+  std::string path = Lower(asset.relative_path);
+  std::string level_l = Lower(std::string(level));
+  const std::string needle = "/" + level_l + "/";
+  return path.find(needle) != std::string::npos;
+}
 }  // namespace
+
+void ClearMSHCache()
+{
+  std::scoped_lock lock(g_msh_cache_mutex);
+  g_msh_cache.clear();
+}
+
+void PreloadCurrentLevelMSH(std::string_view level)
+{
+  if (!PS3AssetPort::IsMSHEnabled() || !PS3RemasterAssets::IsReady() || level.empty())
+    return;
+
+  std::unordered_map<std::string, std::shared_ptr<StaticMesh>> next;
+  std::size_t candidates = 0;
+  std::size_t decoded = 0;
+  std::size_t rejected = 0;
+
+  for (const auto& asset : PS3RemasterAssets::GetAssets())
+  {
+    const std::string filename = Lower(asset.filename);
+    if (!filename.ends_with(".msh") || !BelongsToLevel(asset, level))
+      continue;
+
+    ++candidates;
+    const std::vector<u8> bytes = PS3RemasterAssets::ReadBinary(asset);
+    if (bytes.empty())
+    {
+      ++rejected;
+      continue;
+    }
+
+    auto mesh = std::make_shared<StaticMesh>();
+    mesh->source_name = asset.relative_path;
+    if (!ParseMSHv8(bytes, mesh.get()) || !IsHostRenderable(*mesh))
+    {
+      ++rejected;
+      continue;
+    }
+
+    ++decoded;
+    next[filename] = mesh;
+    next[Lower(asset.relative_path)] = mesh;
+  }
+
+  {
+    std::scoped_lock lock(g_msh_cache_mutex);
+    g_msh_cache = std::move(next);
+  }
+
+  std::fprintf(stderr,
+               "[moh-ps3-msh] ALL-MSH cache ready: level=%.*s candidates=%zu decoded=%zu rejected=%zu keys=%zu\n",
+               static_cast<int>(level.size()), level.data(), candidates, decoded, rejected,
+               CachedMSHCount());
+}
+
+const StaticMesh* FindCachedMSH(std::string_view name_or_path)
+{
+  const std::string raw = Lower(std::string(name_or_path));
+  const std::string base = BaseName(name_or_path);
+  std::scoped_lock lock(g_msh_cache_mutex);
+
+  if (const auto it = g_msh_cache.find(raw); it != g_msh_cache.end())
+    return it->second.get();
+  if (const auto it = g_msh_cache.find(base); it != g_msh_cache.end())
+    return it->second.get();
+  return nullptr;
+}
+
+std::size_t CachedMSHCount()
+{
+  std::scoped_lock lock(g_msh_cache_mutex);
+  return g_msh_cache.size();
+}
 
 bool ParseMSHv8(std::span<const u8> bytes, StaticMesh* out)
 {

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <span>
+#include <string_view>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -30,4 +32,12 @@ DMFInfo InspectDMF(std::span<const u8> bytes);
 // Static MSH can be consumed by a host renderer. It must NOT be copied into
 // the GameCube MSH loader because GC and PS3 layouts are different.
 bool IsHostRenderable(const StaticMesh& mesh);
+
+// v14.0: decode/cache every PS3 static MSH for the active level in one pass.
+// This makes the complete PS3 geometry set available to the native renderer
+// instead of resolving one guessed prop at a time.
+void PreloadCurrentLevelMSH(std::string_view level);
+void ClearMSHCache();
+const StaticMesh* FindCachedMSH(std::string_view name_or_path);
+std::size_t CachedMSHCount();
 }  // namespace PS3MeshPort

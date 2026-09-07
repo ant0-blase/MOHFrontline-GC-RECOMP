@@ -1,5 +1,6 @@
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
+#include "VideoCommon/PS3MeshPort.h"
 
 #include <algorithm>
 #include <cctype>
@@ -33,9 +34,23 @@ bool EnvSwitch(const char* name, bool fallback)
 bool IsTPKRSXEnabled() { return EnvSwitch("MOH_PS3_TPK_RSX", false); }
 bool IsMSHEnabled() { return EnvSwitch("MOH_PS3_MSH", true); }
 bool IsDMFEnabled() { return EnvSwitch("MOH_PS3_DMF", false); }
-void Initialize() { Native::Initialize(); }
-void Shutdown() { Native::Shutdown(); }
-void SetCurrentLevel(std::string_view level) { Native::SetCurrentLevel(level); }
+void Initialize()
+{
+  Native::Initialize();
+  PS3MeshPort::ClearMSHCache();
+}
+
+void Shutdown()
+{
+  PS3MeshPort::ClearMSHCache();
+  Native::Shutdown();
+}
+
+void SetCurrentLevel(std::string_view level)
+{
+  Native::SetCurrentLevel(level);
+  PS3MeshPort::PreloadCurrentLevelMSH(level);
+}
 std::string GetCurrentLevel() { return Native::GetCurrentLevel(); }
 Class Classify(std::string_view path) { return static_cast<Class>(Native::Classify(path)); }
 Match Resolve(std::string_view path, Class wanted)
