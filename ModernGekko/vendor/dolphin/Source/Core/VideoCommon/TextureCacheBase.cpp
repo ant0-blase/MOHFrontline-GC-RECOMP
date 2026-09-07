@@ -780,14 +780,19 @@ void TextureCacheBase::OnFrameEnd()
   // copies.
   FlushEFBCopies();
 
-  // Named sky registrations may replace allocations from a previous level.
-  // Recreate cached GPU entries after the loader publishes their identity.
-  if (PS3Compass::ConsumeSkyCacheInvalidation())
+  // A sky reload changes only the named allocations. Keep XFB/EFB copies
+  // alive: Frontline uses them for its loading fade, and globally invalidating
+  // the cache here can expose undecoded YUV data as a purple transition frame.
+  for (u32 address : PS3Compass::ConsumeSkyCacheInvalidations())
   {
-    std::fprintf(
-        stderr,
-        "[moh-ps3-sky] reloading TextureCache for named sky registrations\n");
-    Invalidate();
+    auto [it, end] = m_textures_by_address.equal_range(address);
+    while (it != end)
+    {
+      if (it->second->IsCopy())
+        ++it;
+      else
+        it = InvalidateTexture(it);
+    }
   }
 
   Cleanup(g_presenter->FrameCount());

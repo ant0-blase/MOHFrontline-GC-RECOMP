@@ -60,7 +60,7 @@ std::unordered_map<std::string, int> resource_ids;
 std::unordered_map<u32, Registration> registrations;
 std::unordered_set<u32> named_sky_addresses;
 std::unordered_set<u32> uploaded_named_sky;
-bool named_sky_cache_invalidation = false;
+std::unordered_set<u32> named_sky_invalidations;
 int next_resource_id = 0;
 std::mutex mutex;
 
@@ -1227,10 +1227,12 @@ void SetAuto3DLevelScope(
   {
     std::scoped_lock registrations_lock(mutex);
     for (u32 address : named_sky_addresses)
+    {
       registrations.erase(address);
+      named_sky_invalidations.insert(address);
+    }
     named_sky_addresses.clear();
     uploaded_named_sky.clear();
-    named_sky_cache_invalidation = true;
   }
 
   std::fprintf(
@@ -3764,7 +3766,7 @@ void MarkNamedSkyAddress(u32 address)
   named_sky_addresses.insert(address);
   registrations.erase(address);  // A reloaded level may reuse the allocation.
   uploaded_named_sky.erase(address);
-  named_sky_cache_invalidation = true;
+  named_sky_invalidations.insert(address);
 }
 
 void NotifyTextureUploaded(const TextureInfo& info)
@@ -3917,20 +3919,12 @@ std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
   return decoded;
 }
 
-bool ConsumeSkyCacheInvalidation()
+std::vector<u32> ConsumeSkyCacheInvalidations()
 {
-  {
-    std::scoped_lock lock(mutex);
-    if (std::exchange(named_sky_cache_invalidation, false))
-      return true;
-  }
-  std::scoped_lock lock(auto3d_mutex);
-
-  if (!sky_cache_invalidation_pending)
-    return false;
-
-  sky_cache_invalidation_pending = false;
-  return true;
+  std::scoped_lock lock(mutex);
+  std::vector<u32> addresses(named_sky_invalidations.begin(), named_sky_invalidations.end());
+  named_sky_invalidations.clear();
+  return addresses;
 }
 
 void Shutdown()
@@ -3960,7 +3954,7 @@ void Shutdown()
   registrations.clear();
   named_sky_addresses.clear();
   uploaded_named_sky.clear();
-  named_sky_cache_invalidation = false;
+  named_sky_invalidations.clear();
   resources.clear();
   resource_ids.clear();
   next_resource_id = 0;
