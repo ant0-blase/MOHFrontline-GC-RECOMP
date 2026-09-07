@@ -1337,9 +1337,12 @@ bool VertexManagerBase::PrepareMOHCSMForSampling(MOHCSMReceiverData* out_data)
   MOHCSMReceiverData receiver = csm.receivers[set];
   receiver.flags[0] = 1;
   // Debug 1..4 displays the raw corresponding shadow-map depth full-screen.
-  // Debug 5 displays the final computed CSM shadow mask. Zero is normal mode.
+  // Debug 5 displays the final computed CSM shadow mask.
+  // Debug 6/7 diagnose corrected/opposite scene-depth orientation; debug 8
+  // keeps the corrected depth and tests the opposite shadow-compare polarity.
+  // Zero is normal mode.
   receiver.flags[3] =
-      std::clamp(static_cast<s32>(MohEnvFloat("MOH_PS3_CSM_DEBUG", 0.0f)), 0, 5);
+      std::clamp(static_cast<s32>(MohEnvFloat("MOH_PS3_CSM_DEBUG", 0.0f)), 0, 8);
   if (out_data)
     *out_data = receiver;
 
@@ -1590,8 +1593,15 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
         p10, p11,
         std::clamp(MohEnvFloat("MOH_PS3_CSM_BIAS", 0.0012f), 0.0f, 0.02f),
         0.000830078f};  // exact 4-tap receiver footprint recovered from the RSX capture
-    receiver.flags = {0, static_cast<s32>(MOH_CSM_CASCADES),
-                          MohEnvSwitch("MOH_PS3_CSM_FLIP_Y", false) ? 1 : 0, 0};
+    // flags.z bitfield:
+    //   bit0 = shadow-map Y flip
+    //   bit1 = manual scene-depth flip AFTER v2.9 automatic CSM correction
+    //   bit2 = diagnostic receiver compare-polarity flip
+    const s32 receiver_transform_flags =
+        (MohEnvSwitch("MOH_PS3_CSM_FLIP_Y", false) ? 1 : 0) |
+        (MohEnvSwitch("MOH_PS3_CSM_DEPTH_FLIP", false) ? 2 : 0) |
+        (MohEnvSwitch("MOH_PS3_CSM_COMPARE_FLIP", false) ? 4 : 0);
+    receiver.flags = {0, static_cast<s32>(MOH_CSM_CASCADES), receiver_transform_flags, 0};
 
     const s32 debug_mode =
         std::clamp(static_cast<s32>(MohEnvFloat("MOH_PS3_CSM_DEBUG", 0.0f)), 0, 5);
@@ -1678,7 +1688,21 @@ void main()
         std::clamp(static_cast<s32>(MohEnvFloat("MOH_PS3_CSM_DEBUG", 0.0f)), 0, 5);
     const bool force_write = MohEnvSwitch("MOH_PS3_CSM_FORCE_WRITE", false) ||
                              (debug_mode >= 1 && debug_mode <= 4);
-    config.depth_state.func = force_write ? CompareMode::Always : CompareMode::GEqual;
+
+    // The CSM projection is authored directly in HOST reverse-Z space: the
+    // closest caster produces the largest D32F value and the map is cleared to
+    // 0.  We therefore need the physical host test to be GREATER_OR_EQUAL.
+    //
+    // Dolphin normally swaps Less/Greater when the backend cannot expose a
+    // reversed depth range.  That swap is correct for ordinary GX rendering,
+    // but it double-inverts this custom host-authored CSM pass: logical GEqual
+    // becomes physical LessEqual, so a map cleared to 0 never receives any
+    // positive caster depth. DEBUG=1..4 hid this by forcing Always.
+    // Pick the abstract compare which maps to physical >= on either backend.
+    const bool backend_swaps_depth_compare = !g_backend_info.bSupportsReversedDepthRange;
+    const CompareMode nearest_caster_compare =
+        backend_swaps_depth_compare ? CompareMode::LEqual : CompareMode::GEqual;
+    config.depth_state.func = force_write ? CompareMode::Always : nearest_caster_compare;
     config.framebuffer_state = {};
     // A depth-only framebuffer has no color attachment.  Leaving the default
     // enum value here means RGBA8 and can produce a pipeline/render-pass mismatch
@@ -1703,8 +1727,10 @@ void main()
     {
       std::fprintf(stderr,
                    "[moh-ps3-csm] shadow pipeline READY: D32F, no-cull, depth=%s, "
-                   "fixed-function light-space depth\n",
-                   force_write ? "Always(debug)" : "GEqual");
+                   "host-reversed=%d, fixed-function light-space depth\n",
+                   force_write ? "Always(debug)" :
+                       (backend_swaps_depth_compare ? "LEqual=>host-GEqual" : "GEqual"),
+                   g_backend_info.bSupportsReversedDepthRange ? 1 : 0);
       csm.logged_pipeline_ready = true;
     }
   }
@@ -1840,6 +1866,238 @@ void VertexManagerBase::RenderDrawCall(
   g_gfx->SetPipeline(current_pipeline);
 
   bool submitted_ps3_mesh = false;
+  bool submitted_ps3_skinned = false;
+  PS3MeshPort::SkinnedDrawReplacement submitted_skin_replacement;
+
+  // DMF v16.8 validation bridge.  Frontline loads the animated GameCube skin
+  // groups with GXLoadPosMtxIndx(group, palette_slot * 3) immediately before
+  // GXCallDisplayList.  Therefore the current XF position-matrix palette is the
+  // authoritative animated pose for this exact DMF draw.  Keep this one-shot
+  // diagnostic in v16.9 so the first real replacements remain auditable.
+  if (const auto skin = PS3MeshPort::CurrentSkinnedDraw(); skin)
+  {
+    static std::unordered_map<u32, bool> s_logged_ps3_dmf_draws;
+    const bool first_for_dl =
+        s_logged_ps3_dmf_draws.size() < 192 &&
+        s_logged_ps3_dmf_draws.emplace(skin.display_list, true).second;
+    if (first_for_dl)
+    {
+      NativeVertexFormat* skin_format = VertexLoaderManager::GetCurrentVertexFormat();
+      const PortableVertexDeclaration& skin_decl = skin_format->GetVertexDeclaration();
+      const u32 skin_stride = skin_format->GetVertexStride();
+      const u32 skin_vertices = m_index_generator.GetNumVerts();
+      const auto analysis = PS3MeshPort::AnalyzeCurrentSkinnedPalette();
+
+      std::size_t finite_matrix_slots = 0;
+      std::array<float, 3> first_translation{};
+      bool have_first_translation = false;
+      for (std::size_t slot = 0; slot < skin.gc_palette_groups.size(); ++slot)
+      {
+        // GX destination matrix id is slot*3. XF stores each row as four
+        // floats, hence 12 floats per 3x4 position matrix.
+        const std::size_t base = slot * 12;
+        if (base + 11 >= std::size(xfmem.posMatrices))
+          break;
+        bool finite = true;
+        for (std::size_t element = 0; element < 12; ++element)
+          finite = finite && std::isfinite(xfmem.posMatrices[base + element]);
+        if (!finite)
+          continue;
+        ++finite_matrix_slots;
+        if (!have_first_translation)
+        {
+          first_translation = {xfmem.posMatrices[base + 3], xfmem.posMatrices[base + 7],
+                               xfmem.posMatrices[base + 11]};
+          have_first_translation = true;
+        }
+      }
+
+      const auto type_value = [](ComponentFormat type) {
+        return static_cast<unsigned>(type);
+      };
+      std::fprintf(stderr,
+                   "[moh-ps3-skin] GX DRAW DECL: gc=%s material=%s DL=%08x verts=%u stride=%u primitive=%u pos=(%d,t%u,c%d,o%d) nrm=(%d,t%u,c%d,o%d) uv0=(%d,t%u,c%d,o%d) posmtx=(%d,t%u,c%d,o%d)\n",
+                   skin.gc_name.c_str(),
+                   skin.gc_material_name.empty() ? "<unnamed>" : skin.gc_material_name.c_str(),
+                   skin.display_list, skin_vertices, skin_stride,
+                   static_cast<unsigned>(primitive_type), skin_decl.position.enable ? 1 : 0,
+                   type_value(skin_decl.position.type), skin_decl.position.components,
+                   skin_decl.position.offset, skin_decl.normals[0].enable ? 1 : 0,
+                   type_value(skin_decl.normals[0].type), skin_decl.normals[0].components,
+                   skin_decl.normals[0].offset, skin_decl.texcoords[0].enable ? 1 : 0,
+                   type_value(skin_decl.texcoords[0].type), skin_decl.texcoords[0].components,
+                   skin_decl.texcoords[0].offset, skin_decl.posmtx.enable ? 1 : 0,
+                   type_value(skin_decl.posmtx.type), skin_decl.posmtx.components,
+                   skin_decl.posmtx.offset);
+
+      std::fprintf(stderr,
+                   "[moh-ps3-skin] GX PALETTE ANALYSIS: gc=%s material=%s DL=%08x ps3_clusters=%zu triangles=%zu selected=%zu ambiguous=%zu unmapped=%zu vertices=%zu matrix_slots=%zu finite_matrices=%zu firstT=(%.4f %.4f %.4f) valid=%d | palette validation\n",
+                   skin.gc_name.c_str(),
+                   skin.gc_material_name.empty() ? "<unnamed>" : skin.gc_material_name.c_str(),
+                   skin.display_list, analysis.ps3_material_clusters, analysis.total_triangles,
+                   analysis.selected_triangles, analysis.ambiguous_triangles,
+                   analysis.unmapped_triangles, analysis.selected_vertices,
+                   analysis.matrix_slots, finite_matrix_slots,
+                   have_first_translation ? first_translation[0] : 0.0f,
+                   have_first_translation ? first_translation[1] : 0.0f,
+                   have_first_translation ? first_translation[2] : 0.0f,
+                   analysis.valid && finite_matrix_slots == skin.gc_palette_groups.size() ? 1 : 0);
+    }
+  }
+
+  // v16.9 first real PS3 DMF draw.  Only replace a draw when the host bridge
+  // proved a strict 1:1 authored material correspondence: one GC DL, one PS3
+  // cluster, no ambiguous/unmapped triangles, and an exact PS3->GC skin-group
+  // mapping.  The GameCube animation system remains authoritative: each PS3
+  // vertex receives the same GX position-matrix id (slot*3) that the original
+  // DMF used after GXLoadPosMtxIndx.  Anything uncertain falls through to GC.
+  const bool ps3_dmf_triangle_primitive =
+      primitive_type == PrimitiveType::Triangles ||
+      primitive_type == PrimitiveType::TriangleStrip;
+  if (ps3_dmf_triangle_primitive && xfmem.projection.type == ProjectionType::Perspective)
+  {
+    auto replacement = PS3MeshPort::BuildCurrentSkinnedReplacement();
+    if (replacement)
+    {
+      NativeVertexFormat* format = VertexLoaderManager::GetCurrentVertexFormat();
+      const PortableVertexDeclaration& decl = format->GetVertexDeclaration();
+      const u32 vertex_stride = format->GetVertexStride();
+      const u32 gc_vertex_count = m_index_generator.GetNumVerts();
+      const std::size_t gc_vertex_bytes = std::size_t(gc_vertex_count) * vertex_stride;
+      const auto& cluster = *replacement.cluster;
+
+      const auto attribute_is_float = [vertex_stride](const AttributeFormat& attribute,
+                                                       int minimum_components) {
+        return attribute.enable && attribute.type == ComponentFormat::Float &&
+               attribute.components >= minimum_components && attribute.offset >= 0 &&
+               std::size_t(attribute.offset) +
+                       sizeof(float) * std::size_t(minimum_components) <=
+                   vertex_stride;
+      };
+
+      bool stream_ok = vertex_stride != 0 && gc_vertex_count >= 3 &&
+                       m_base_buffer_pointer && m_cur_buffer_pointer &&
+                       gc_vertex_bytes <= MAXVBUFFERSIZE &&
+                       std::size_t(m_cur_buffer_pointer - m_base_buffer_pointer) >=
+                           gc_vertex_bytes &&
+                       attribute_is_float(decl.position, 3) &&
+                       attribute_is_float(decl.normals[0], 3) &&
+                       attribute_is_float(decl.texcoords[0], 2) &&
+                       decl.posmtx.enable && decl.posmtx.type == ComponentFormat::UByte &&
+                       decl.posmtx.components >= 4 && decl.posmtx.offset >= 0 &&
+                       std::size_t(decl.posmtx.offset) + sizeof(u32) <= vertex_stride &&
+                       !decl.normals[1].enable && !decl.normals[2].enable &&
+                       cluster.positions.size() <= 65535 &&
+                       cluster.positions.size() * vertex_stride <= MAXVBUFFERSIZE &&
+                       cluster.positions.size() == cluster.normals.size() &&
+                       cluster.positions.size() == cluster.uv0.size() &&
+                       cluster.positions.size() == replacement.position_matrix_indices.size() &&
+                       !cluster.indices.empty() && (cluster.indices.size() % 3) == 0;
+
+      for (std::size_t tex = 1; stream_ok && tex < decl.texcoords.size(); ++tex)
+        if (decl.texcoords[tex].enable)
+          stream_ok = false;
+
+      // Preserve constant tint/other color state from the GC draw.  Varying
+      // authored GC colors cannot be projected safely onto the PS3 ordering.
+      const std::span<const u8> gc_vertices(
+          stream_ok ? m_base_buffer_pointer : nullptr, stream_ok ? gc_vertex_bytes : 0);
+      for (const auto& color : decl.colors)
+      {
+        if (!stream_ok || !color.enable)
+          continue;
+        const std::size_t bytes =
+            std::size_t(GetElementSize(color.type)) * std::max(color.components, 1);
+        if (color.offset < 0 || std::size_t(color.offset) + bytes > vertex_stride)
+        {
+          stream_ok = false;
+          break;
+        }
+        for (u32 i = 1; i < gc_vertex_count; ++i)
+        {
+          if (std::memcmp(gc_vertices.data() + color.offset,
+                          gc_vertices.data() + std::size_t(i) * vertex_stride + color.offset,
+                          bytes) != 0)
+          {
+            stream_ok = false;
+            break;
+          }
+        }
+      }
+
+      // Every matrix id written below must already exist in XF and be finite.
+      for (const u8 matrix_id : replacement.position_matrix_indices)
+      {
+        if (!stream_ok || (matrix_id % 3) != 0)
+          break;
+        const std::size_t base = std::size_t(matrix_id) * 4;
+        if (base + 11 >= std::size(xfmem.posMatrices))
+        {
+          stream_ok = false;
+          break;
+        }
+        for (std::size_t element = 0; element < 12; ++element)
+        {
+          if (!std::isfinite(xfmem.posMatrices[base + element]))
+          {
+            stream_ok = false;
+            break;
+          }
+        }
+      }
+
+      const std::size_t expanded_index_count =
+          cluster.indices.size() +
+          (g_backend_info.bSupportsPrimitiveRestart ? cluster.indices.size() / 3 : 0);
+      if (expanded_index_count > MAXIBUFFERSIZE)
+        stream_ok = false;
+      for (const u16 index : cluster.indices)
+        if (index >= cluster.positions.size())
+          stream_ok = false;
+
+      if (stream_ok)
+      {
+        const std::vector<u8> gc_template(gc_vertices.begin(),
+                                          gc_vertices.begin() + vertex_stride);
+        ResetBuffer(vertex_stride);
+        for (std::size_t i = 0; i < cluster.positions.size(); ++i)
+        {
+          u8* destination = m_cur_buffer_pointer;
+          std::memcpy(destination, gc_template.data(), vertex_stride);
+          std::memcpy(destination + decl.position.offset, cluster.positions[i].data(),
+                      sizeof(float) * 3);
+          std::memcpy(destination + decl.normals[0].offset, cluster.normals[i].data(),
+                      sizeof(float) * 3);
+          std::memcpy(destination + decl.texcoords[0].offset, cluster.uv0[i].data(),
+                      sizeof(float) * 2);
+
+          // PosMtx_ReadDirect_UByte expands the guest byte to a host u32 in the
+          // portable vertex.  Reproduce that exact representation here.
+          const u32 matrix_id = replacement.position_matrix_indices[i];
+          std::memcpy(destination + decl.posmtx.offset, &matrix_id, sizeof(matrix_id));
+          m_cur_buffer_pointer += vertex_stride;
+        }
+
+        m_index_generator.AddExternalTriangles(
+            cluster.indices.data(), static_cast<u32>(cluster.indices.size()),
+            static_cast<u32>(cluster.positions.size()));
+        submitted_ps3_mesh = true;
+        submitted_ps3_skinned = true;
+        submitted_skin_replacement = std::move(replacement);
+      }
+      else
+      {
+        static unsigned reject_logs = 0;
+        if (reject_logs++ < 48)
+        {
+          const auto skin = PS3MeshPort::CurrentSkinnedDraw();
+          std::fprintf(stderr,
+                       "[moh-ps3-skin] SKINNED STREAM REJECT: gc=%s material=%s DL=%08x | strict fallback GC\n",
+                       skin.gc_name.c_str(), skin.gc_material_name.c_str(), skin.display_list);
+        }
+      }
+    }
+  }
 
   // Exact named MSH display-list replacement:
   //
@@ -1858,7 +2116,7 @@ void VertexManagerBase::RenderDrawCall(
   const bool ps3_triangle_primitive =
       primitive_type == PrimitiveType::Triangles ||
       primitive_type == PrimitiveType::TriangleStrip;
-  if (PS3MeshPort::IsStaticDrawReplacementEnabled() &&
+  if (!submitted_ps3_mesh && PS3MeshPort::IsStaticDrawReplacementEnabled() &&
       ps3_triangle_primitive &&
       xfmem.projection.type == ProjectionType::Perspective)
   {
@@ -2062,7 +2320,9 @@ void VertexManagerBase::RenderDrawCall(
     g_perf_query->EnableQuery(bpmem.zcontrol.early_ztest ? PQG_ZCOMP_ZCOMPLOC : PQG_ZCOMP);
 
   DrawCurrentBatch(base_index, m_index_generator.GetIndexLen(), base_vertex);
-  if (submitted_ps3_mesh)
+  if (submitted_ps3_skinned)
+    PS3MeshPort::NotifySkinnedDrawSubmitted(submitted_skin_replacement);
+  else if (submitted_ps3_mesh)
     PS3MeshPort::NotifyStaticDrawSubmitted();
 
   // Track the total emulated state draws

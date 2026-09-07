@@ -225,7 +225,7 @@ float3 ReconstructMOHViewPosition(float2 uv, float reverse_depth)
 
   // Post-process UVs use a top-left screen convention; projection NDC Y points up.
   float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  if (moh_csm_flags.z != 0)
+  if ((moh_csm_flags.z & 1) != 0)
     ndc.y = -ndc.y;
 
   return float3(depth_from_camera * (ndc.x + p2) / p0,
@@ -246,8 +246,12 @@ float4 ProjectMOHCascade(int cascade, float3 view_pos)
 float CompareMOHShadowTap(int cascade, float2 uv, float receiver_reverse_z, float bias)
 {
   float map_reverse_z = SampleCSMDepth(cascade, clamp(uv, float2(0.0), float2(1.0)));
-  // Reverse-Z map: the closest caster has the largest value.  Receiver bias is
-  // the host-side equivalent of the RSX caster's polygon-offset depth bias.
+  // Normal convention: reverse-Z nearest caster is the largest value, so the
+  // receiver is visible when it is at least as close as the sampled caster.
+  // flags.z bit2 is a diagnostic polarity override for the remaining receiver
+  // test; it does not alter the caster map itself.
+  if ((moh_csm_flags.z & 4) != 0)
+    return receiver_reverse_z - bias <= map_reverse_z ? 1.0 : 0.0;
   return receiver_reverse_z + bias >= map_reverse_z ? 1.0 : 0.0;
 }
 
@@ -259,7 +263,7 @@ float SampleMOHTrueCSM(int cascade, float3 view_pos)
 
   float3 ndc = light.xyz / light.w;
   float2 suv = ndc.xy * 0.5 + float2(0.5);
-  if (moh_csm_flags.z != 0)
+  if ((moh_csm_flags.z & 1) != 0)
     suv.y = 1.0 - suv.y;
 
   // Caster clip Z is [-1,0]. Dolphin converts it to reverse-Z [1,0].
@@ -299,6 +303,82 @@ float ComputeMOHTrueCSMShadow(float2 uv, float reverse_depth)
 
   float visibility = SampleMOHTrueCSM(cascade, view_pos);
   return clamp(1.0 - visibility, 0.0, 1.0);
+}
+
+float GetMOHReceiverDepth(float2 uv)
+{
+  // v3.0: DEBUG=6 was blue while DEBUG=7 was green on the live renderer.
+  // That is an empirical statement about the value returned by DepthAt(),
+  // independent of how the backend advertises its native depth convention:
+  // the CSM receiver needs the exact opposite of DepthAt() here.
+  //
+  // Do not key this correction off moh_depth_flags.y.  v2.9 did that and
+  // DEBUG=8 became blue again, proving the backend flag does not describe the
+  // already-resolved value seen by this FINAL-XFB path reliably enough.
+  float d = 1.0 - DepthAt(uv);
+
+  // Escape hatch: explicitly flip back to the generic post-process convention
+  // if another backend/path later proves to expose the opposite orientation.
+  if ((moh_csm_flags.z & 2) != 0)
+    d = 1.0 - d;
+  return d;
+}
+
+float3 DebugMOHReceiverPipeline(float2 uv, bool force_opposite_depth, bool force_opposite_compare)
+{
+  if (!HasSceneDepth())
+    return float3(1.0, 0.0, 1.0);  // magenta = no EFB depth bound
+  if (!HasTrueCSM())
+    return float3(0.0, 1.0, 1.0);  // cyan = no CSM published
+
+  float reverse_depth = GetMOHReceiverDepth(uv);
+  if (force_opposite_depth)
+    reverse_depth = 1.0 - reverse_depth;
+  if (reverse_depth <= 0.000001)
+    return float3(0.0, 0.0, 1.0);  // blue = depth decoded as far/empty
+
+  float3 view_pos = ReconstructMOHViewPosition(uv, reverse_depth);
+  float view_depth = max(-view_pos.z, 0.0);
+  int cascade = 3;
+  if (view_depth <= moh_csm_splits.x)
+    cascade = 0;
+  else if (view_depth <= moh_csm_splits.y)
+    cascade = 1;
+  else if (view_depth <= moh_csm_splits.z)
+    cascade = 2;
+  else if (view_depth > moh_csm_splits.w)
+    return float3(1.0, 0.0, 0.0);  // red = reconstructed beyond CSM far
+
+  float4 light = ProjectMOHCascade(cascade, view_pos);
+  if (abs(light.w) < 0.000001)
+    return float3(1.0, 0.0, 0.0);
+
+  float3 ndc = light.xyz / light.w;
+  float2 suv = ndc.xy * 0.5 + float2(0.5);
+  if ((moh_csm_flags.z & 1) != 0)
+    suv.y = 1.0 - suv.y;
+
+  if (suv.x <= 0.001 || suv.x >= 0.999 || suv.y <= 0.001 || suv.y >= 0.999 ||
+      ndc.z < -1.001 || ndc.z > 0.001)
+    return float3(1.0, 0.0, 0.0);  // red = outside light-space cascade
+
+  float receiver_reverse_z = clamp(-ndc.z, 0.0, 1.0);
+  float map_reverse_z = SampleCSMDepth(cascade, suv);
+  float bias = moh_csm_camera1.z * (1.0 + float(cascade) * 0.55);
+
+  // Yellow here is important: previous DEBUG=7 green could also mean that the
+  // normal GEqual caster map was still at its 0.0 clear value.
+  if (map_reverse_z <= 0.000001)
+    return float3(1.0, 1.0, 0.0);
+
+  bool shadowed;
+  if (force_opposite_compare)
+    shadowed = receiver_reverse_z - bias > map_reverse_z;
+  else
+    shadowed = receiver_reverse_z + bias < map_reverse_z;
+
+  // white = shadow according to selected polarity; green = valid map + lit.
+  return shadowed ? float3(1.0) : float3(0.0, 1.0, 0.0);
 }
 
 float3 BrightPass(float3 c)
@@ -370,8 +450,22 @@ void main()
   {
     float mask = 0.0;
     if (HasSceneDepth() && HasTrueCSM())
-      mask = ComputeMOHTrueCSMShadow(uv, DepthAt(uv));
+      mask = ComputeMOHTrueCSMShadow(uv, GetMOHReceiverDepth(uv));
     SetOutput(float4(mask, mask, mask, 1.0));
+    return;
+  }
+  if (moh_csm_flags.w >= 6 && moh_csm_flags.w <= 8)
+  {
+    // v2.9 receiver diagnostics after fixing the EFB depth orientation:
+    //   6 = corrected depth + normal compare
+    //   7 = opposite depth + normal compare
+    //   8 = corrected depth + opposite shadow compare
+    // Colour key: magenta=no scene depth, cyan=no CSM, blue=far/empty scene depth,
+    // red=outside cascade, yellow=sampled CSM depth is still clear 0,
+    // green=valid non-zero CSM sample but lit, white=shadowed.
+    float3 debug_receiver =
+        DebugMOHReceiverPipeline(uv, moh_csm_flags.w == 7, moh_csm_flags.w == 8);
+    SetOutput(float4(debug_receiver, 1.0));
     return;
   }
 
@@ -515,7 +609,7 @@ void main()
     // pre-HUD pass.  No luminance tracing or screen-space shadow ray is used.
     float shadow = 0.0;
     if (HasSceneDepth() && HasTrueCSM())
-      shadow = ComputeMOHTrueCSMShadow(uv, DepthAt(uv));
+      shadow = ComputeMOHTrueCSMShadow(uv, GetMOHReceiverDepth(uv));
 
     // The old option name is retained so existing UI/config plumbing keeps
     // working, but it now controls only the true CSM result.

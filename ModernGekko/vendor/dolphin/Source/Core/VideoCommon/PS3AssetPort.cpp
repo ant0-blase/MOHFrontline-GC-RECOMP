@@ -492,6 +492,7 @@ void Initialize()
   s_lit_scene.store(std::shared_ptr<const LitScene>{}, std::memory_order_release);
   PS3MeshPort::ClearMSHCache();
   PS3MeshPort::ClearDMFCache();
+  PS3MeshPort::ClearEMTCache();
 
   std::fprintf(stderr, "[moh-ps3-lit] bridge %s (strength=%.2f)\n",
                s_lighting_enabled ? "ON" : "OFF", s_lighting_strength);
@@ -508,6 +509,7 @@ void Shutdown()
   PS3MeshPort::ClearMSHCache();
   PS3MeshPort::ClearDMFCache();
   PS3MeshPort::ClearSKLCache();
+  PS3MeshPort::ClearEMTCache();
   Native::Shutdown();
 }
 
@@ -522,12 +524,14 @@ void SetCurrentLevel(std::string_view level)
     PS3MeshPort::ClearMSHCache();
     PS3MeshPort::ClearDMFCache();
     PS3MeshPort::ClearSKLCache();
+    PS3MeshPort::ClearEMTCache();
     return;
   }
 
   PS3MeshPort::PreloadCurrentLevelMSH(active_level);
   PS3MeshPort::PreloadCurrentLevelDMF(active_level);
   PS3MeshPort::PreloadCurrentLevelSKL(active_level);
+  PS3MeshPort::PreloadCurrentLevelEMT(active_level);
 }
 
 void SyncLightingLevel(std::string_view level) { SyncLevelLighting(level); }

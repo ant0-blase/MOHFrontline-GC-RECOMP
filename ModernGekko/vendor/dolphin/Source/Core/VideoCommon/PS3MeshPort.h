@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <array>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -27,11 +28,116 @@ struct DMFInfo
   std::string model_name;
 };
 
+struct DMFSkinGroup
+{
+  u8 bone_a = 0;
+  u8 bone_b = 0;
+  float blend = 0.0f;
+  std::array<float, 4> auxiliary{};
+};
+
+struct DMFCluster
+{
+  u32 material_index = 0;
+  u32 texture_index = 0;
+  u32 material_cluster_index = 0;
+  std::string material_name;
+  u8 vertex_stride = 0;
+  u8 attribute_word_count = 0;
+  std::vector<Attribute> attributes;
+  std::vector<u16> palette_groups;
+  std::vector<u16> vertex_palette_slots;
+  std::vector<u16> indices;
+  std::vector<u8> vertices;
+  std::vector<std::array<float, 3>> positions;
+  std::vector<std::array<float, 3>> normals;
+  std::vector<std::array<float, 2>> uv0;
+  bool has_position = false;
+  bool has_normal = false;
+  bool has_uv0 = false;
+};
+
+struct DMFDecoded
+{
+  bool valid = false;
+  std::vector<std::string> bone_refs;
+  std::vector<DMFSkinGroup> skin_groups;
+  std::vector<DMFCluster> clusters;
+  std::size_t total_vertices = 0;
+  std::size_t total_indices = 0;
+};
+
 struct DMFResource
 {
   DMFInfo info;
   std::string source_name;
   std::shared_ptr<const std::vector<u8>> bytes;
+  std::shared_ptr<const DMFDecoded> decoded;
+};
+
+struct EMTInfo
+{
+  bool valid = false;
+  bool big_endian = false;
+  u32 version = 0;
+  u32 entity_count = 0;
+  u32 section_a = 0;
+  u32 section_b = 0;
+  u32 section_c = 0;
+  std::size_t leks_blocks = 0;
+};
+
+struct EMTResource
+{
+  EMTInfo info;
+  std::string source_name;
+  std::shared_ptr<const std::vector<u8>> bytes;
+};
+
+struct SkinnedDrawMatch
+{
+  std::shared_ptr<const DMFResource> owner;
+  std::string gc_name;
+  u32 display_list = 0;
+  u32 material_index = 0;
+  u32 cluster_index = 0;
+  std::string gc_material_name;
+  std::vector<u8> gc_palette_groups;
+  std::vector<s16> ps3_group_to_gc;
+  std::string skeleton_name;
+
+  explicit operator bool() const { return owner != nullptr; }
+};
+
+
+struct SkinnedPaletteAnalysis
+{
+  bool valid = false;
+  std::size_t ps3_material_clusters = 0;
+  std::size_t total_triangles = 0;
+  std::size_t selected_triangles = 0;
+  std::size_t ambiguous_triangles = 0;
+  std::size_t unmapped_triangles = 0;
+  std::size_t selected_vertices = 0;
+  std::size_t matrix_slots = 0;
+};
+
+// Strict v16.9 proof-of-life replacement.  It is returned only when the
+// current GC DMF material has exactly one authored GX display list, exactly
+// one PS3 material cluster, every PS3 triangle maps to that palette, and all
+// required vertex attributes were decoded from the RSX declaration.
+struct SkinnedDrawReplacement
+{
+  std::shared_ptr<const DMFResource> owner;
+  const DMFCluster* cluster = nullptr;
+  std::vector<u8> position_matrix_indices;
+  std::size_t gc_material_draws = 0;
+
+  explicit operator bool() const
+  {
+    return owner != nullptr && cluster != nullptr &&
+           position_matrix_indices.size() == cluster->positions.size();
+  }
 };
 
 struct SKLInfo
@@ -90,7 +196,11 @@ void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const
 StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands);
 void SetDisplayListContext(u32 address, std::span<const u8> commands);
 void SetDisplayListMatch(StaticDrawMatch match);
+SkinnedDrawMatch CurrentSkinnedDraw();
+SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette();
+SkinnedDrawReplacement BuildCurrentSkinnedReplacement();
 void NotifyStaticDrawSubmitted();
+void NotifySkinnedDrawSubmitted(const SkinnedDrawReplacement& replacement);
 void PrintDrawStatistics();
 
 bool IsStaticDrawReplacementEnabled();
@@ -101,6 +211,8 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices,
 
 bool ParseMSHv8(std::span<const u8> bytes, StaticMesh* out);
 DMFInfo InspectDMF(std::span<const u8> bytes);
+bool DecodeDMF0502(std::span<const u8> bytes, DMFDecoded* out);
+EMTInfo InspectEMT(std::span<const u8> bytes);
 SKLInfo InspectSKL(std::span<const u8> bytes);
 
 // Static MSH can be consumed by a host renderer. It must NOT be copied into
@@ -116,12 +228,16 @@ void PreloadCurrentLevelDMF(std::string_view level);
 void ClearDMFCache();
 void PreloadCurrentLevelSKL(std::string_view level);
 void ClearSKLCache();
+void PreloadCurrentLevelEMT(std::string_view level);
+void ClearEMTCache();
 const StaticMesh* FindCachedMSH(std::string_view name_or_path);
 const DMFResource* FindCachedDMF(std::string_view name_or_path);
 const SKLInfo* FindCachedSKL(std::string_view name_or_path);
+const EMTResource* FindCachedEMT(std::string_view name_or_path);
 std::size_t CachedMSHCount();
 std::size_t CachedDMFCount();
 std::size_t CachedSKLCount();
+std::size_t CachedEMTCount();
 
 // Main GC -> PS3 model bridge. .msf is accepted as an alias of .msh.
 Replacement ResolveReplacement(std::string_view gc_resource_name);
