@@ -1,6 +1,6 @@
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/TPK.h"
 #include <algorithm>
-#include <set>
+#include <limits>
 namespace MOHFrontline::PS3::TPK
 {
 bool Parse(std::span<const std::uint8_t> b, std::vector<Texture>* out)
@@ -22,7 +22,10 @@ bool Parse(std::span<const std::uint8_t> b, std::vector<Texture>* out)
     if (end == b.begin() + p || offset > b.size() || b.size() - offset < 48) return false;
     Texture t;
     t.name.assign(b.begin() + p, end);
-    t.size = u32(offset + 4); t.offset = u32(offset + 8);
+    t.size = u32(offset + 4);
+    const std::uint64_t absolute = std::uint64_t(u32(4)) + u32(offset + 8);
+    if (absolute > std::numeric_limits<std::uint32_t>::max()) return false;
+    t.offset = static_cast<std::uint32_t>(absolute);
     std::copy_n(b.begin() + offset + 16, 24, t.descriptor.begin());
     if (!t.size || t.descriptor[2] != 2 || t.descriptor[3] != 0 || !t.descriptor[1]) return false;
     parsed.push_back(std::move(t));

@@ -216,6 +216,77 @@ bool ReadGuestCString(
   return false;
 }
 
+#if defined(MODERNGEKKO_MOH_PC_LAYER)
+void RegisterGuestShape(CPUState* state, u32 file, int index, bool named_sky = false)
+{
+    if (!IsMem1Address(file) || file > 0x817FFFE8u ||
+        ReadGuestU32(state, file) != 0x53485047u) return;
+    const u32 offset = ReadGuestU32(state, file + 20);
+    if (offset < 24 || offset > 0x81800000u - file - 16) return;
+    const u32 shape = file + offset;
+    if (named_sky)
+      PS3Compass::MarkNamedSkyAddress(shape + 16);
+    if (index < 0) return;
+    const u32 wh = ReadGuestU32(state, shape + 4);
+    const u32 w = wh >> 16, h = wh & 65535;
+    const u32 type = ReadGuestU32(state, shape) >> 24;
+    // SHPG CTexture::Set switch verified against the GMFE69 ELF.
+    const int format = type == 20 ? 4 : type == 22 ? 6 : type == 24 ? 8 : type == 25 ? 9 : type == 30 ? 14 : -1;
+    if (format < 0 || !w || !h || w > 1024 || h > 1024) return;
+    const auto size = TexDecoder_GetTextureSizeInBytes(w, h, static_cast<TextureFormat>(format));
+    if (size <= 0 || static_cast<u32>(size) > 0x81800000u - shape - 16) return;
+    std::vector<u8> original(size);
+    for (int i = 0; i < size; ++i)
+      original[i] = static_cast<u8>(state->external_read(state, shape + 16 + i, 1));
+    std::vector<u8> palette;
+    u32 palette_format = 0;
+    if (format == 8 || format == 9)
+    {
+      const u32 poff = ReadGuestU32(state, shape) & 0xFFFFFF;
+      const u32 psize = format == 8 ? 32 : 512;
+      if (poff < 16 || poff > 0x81800000u - shape - 16 - psize) return;
+      const u32 p = shape + poff;
+      const u32 pt = ReadGuestU32(state, p) >> 24;
+      if (pt < 48 || pt > 50) return;
+      palette_format = pt - 48;
+      palette.resize(psize);
+      for (u32 i = 0; i < psize; ++i)
+        palette[i] = static_cast<u8>(state->external_read(state, p + 16 + i, 1));
+    }
+    PS3Compass::Register(index, shape + 16, w, h, format, std::move(original),
+                         palette_format, std::move(palette));
+}
+
+void RegisterGuestTexturePack(CPUState* state, u32 file)
+{
+  if (!IsMem1Address(file) || file > 0x817ffff0u || ReadGuestU32(state, file) != 0x54504143u)
+    return;
+  const u32 count = ReadGuestU32(state, file + 4);
+  const u32 names = ReadGuestU32(state, file + 8);
+  const u32 pointers = ReadGuestU32(state, file + 12);
+  const u32 available = 0x81800000u - file;
+  if (!count || count > 4096 || names > available || pointers > available ||
+      count > (available - names) / 16 || count > (available - pointers) / 4)
+    return;
+  for (u32 i = 0; i < count; ++i)
+  {
+    std::string name;
+    for (u32 j = 0; j < 16; ++j)
+    {
+      const char c = state->external_read(state, file + names + i * 16 + j, 1);
+      if (!c) break;
+      name.push_back(c);
+    }
+    const u32 texture = ReadGuestU32(state, file + pointers + i * 4);
+    if (texture > available - 4) continue;
+    const u32 shape = ReadGuestU32(state, file + texture);
+    if (shape > available - 24) continue;
+    const int id = PS3Compass::TPKIndex(name);
+    if (id >= 0) RegisterGuestShape(state, file + shape, id);
+  }
+}
+#endif
+
 bool FindGuestFontText(
     CPUState* state,
     std::string* out,
@@ -1262,6 +1333,15 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
       }
     }
 
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower_name.ends_with(".tpk"))
+    {
+      RegisterGuestTexturePack(state, state->gpr[3]);
+      return true;
+    }
+
     // TLT_LoadFileFromLevelBigFile returns r3=SHPG and the metadata hook
     // preserves r29=original LFC filename in r0. CSkyBox::SetTextures uses
     // this loader directly; it never constructs a CSprite.
@@ -1298,43 +1378,8 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     std::string name;
     if (!ReadGuestCString(state, state->gpr[0], &name)) return true;
     const int index = PS3Compass::NameIndex(name);
-    const u32 file = state->gpr[3];
-    if (!IsMem1Address(file) || file > 0x817FFFE8u ||
-        ReadGuestU32(state, file) != 0x53485047u) return true;
-    const u32 offset = ReadGuestU32(state, file + 20);
-    if (offset < 24 || offset > 0x81800000u - file - 16) return true;
-    const u32 shape = file + offset;
-    if (!PS3NamedSky::RelativePath(name).empty())
-      PS3Compass::MarkNamedSkyAddress(shape + 16);
-    if (index < 0) return true;
-    const u32 wh = ReadGuestU32(state, shape + 4);
-    const u32 w = wh >> 16, h = wh & 65535;
-    const u32 type = ReadGuestU32(state, shape) >> 24;
-    // SHPG CTexture::Set switch verified against the GMFE69 ELF.
-    const int format = type == 20 ? 4 : type == 22 ? 6 : type == 24 ? 8 : type == 25 ? 9 : type == 30 ? 14 : -1;
-    if (format < 0 || !w || !h || w > 1024 || h > 1024) return true;
-    const auto size = TexDecoder_GetTextureSizeInBytes(w, h, static_cast<TextureFormat>(format));
-    if (size <= 0 || static_cast<u32>(size) > 0x81800000u - shape - 16) return true;
-    std::vector<u8> original(size);
-    for (int i = 0; i < size; ++i)
-      original[i] = static_cast<u8>(state->external_read(state, shape + 16 + i, 1));
-    std::vector<u8> palette;
-    u32 palette_format = 0;
-    if (format == 8 || format == 9)
-    {
-      const u32 poff = ReadGuestU32(state, shape) & 0xFFFFFF;
-      const u32 psize = format == 8 ? 32 : 512;
-      if (poff < 16 || poff > 0x81800000u - shape - 16 - psize) return true;
-      const u32 p = shape + poff;
-      const u32 pt = ReadGuestU32(state, p) >> 24;
-      if (pt < 48 || pt > 50) return true;
-      palette_format = pt - 48;
-      palette.resize(psize);
-      for (u32 i = 0; i < psize; ++i)
-        palette[i] = static_cast<u8>(state->external_read(state, p + 16 + i, 1));
-    }
-    PS3Compass::Register(index, shape + 16, w, h, format, std::move(original),
-                         palette_format, std::move(palette));
+    RegisterGuestShape(state, state->gpr[3], index,
+                       !PS3NamedSky::RelativePath(name).empty());
     return true;
   }
 

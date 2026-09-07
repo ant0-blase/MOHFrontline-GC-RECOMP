@@ -3372,18 +3372,13 @@ FindAuto3D(const TextureInfo& info)
     return nullptr;
   }
 
-  if (auto cached_exact =
-          FindExactLevelPortTexture(
-              info))
+  // Legacy offline hashes are diagnostic only. Production TPK identities
+  // arrive from the guest pack loader, with the original texture name.
+  if (const char* legacy = std::getenv("MOH_PS3_LEGACY_TPK_HASH");
+      legacy && std::string_view(legacy) == "1")
   {
-    return cached_exact;
-  }
-
-  if (auto exact =
-          FindExactTPK1_1(
-              info))
-  {
-    return exact;
+    if (auto exact = FindExactLevelPortTexture(info)) return exact;
+    if (auto exact = FindExactTPK1_1(info)) return exact;
   }
 
   // Exact TPK/RSX has priority. Sky/current-level SSH matching is next; the
@@ -3759,6 +3754,34 @@ int NameIndex(std::string_view name)
 }
 
 
+int MaterialIndex(std::string key, std::shared_ptr<VideoCommon::CustomTextureData> data)
+{
+  if (!data) return -1;
+  std::scoped_lock lock(mutex);
+  if (auto it = resource_ids.find(key); it != resource_ids.end()) return it->second;
+  const int id = next_resource_id++;
+  Resource r;
+  r.filename = Filename(key);
+  r.relative_path = key;
+  r.decoded = std::move(data);
+  r.attempted = true;
+  resource_ids.emplace(std::move(key), id);
+  resources.emplace(id, std::move(r));
+  return id;
+}
+
+int TPKIndex(std::string_view name)
+{
+  if (!PS3AssetPort::IsTPKRSXEnabled()) return -1;
+  const auto level = MOHFrontline::NativeAssets::GetCurrentLevel();
+  if (level.empty()) return -1;
+  const auto decoded = MOHFrontline::Materials::LoadTexture(level, name);
+  if (!decoded) return -1;
+  return MaterialIndex("data/" + level.substr(0, 1) + "/" + level +
+                       "/level.viv::tpk" + level + ".tpk::" + std::string(name),
+                       BuildCustomTextureFromPS3Levels(*decoded));
+}
+
 void MarkNamedSkyAddress(u32 address)
 {
   std::scoped_lock lock(mutex);
@@ -3773,7 +3796,7 @@ void NotifyTextureUploaded(const TextureInfo& info)
 {
   std::scoped_lock lock(mutex);
   const u32 address = info.GetRawAddress();
-  if (!named_sky_addresses.contains(address) || uploaded_named_sky.contains(address))
+  if (uploaded_named_sky.contains(address))
     return;
   const auto it = registrations.find(address);
   if (it == registrations.end())
@@ -3781,8 +3804,16 @@ void NotifyTextureUploaded(const TextureInfo& info)
   const auto resource = resources.find(it->second.resource_id);
   if (resource == resources.end())
     return;
-  uploaded_named_sky.insert(address);
   const auto& path = resource->second.relative_path;
+  if (path.find(".tpk::") != std::string::npos)
+  {
+    uploaded_named_sky.insert(address);
+    std::fprintf(stderr, "[moh-ps3-tpk] ACTIVE GC-material=%08x -> PS3=%s\n",
+                 address, path.c_str());
+    return;
+  }
+  if (!named_sky_addresses.contains(address)) return;
+  uploaded_named_sky.insert(address);
   std::string face = path.substr(path.size() - 6, 2);
   std::transform(face.begin(), face.end(), face.begin(),
                  [](unsigned char c) { return static_cast<char>(std::toupper(c)); });

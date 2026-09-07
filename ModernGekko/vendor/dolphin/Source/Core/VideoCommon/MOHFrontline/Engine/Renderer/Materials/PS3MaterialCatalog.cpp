@@ -35,7 +35,10 @@ Catalog& Get(std::string_view level)
   auto rsx = NativeAssets::Resolve(scope + "rsx.viv", NativeAssets::Domain::Container);
   std::vector<PS3::TPK::Texture> records;
   if (!tpk || !rsx || !PS3::TPK::Parse(NativeAssets::Read(tpk), &records))
-  { ++stats.failures; return c; }
+  { ++stats.failures;
+    std::fprintf(stderr, "[moh-ps3-tpk] FAIL file=%stpk%.*s.tpk record=header reason=missing or invalid TPAC/RSX\n",
+                 scope.c_str(), int(level.size()), level.data());
+    return c; }
   c.rsx = rsx.asset;
   std::set<std::string> ambiguous;
   for (auto& r : records)
@@ -56,7 +59,7 @@ Catalog& Get(std::string_view level)
     else c.records.emplace(name, std::move(r));
   }
   ++stats.catalogs; stats.records += c.records.size();
-  std::fprintf(stderr, "[moh-native][material] level=%.*s parsed=%zu (activation requires validated UVs)\n",
+  std::fprintf(stderr, "[moh-ps3-tpk] loaded level=%.*s records=%zu (awaiting guest material binding)\n",
                int(level.size()), level.data(), c.records.size());
   return c;
 }
@@ -73,21 +76,42 @@ std::shared_ptr<const std::vector<PS3TextureDecoder::Level>> LoadTexture(std::st
   const auto found = c.records.find(name);
   if (found == c.records.end()) return {};
   const auto& r = found->second;
-  const auto bytes = PS3RemasterAssets::ReadRange(*c.rsx, r.offset, r.size);
-  if (bytes.size() != r.size) { ++stats.failures; c.decoded[std::string(name)] = {}; return {}; }
+  auto decoded = DecodeRSXTexture(*c.rsx, r.offset, r.size, r.descriptor);
+  if (!decoded)
+  {
+    ++stats.failures;
+    std::fprintf(stderr, "[moh-ps3-tpk] FAIL level=%.*s record=%.*s reason=RSX range or texture decode\n",
+                 int(level.size()), level.data(), int(name.size()), name.data());
+  }
+  else
+  {
+    ++stats.decoded;
+    std::fprintf(stderr, "[moh-ps3-tpk] material=%.*s texture=%.*s size=%ux%u\n",
+                 int(name.size()), name.data(), int(name.size()), name.data(),
+                 decoded->front().width, decoded->front().height);
+  }
+  c.decoded[std::string(name)] = decoded;
+  return decoded;
+}
+std::shared_ptr<const std::vector<PS3TextureDecoder::Level>> DecodeRSXTexture(
+    const PS3RemasterAssets::AssetInfo& asset, std::uint64_t offset, std::uint32_t size,
+    const std::array<std::uint8_t, 24>& descriptor)
+{
+  const auto bytes = PS3RemasterAssets::ReadRange(asset, offset, size);
+  if (!size || bytes.size() != size) return {};
+  // Existing decoder accepts this 48-byte GTF header plus an unchanged RSX
+  // payload. Descriptor fields and BC blocks retain their documented endian.
   std::vector<std::uint8_t> gtf(48 + bytes.size());
   auto write = [&](std::size_t p, std::uint32_t v) {
     for (unsigned i = 0; i < 4; ++i) gtf[p+i] = v >> (24 - 8*i);
   };
-  write(0, 0x02010100); write(4, r.size); write(8, 1); write(16, 20); write(20, r.size);
-  std::copy(r.descriptor.begin(), r.descriptor.end(), gtf.begin() + 24);
+  write(0, 0x02010100); write(4, size); write(8, 1); write(16, 20); write(20, size);
+  std::copy(descriptor.begin(), descriptor.end(), gtf.begin() + 24);
   std::copy(bytes.begin(), bytes.end(), gtf.begin() + 48);
   auto decoded = std::make_shared<std::vector<PS3TextureDecoder::Level>>();
-  if (!PS3TextureDecoder::Decode(gtf, decoded.get()))
-  { ++stats.failures; c.decoded[std::string(name)] = {}; return {}; }
-  ++stats.decoded;
-  c.decoded[std::string(name)] = decoded;
+  if (!PS3TextureDecoder::Decode(gtf, decoded.get()) || decoded->empty()) return {};
   return decoded;
 }
+
 Statistics GetStatistics() { std::scoped_lock lock(mutex); return stats; }
 }

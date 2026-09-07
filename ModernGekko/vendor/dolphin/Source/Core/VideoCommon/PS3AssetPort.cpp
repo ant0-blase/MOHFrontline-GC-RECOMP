@@ -470,7 +470,11 @@ bool RestoreNativeLightState(VertexShaderConstants& constants, const XFMemory& x
 }
 }  // namespace
 
-bool IsTPKRSXEnabled() { return EnvSwitch("MOH_PS3_TPK_RSX", false); }
+bool IsTPKRSXEnabled()
+{
+  return EnvSwitch("MOH_PS3_TPK_RSX", true) && EnvSwitch("MOH_PS3_TPK", true) &&
+         EnvSwitch("MOH_PS3_RSX", true) && EnvSwitch("MOH_PS3_LEVEL_PORT", true);
+}
 bool IsMSHEnabled() { return EnvSwitch("MOH_PS3_MSH", true); }
 bool IsDMFEnabled() { return EnvSwitch("MOH_PS3_DMF", false); }
 bool IsLightingEnabled() { return s_lighting_enabled; }
