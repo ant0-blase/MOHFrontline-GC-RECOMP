@@ -900,6 +900,7 @@ std::unordered_map<
     sky_exact_assignments;
 
 bool sky_assignment_logged = false;
+bool sky_cache_invalidation_pending = false;
 
 bool StrictLevelTexturesEnabled()
 {
@@ -1127,6 +1128,10 @@ void ResetAuto3DCacheLocked()
   auto3d_rejected.clear();
   strict_level_matches.clear();
   strict_level_rejected.clear();
+  sky_gc_probes.clear();
+  sky_exact_assignments.clear();
+  sky_assignment_logged = false;
+  sky_cache_invalidation_pending = false;
 }
 
 void SetAuto3DLevelScope(
@@ -1341,6 +1346,14 @@ std::string CurrentLevelIdFromScope(
   return level;
 }
 
+std::string DirectSkyStemForLevel(std::string_view level)
+{
+  if (level == "1_1")
+    return "level1test";
+
+  return std::string(level);
+}
+
 bool IsExactCurrentLevelSkyFacePath(
     std::string_view relative,
     std::string_view scope)
@@ -1382,10 +1395,13 @@ bool IsExactCurrentLevelSkyFacePath(
       "fr", "bk", "lf", "rt", "up", "dn",
   };
 
+  const std::string sky_stem =
+      DirectSkyStemForLevel(level);
+
   for (const auto face : faces)
   {
     if (file ==
-        level + "_" +
+        sky_stem + "_" +
             std::string(face) +
             ".ssh")
     {
@@ -1411,11 +1427,44 @@ bool UpdateDeterministicSkyAssignmentLocked(
   if (potential_sky)
     *potential_sky = false;
 
+  const bool supported_sky_probe =
+      width == height &&
+      (width == 128 ||
+       width == 256);
+
   if (!SkyTexturesEnabled() ||
       auto3d_level_scope.empty() ||
-      width != 128 ||
-      height != 128)
+      !supported_sky_probe)
   {
+    return false;
+  }
+
+  // v14.5: GameCube sky faces are not assumed to all be 128x128.
+  // Keep 128x128 sides, but also admit 256x256 square sky uploads.
+  // v14.4: once the global sky assignment has been solved, freeze it.
+  // Re-solving for every later 128x128 texture can make unrelated
+  // world/floor textures steal a sky face such as DN or UP.
+  if (!sky_exact_assignments.empty())
+  {
+    const auto it =
+        sky_exact_assignments.find(key);
+
+    if (it != sky_exact_assignments.end())
+    {
+      if (assigned_path)
+        *assigned_path = it->second;
+
+      if (potential_sky)
+        *potential_sky = true;
+
+      return true;
+    }
+
+    // Only the hashes already present in sky_exact_assignments are sky.
+    // Any other 128x128 anonymous GC texture must stay untouched.
+    if (potential_sky)
+      *potential_sky = true;
+
     return false;
   }
 
@@ -1461,6 +1510,9 @@ bool UpdateDeterministicSkyAssignmentLocked(
       CurrentLevelIdFromScope(
           auto3d_level_scope);
 
+  const std::string sky_stem =
+      DirectSkyStemForLevel(level);
+
   for (const auto& candidate :
        auto3d_candidates)
   {
@@ -1480,7 +1532,7 @@ bool UpdateDeterministicSkyAssignmentLocked(
          ++slot)
     {
       const std::string expected =
-          level +
+          sky_stem +
           "_" +
           std::string(
               face_suffixes[slot]) +
@@ -1635,7 +1687,7 @@ bool UpdateDeterministicSkyAssignmentLocked(
   const std::size_t minimum_probes =
       std::max<std::size_t>(
           face_count,
-          12);
+          32);
 
   if (sky_gc_probes.size() <
       minimum_probes)
@@ -1845,6 +1897,9 @@ bool UpdateDeterministicSkyAssignmentLocked(
   /*
    * Once solved, install an exact GC texture hash -> PS3 face map.
    */
+  const bool assignment_was_ready =
+      !sky_exact_assignments.empty();
+
   sky_exact_assignments.clear();
 
 
@@ -1859,12 +1914,31 @@ bool UpdateDeterministicSkyAssignmentLocked(
                 .probe_for_face[
                     face_index]);
 
-    sky_exact_assignments[
+    const u64 gc_key =
         sky_gc_probes[
-            probe].key] =
+            probe].key;
+
+    sky_exact_assignments[
+        gc_key] =
         faces[
             face_index]
             ->relative_path;
+
+    // v14.1: these hashes may have been rejected by the old per-texture
+    // matcher before the global sky assignment became ready. Unblock them
+    // so every mapped cube face can use its deterministic PS3 replacement.
+    strict_level_rejected.erase(gc_key);
+  }
+
+  if (!assignment_was_ready &&
+      !sky_exact_assignments.empty())
+  {
+    sky_cache_invalidation_pending = true;
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3-sky] v14.2 assignment committed: "
+        "requesting one-shot texture-cache reload\n");
   }
 
 
@@ -2052,12 +2126,109 @@ void BuildAuto3DCandidatesLocked()
   std::size_t tried = 0;
   std::size_t decoded_count = 0;
 
+  // v14.3: load standalone skybox faces by their exact PS3 filenames.
+  // Explicit sky faces bypass the generic low-contrast candidate filter.
+  const std::string level =
+      CurrentLevelIdFromScope(scope);
+
+  const std::string sky_stem =
+      DirectSkyStemForLevel(level);
+
+  static constexpr std::array<std::string_view, 6> direct_faces = {
+      "fr", "bk", "lf", "rt", "up", "dn",
+  };
+
+  std::size_t direct_sky_loaded = 0;
+
+  for (const auto face : direct_faces)
+  {
+    const std::string relative_path =
+        scope + sky_stem + "_" + std::string(face) + ".ssh";
+
+    const auto* asset =
+        PS3RemasterAssets::FindByRelativePath(relative_path);
+
+    if (!asset ||
+        asset->kind != PS3RemasterAssets::Kind::Texture)
+    {
+      continue;
+    }
+
+    ++tried;
+
+    const auto binary =
+        PS3RemasterAssets::ReadBinary(*asset);
+
+    if (binary.empty())
+      continue;
+
+    std::vector<PS3TextureDecoder::Level> levels;
+
+    if (!PS3TextureDecoder::Decode(
+            std::span<const u8>(
+                binary.data(),
+                binary.size()),
+            &levels) ||
+        levels.empty())
+    {
+      std::fprintf(
+          stderr,
+          "[moh-ps3-sky] direct face decode failed: %s\n",
+          relative_path.c_str());
+      continue;
+    }
+
+    const auto& base = levels.front();
+
+    if (base.rgba.size() <
+            std::size_t(base.width) *
+                base.height *
+                4u ||
+        base.width < 8 ||
+        base.height < 8 ||
+        base.width > 4096 ||
+        base.height > 4096 ||
+        base.rgba.empty())
+    {
+      continue;
+    }
+
+    Auto3DCandidate candidate;
+    candidate.relative_path =
+        Normalize(asset->relative_path);
+    candidate.width = base.width;
+    candidate.height = base.height;
+    candidate.fingerprint =
+        MakeAuto3DFingerprint(
+            base.rgba.data(),
+            base.width,
+            base.height);
+
+    auto3d_candidates.push_back(
+        std::move(candidate));
+
+    ++decoded_count;
+    ++direct_sky_loaded;
+  }
+
+  if (direct_sky_loaded)
+  {
+    std::fprintf(
+        stderr,
+        "[moh-ps3-sky] DIRECT FACE SET: "
+        "scope=%s stem=%s loaded=%zu/6\n",
+        scope.c_str(),
+        sky_stem.c_str(),
+        direct_sky_loaded);
+  }
+
   for (const auto& asset :
        PS3RemasterAssets::GetAssets())
   {
     if (asset.kind != PS3RemasterAssets::Kind::Texture ||
         !Lower(asset.filename).ends_with(".ssh") ||
-        !Auto3DPathAllowed(asset.relative_path, scope))
+        !Auto3DPathAllowed(asset.relative_path, scope) ||
+        IsExactCurrentLevelSkyFacePath(asset.relative_path, scope))
     {
       continue;
     }
@@ -3740,6 +3911,17 @@ std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
   return decoded;
 }
 
+bool ConsumeSkyCacheInvalidation()
+{
+  std::scoped_lock lock(auto3d_mutex);
+
+  if (!sky_cache_invalidation_pending)
+    return false;
+
+  sky_cache_invalidation_pending = false;
+  return true;
+}
+
 void Shutdown()
 {
   {
@@ -3754,6 +3936,7 @@ void Shutdown()
     sky_gc_probes.clear();
     sky_exact_assignments.clear();
     sky_assignment_logged = false;
+    sky_cache_invalidation_pending = false;
     exact_tpk_decoded.clear();
     level_port_decoded.clear();
     level_port_textures.clear();

@@ -19,6 +19,7 @@
 #include "VideoCommon/FreeLookCamera.h"
 #include "VideoCommon/GraphicsModSystem/Runtime/GraphicsModActionData.h"
 #include "VideoCommon/GraphicsModSystem/Runtime/GraphicsModManager.h"
+#include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoCommon.h"
@@ -285,6 +286,10 @@ void VertexShaderManager::SetConstants(std::span<const std::string> textures,
     dirty = true;
   }
   xf_state_manager.ResetMaterialChanges();
+
+  if (PS3AssetPort::ApplyLightingToGX(
+          constants, xfmem, xfmem.projection.type == ProjectionType::Perspective))
+    dirty = true;
 
   if (xf_state_manager.DidPosNormalChange())
   {

@@ -11,6 +11,9 @@
 #include "Common/CommonTypes.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 
+struct VertexShaderConstants;
+struct XFMemory;
+
 namespace PS3AssetPort
 {
 enum class Class
@@ -53,6 +56,16 @@ Class Classify(std::string_view path);
 bool IsTPKRSXEnabled();
 bool IsMSHEnabled();
 bool IsDMFEnabled();
+
+// PS3 .lit lighting bridge.
+//
+// v1 imports the PS3 level-wide ambient/sun palette while deliberately
+// preserving the GameCube/GX light positions, directions and attenuation.
+// PS3 .lit local-light positions are world-space, while GX shader lights are
+// already transformed to view-space; copying them raw would be incorrect.
+bool IsLightingEnabled();
+bool ApplyLightingToGX(VertexShaderConstants& constants, const XFMemory& xfmem,
+                       bool perspective);
 
 // General resolver. This is the one entry point that every future file-load
 // hook should use instead of maintaining separate hard-coded tables.

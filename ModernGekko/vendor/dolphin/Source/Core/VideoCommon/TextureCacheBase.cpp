@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -778,6 +779,18 @@ void TextureCacheBase::OnFrameEnd()
   // rate and not waiting for vblank. Otherwise, we'd end up with a huge list of pending
   // copies.
   FlushEFBCopies();
+
+  // v14.2: the deterministic PS3 sky assignment can become ready only after
+  // several anonymous GameCube sky textures are already cached as normal GX
+  // textures. Invalidate once so the next frame recreates those entries
+  // through PS3Compass::Find() with the solved face table.
+  if (PS3Compass::ConsumeSkyCacheInvalidation())
+  {
+    std::fprintf(
+        stderr,
+        "[moh-ps3-sky] v14.2 reloading TextureCache for solved sky faces\n");
+    Invalidate();
+  }
 
   Cleanup(g_presenter->FrameCount());
 }
