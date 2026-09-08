@@ -2074,12 +2074,20 @@ SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette()
 
 SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
 {
-  // Thompson-only bridge. The existing VertexManager path still performs the
-  // final declaration/XF/finite-matrix checks before replacing the GC draw.
+  // First-person weapon bridge.  The existing VertexManager path still does
+  // the final declaration/XF/finite-matrix checks before replacing the GC
+  // draw, and every material still needs the strict one-cluster / one-GC-DL /
+  // full-palette proof below.  M1 is deliberately enabled here now that its
+  // 0x0502 skin-group coefficients no longer make the decoder reject the file.
   static const bool replace = EnvSwitchLocal("MOH_PS3_DMF_REPLACE", true);
   const auto& draw = g_current_dmf_draw;
+  const bool supported_player_weapon =
+      draw.gc_name == "th_weapondday.dmf" ||
+      draw.gc_name == "th_weapon.dmf" ||
+      draw.gc_name == "m1_weapondday.dmf" ||
+      draw.gc_name == "m1_weapon.dmf";
   if (!replace || !draw.prepared || !draw.owner || !draw.owner->decoded ||
-      draw.gc_name != "th_weapondday.dmf")
+      !supported_player_weapon)
     return {};
 
   const auto& ready = draw.prepared->readiness;
@@ -2152,13 +2160,16 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
     matrix_indices[vertex] = static_cast<u8>(matrix_id);
   }
 
-  static bool logged = false;
-  if (!logged)
+  static std::unordered_set<std::string> logged_weapon_materials;
+  const std::string log_key =
+      std::string(draw.gc_name) + "|" + std::string(draw.gc_material_name);
+  if (logged_weapon_materials.insert(log_key).second)
   {
-    logged = true;
     std::fprintf(stderr,
-                 "[moh-ps3-dmf] Thompson STRICT replacement READY: material=%s "
+                 "[moh-ps3-dmf] Weapon STRICT replacement READY: "
+                 "gc=%.*s material=%s "
                  "verts=%zu tris=%zu palette=%zu groups=%zu/%zu\n",
+                 static_cast<int>(draw.gc_name.size()), draw.gc_name.data(),
                  draw.gc_material_name.data(), selected_cluster->positions.size(),
                  selected_cluster->indices.size() / 3, draw.gc_palette_groups.size(),
                  std::count_if(draw.ps3_group_to_gc.begin(), draw.ps3_group_to_gc.end(),
@@ -2458,8 +2469,16 @@ bool DecodeDMF0502(std::span<const u8> bytes, DMFDecoded* out)
     group.blend = BEFloat(q + 8);
     for (std::size_t j = 0; j < group.auxiliary.size(); ++j)
       group.auxiliary[j] = BEFloat(q + 12 + j * 4);
-    if (group.bone_a >= bone_count || group.bone_b >= bone_count || !std::isfinite(group.blend) ||
-        group.blend < -0.01f || group.blend > 1.01f)
+
+    // PS3 0x0502 stores the legacy GC 16-bit skin coefficient as float/4096.
+    // It is NOT a normalized [0,1] weight. The M1 Garand contains authored
+    // values above 1.0, so the old <= 1.01 check rejected the complete DMF
+    // before the valid M1TOP/M1SIDE clusters and UV0 streams could be used.
+    // Exact PS3->GC matching still requires the original u16 coefficient.
+    const float legacy_blend_q = group.blend * 4096.0f;
+    if (group.bone_a >= bone_count || group.bone_b >= bone_count ||
+        !std::isfinite(group.blend) || !std::isfinite(legacy_blend_q) ||
+        legacy_blend_q < -0.5f || legacy_blend_q > 65535.5f)
       return false;
     for (float value : group.auxiliary)
       if (!std::isfinite(value))

@@ -3399,20 +3399,6 @@ bool NeedsNativeMSHUV(
     const std::shared_ptr<VideoCommon::CustomTextureData>& decoded,
     std::string_view material)
 {
-  // v5.1: do NOT hide PS3 materials by default.  The previous v5 guard was
-  // useful diagnostically, but it made the Thompson PS3 textures disappear
-  // completely because TOM_01WO256/TOM_02MET256 are 432x336 while the GC
-  // source textures are 256x256.
-  //
-  // Keep the guard available as an explicit debug switch while the native
-  // MSH vertex/UV submission bridge is being implemented.
-  const char* guard_value = std::getenv("MOH_PS3_TPK_UV_GUARD");
-  if (!guard_value || !*guard_value)
-    return false;
-  const std::string guard = Lower(std::string(guard_value));
-  if (guard != "1" && guard != "true" && guard != "on" && guard != "yes")
-    return false;
-
   if (UnsafeTPKUVOverrideEnabled() || !decoded || !gc_width || !gc_height ||
       decoded->m_slices.empty() || decoded->m_slices[0].m_levels.empty())
   {
@@ -3421,6 +3407,27 @@ bool NeedsNativeMSHUV(
 
   const auto& ps3 = decoded->m_slices[0].m_levels.front();
   if (!ps3.width || !ps3.height)
+    return false;
+
+  // Remaster weapon sheets are real authored atlases, not ordinary hi-res
+  // versions of the GC texture. M1, Thompson, shotgun, G43, M40, etc. use
+  // this exact 256x256 -> 432x336 transition, so protect it by default.
+  const bool remaster_weapon_atlas =
+      gc_width == 256 && gc_height == 256 &&
+      ps3.width == 432 && ps3.height == 336;
+
+  // Explicit env value still overrides the default. Setting the guard to 1
+  // makes the rule cover every substantial aspect change; setting it to 0
+  // restores the old unsafe behaviour for experiments.
+  bool guard_enabled = remaster_weapon_atlas;
+  if (const char* guard_value = std::getenv("MOH_PS3_TPK_UV_GUARD");
+      guard_value && *guard_value)
+  {
+    const std::string guard = Lower(std::string(guard_value));
+    guard_enabled =
+        guard == "1" || guard == "true" || guard == "on" || guard == "yes";
+  }
+  if (!guard_enabled)
     return false;
 
   const u64 lhs =
@@ -3436,12 +3443,30 @@ bool NeedsNativeMSHUV(
   if (!lo || hi <= lo + lo / 8u)
     return false;
 
+  // If this exact current DMF draw passed the strict replacement proof, the
+  // renderer will submit cluster.uv0 from PS3. The atlas and its authored UV
+  // set therefore travel together and the PS3 texture is safe.
+  const auto native = PS3MeshPort::BuildCurrentSkinnedReplacement();
+  if (native && native.cluster && native.cluster->has_uv0)
+  {
+    static unsigned native_uv_logs = 0;
+    if (native_uv_logs++ < 64)
+    {
+      std::fprintf(stderr,
+                   "[moh-ps3-uv] NATIVE PS3 UV0: material=%.*s "
+                   "GC=%ux%u PS3=%ux%u -> allow PS3 atlas\n",
+                   static_cast<int>(material.size()), material.data(),
+                   gc_width, gc_height, ps3.width, ps3.height);
+    }
+    return false;
+  }
+
   static unsigned mismatch_logs = 0;
   if (mismatch_logs++ < 160)
   {
     std::fprintf(
         stderr,
-        "[moh-ps3-uv] MSH UV REQUIRED: material=%.*s "
+        "[moh-ps3-uv] PS3 UV REQUIRED: material=%.*s "
         "GC=%ux%u PS3=%ux%u -> keep GC "
         "(MOH_PS3_TPK_UNSAFE_UV=1 forces legacy behavior)\n",
         static_cast<int>(material.size()),

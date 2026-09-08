@@ -1495,6 +1495,38 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
       }
     }
 
+    // The gameplay HUD and the top-screen objective banner are meant to use
+    // the same high-resolution PS3 gameplay face. Keep the original CFont
+    // object (and therefore its live color/height/X/Y scale), but select the
+    // mohgamefont atlas for both HUD variants and objFont while gameplay is
+    // active. Frontend/mission-log uses of objFont remain untouched.
+    if (MohPcLayer::IsGameplayActive())
+    {
+      const std::string gameplay_font =
+          NormalizePS3FontAssetName(
+              exact_font);
+
+      if (gameplay_font == "objfont.sfn" ||
+          (gameplay_font.starts_with("mohgamefont_") &&
+           gameplay_font.ends_with(".sfn")))
+      {
+        exact_font =
+            "mohgamefont_72.sfn";
+      }
+    }
+
+    // Force the original clean gameplay font path again: when gameplay is
+    // active, never keep role-specific bridged fonts such as objfont,
+    // popupdisplay, subtitlefont or comicfont.  Always draw through
+    // mohgamefont_72.sfn exactly like the first clean implementation.
+    // This covers the in-game HUD, the objective banner at the top and the
+    // pause overlay opened during gameplay.
+    if (MohPcLayer::IsGameplayActive())
+    {
+      exact_font =
+          "mohgamefont_72.sfn";
+    }
+
     if (exact_font.empty())
     {
       return true;

@@ -1776,15 +1776,8 @@ void SetMovieActive(bool active)
                        AnisotropicFilteringMode::Default);
     Config::SetCurrent(Config::GFX_HACK_FAST_TEXTURE_SAMPLING, false);
 
-    // The source movies are authored 4:3. Present them at exactly 4:3 even
-    // when gameplay is Auto fill-window / 16:10 / 16:9 / ultrawide.
-    Config::SetCurrent(Config::GFX_ASPECT_RATIO, AspectMode::CustomStretch);
-    Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, 4);
-    Config::SetCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, 3);
-    Config::SetCurrent(Config::GFX_CROP_TO_ASPECT_RATIO, false);
-
     std::fprintf(stderr,
-                 "[moh-vp6] movie ON: precise sampler + guest filtering + 4:3\n");
+                 "[moh-vp6] movie ON: precise sampler + guest filtering; aspect unchanged\n");
   }
   else
   {
@@ -1794,9 +1787,8 @@ void SetMovieActive(bool active)
                        AnisotropyMode(s.anisotropy.load()));
     Config::SetCurrent(Config::GFX_HACK_FAST_TEXTURE_SAMPLING,
                        s.original_fast_texture_sampling);
-    ApplyAspect(s.aspect_mode.load());
     std::fprintf(stderr,
-                 "[moh-vp6] movie OFF: restored v10.2 graphics/aspect\n");
+                 "[moh-vp6] movie OFF: restored v10.2 graphics; aspect unchanged\n");
   }
 }
 
@@ -2203,6 +2195,15 @@ std::string ResolvePS3FontFilename(
         env && *env ?
             NormalizePS3FontFilename(env) :
             "mohgamefont_72.sfn";
+  }
+
+  // Restore the original v6.7 gameplay font policy.  The first PS3 HUD bridge
+  // did not select a separate Objective/Popup/Weapon atlas: every in-game
+  // CFont draw used the authored high-resolution gameplay face.
+  if (s.gameplay.load(std::memory_order_relaxed))
+  {
+    requested =
+        "mohgamefont_72.sfn";
   }
 
   const auto* exact =
@@ -2662,11 +2663,66 @@ void DrawPS3FontUI(
           return glyph;
         };
 
-    // EBOOT 0x36CE0..0x36E68. Normal draws use CFont X/Y scale; a positive
-    // requested height replaces both axes with height/currentGlyphHeight.
+    // v6.7 HUD compatibility path.
+    //
+    // This is deliberately the geometry used by the first clean
+    // mohgamefont_72.sfn HUD implementation:
+    //   * logical coordinate space: 640x480
+    //   * glyph height: 24 logical pixels by default
+    //   * one isotropic scale based on Y, so widescreen never stretches glyphs
+    //   * CFont scale/requested-height from later multi-font work is ignored
+    //
+    // Because ResolvePS3FontFilename() forces gameplay draws to this atlas, the
+    // same geometry is also used by the objective banner at the top.
+    const bool legacy_hud_geometry =
+        NormalizePS3FontFilename(font_name) ==
+        "mohgamefont_72.sfn";
+
+    float legacy_line_height = 1.0f;
+    if (legacy_hud_geometry)
+    {
+      for (const auto& glyph : font->glyphs)
+      {
+        legacy_line_height =
+            std::max(
+                legacy_line_height,
+                static_cast<float>(glyph.height));
+      }
+    }
+
+    const float legacy_logical_height =
+        static_cast<float>(
+            std::clamp(
+                EnvDouble(
+                    "MOH_PS3_FONT_HEIGHT",
+                    24.0),
+                12.0,
+                48.0));
+
+    const float legacy_y_scale =
+        display.y /
+        480.0f;
+
+    const float legacy_glyph_scale =
+        legacy_y_scale *
+        requested_scale *
+        legacy_logical_height /
+        std::max(
+            legacy_line_height,
+            1.0f);
+
+    // Keep the newer EBOOT geometry for non-gameplay role fonts, but restore
+    // the exact old v6.7 sizing for mohgamefont_72.sfn.
     const auto glyph_scale =
         [&](const PS3FontParser::Glyph& glyph)
         {
+          if (legacy_hud_geometry)
+          {
+            return std::pair<float, float>{
+                legacy_glyph_scale,
+                legacy_glyph_scale};
+          }
+
           float sx = request.scale_x;
           float sy = request.scale_y;
           if (request.requested_height > 0.0f && glyph.height > 0)
@@ -2705,9 +2761,22 @@ void DrawPS3FontUI(
             {
               const auto [sx, sy] = glyph_scale(*glyph);
               (void)sy;
-              width += static_cast<float>(
-                  static_cast<int>(glyph->bearing) +
-                  static_cast<int>(glyph->advance)) * sx;
+
+              if (legacy_hud_geometry)
+              {
+                // Original v6.7 width calculation: advance only. Bearing moves
+                // the quad but does not increase the logical pen advance.
+                width +=
+                    static_cast<float>(
+                        glyph->advance) *
+                    sx;
+              }
+              else
+              {
+                width += static_cast<float>(
+                    static_cast<int>(glyph->bearing) +
+                    static_cast<int>(glyph->advance)) * sx;
+              }
             }
           }
 
@@ -2721,9 +2790,14 @@ void DrawPS3FontUI(
         request.x *
         game_x_scale;
 
+    const float draw_y_scale =
+        legacy_hud_geometry ?
+            legacy_y_scale :
+            game_y_scale;
+
     float pen_y =
         request.y *
-        game_y_scale;
+        draw_y_scale;
 
     if (request.centered)
     {
@@ -2740,24 +2814,31 @@ void DrawPS3FontUI(
     for (const auto& glyph : font->glyphs)
       native_line_height = std::max(native_line_height, static_cast<float>(glyph.height));
     const float logical_line_height =
-        request.requested_height > 0.0f ? request.requested_height :
-        native_line_height * request.scale_y;
+        legacy_hud_geometry ?
+            legacy_logical_height :
+            (request.requested_height > 0.0f ? request.requested_height :
+             native_line_height * request.scale_y);
     bool first_glyph_on_line = true;
 
+    // The original v6.7 host HUD bridge drew the PS3 gameplay font as clean
+    // white RGBA. Preserve newer role-font colors outside this compatibility
+    // path.
     const ImU32 color =
-        IM_COL32(
-            static_cast<u8>(
-                (request.rgba >> 24) &
-                0xFF),
-            static_cast<u8>(
-                (request.rgba >> 16) &
-                0xFF),
-            static_cast<u8>(
-                (request.rgba >> 8) &
-                0xFF),
-            static_cast<u8>(
-                request.rgba &
-                0xFF));
+        legacy_hud_geometry ?
+            IM_COL32(255, 255, 255, 255) :
+            IM_COL32(
+                static_cast<u8>(
+                    (request.rgba >> 24) &
+                    0xFF),
+                static_cast<u8>(
+                    (request.rgba >> 16) &
+                    0xFF),
+                static_cast<u8>(
+                    (request.rgba >> 8) &
+                    0xFF),
+                static_cast<u8>(
+                    request.rgba &
+                    0xFF));
 
     for (unsigned char ch :
          request.text)
@@ -2769,7 +2850,7 @@ void DrawPS3FontUI(
 
         pen_y +=
             logical_line_height *
-            game_y_scale *
+            draw_y_scale *
             requested_scale;
         first_glyph_on_line = true;
 
@@ -2784,17 +2865,28 @@ void DrawPS3FontUI(
 
       const auto [sx, sy] = glyph_scale(*glyph);
 
-      // EBOOT exact ordering: +0x14 spacing is applied before every glyph
-      // except the first one on a line; the first receives it after its quad.
-      if (!first_glyph_on_line)
-        pen_x += static_cast<float>(glyph->bearing) * sx;
+      // The later EBOOT path includes signed bearing in the pen state.
+      // v6.7 instead applied bearing only to the glyph quad itself.
+      if (!legacy_hud_geometry &&
+          !first_glyph_on_line)
+      {
+        pen_x +=
+            static_cast<float>(
+                glyph->bearing) *
+            sx;
+      }
 
       if (ch != ' ' &&
           glyph->width > 0 &&
           glyph->height > 0)
       {
         const float x0 =
-            pen_x;
+            legacy_hud_geometry ?
+                pen_x +
+                    static_cast<float>(
+                        glyph->bearing) *
+                    sx :
+                pen_x;
 
         const float y0 =
             pen_y;
@@ -2815,13 +2907,20 @@ void DrawPS3FontUI(
             static_cast<float>(
                 font->atlas_height);
 
+        // v6.7 used a half-texel inset on the large 2048x576 atlas,
+        // avoiding bright/dirty atlas-edge bleeding around HUD glyphs.
+        const float uv_inset =
+            legacy_hud_geometry ?
+                0.5f :
+                0.0f;
+
         const ImVec2 uv0(
-            static_cast<float>(glyph->x) / atlas_w,
-            static_cast<float>(glyph->y) / atlas_h);
+            (static_cast<float>(glyph->x) + uv_inset) / atlas_w,
+            (static_cast<float>(glyph->y) + uv_inset) / atlas_h);
 
         const ImVec2 uv1(
-            static_cast<float>(glyph->x + glyph->width) / atlas_w,
-            static_cast<float>(glyph->y + glyph->height) / atlas_h);
+            (static_cast<float>(glyph->x + glyph->width) - uv_inset) / atlas_w,
+            (static_cast<float>(glyph->y + glyph->height) - uv_inset) / atlas_h);
 
         draw->AddImage(
             *gpu_atlas->texture,
@@ -2836,9 +2935,20 @@ void DrawPS3FontUI(
             color);
       }
 
-      pen_x += static_cast<float>(glyph->advance) * sx;
-      if (first_glyph_on_line)
-        pen_x += static_cast<float>(glyph->bearing) * sx;
+      pen_x +=
+          static_cast<float>(
+              glyph->advance) *
+          sx;
+
+      if (!legacy_hud_geometry &&
+          first_glyph_on_line)
+      {
+        pen_x +=
+            static_cast<float>(
+                glyph->bearing) *
+            sx;
+      }
+
       first_glyph_on_line = false;
     }
 
@@ -2851,13 +2961,28 @@ void DrawPS3FontUI(
       logged_fonts.push_back(
           font_name);
 
-      std::fprintf(
-          stderr,
-          "[moh-ps3-font] EBOOT CFont geometry ACTIVE: "
-          "font=%s canvas=640x448 scale=(%.3f,%.3f) height=%.2f "
-          "signed-spacing raw-UV no-hold\n",
-          font_name.c_str(), request.scale_x, request.scale_y,
-          request.requested_height);
+      if (legacy_hud_geometry)
+      {
+        std::fprintf(
+            stderr,
+            "[moh-ps3-font] v6.7 HUD geometry RESTORED: "
+            "%s canvas=640x480 native-height=%.1f logical-height=%.1f "
+            "isotropic-scale=%.6f half-texel-UV\n",
+            font_name.c_str(),
+            legacy_line_height,
+            legacy_logical_height,
+            legacy_glyph_scale);
+      }
+      else
+      {
+        std::fprintf(
+            stderr,
+            "[moh-ps3-font] EBOOT CFont geometry ACTIVE: "
+            "font=%s canvas=640x448 scale=(%.3f,%.3f) height=%.2f "
+            "signed-spacing raw-UV no-hold\n",
+            font_name.c_str(), request.scale_x, request.scale_y,
+            request.requested_height);
+      }
     }
   }
 }
