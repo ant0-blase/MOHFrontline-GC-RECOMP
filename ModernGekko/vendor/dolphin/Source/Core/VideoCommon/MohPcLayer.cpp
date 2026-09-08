@@ -267,7 +267,7 @@ std::vector<PS3FontDrawRequest>
     s_ps3_font_draw_requests;
 
 std::atomic<bool>
-    s_ps3_font_replace_enabled{false};
+    s_ps3_font_replace_enabled{true};
 
 std::atomic<bool>
     s_ps3_texture_replace_enabled{true};
@@ -2228,6 +2228,24 @@ std::string ResolvePS3FontFilename(
     {
       return "comicfont.sfn";
     }
+  }
+
+  // Exact role-fonts are preferred above. This fallback is only for a PS3
+  // asset pack that genuinely lacks the requested SFN.
+  const char* fallback_name =
+      s.gameplay.load(std::memory_order_relaxed) ?
+          "mohgamefont_72.sfn" :
+          "langfont.sfn";
+
+  const auto* fallback =
+      PS3FontParser::
+          FindByFilename(
+              fallback_name);
+
+  if (fallback &&
+      fallback->atlas_rgba_ready)
+  {
+    return fallback_name;
   }
 
   return requested;

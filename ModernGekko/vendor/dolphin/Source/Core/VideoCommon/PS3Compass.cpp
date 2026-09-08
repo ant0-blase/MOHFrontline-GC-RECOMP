@@ -21,12 +21,17 @@
 #include <utility>
 
 #include "Common/Hash.h"
+#include "Common/FileUtil.h"
+#include "VideoCommon/MOHFrontline/Assets/PS3/Formats/TextureDDS.h"
+#include <sstream>
+#include <iomanip>
 #include "VideoCommon/Assets/CustomTextureData.h"
 #include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3TextureDecoder.h"
 #include "VideoCommon/TextureDecoder.h"
 #include "VideoCommon/TextureInfo.h"
+#include "VideoCommon/VideoConfig.h"
 
 namespace PS3Compass
 {
@@ -2904,8 +2909,103 @@ DecodeExactPS3TPKTexture(std::string_view scope, std::string_view name)
 {
   std::string level_path(scope);
   while (level_path.ends_with('/')) level_path.pop_back();
+  if (g_backend_info.bSupportsST3CTextures)
+  {
+    if (const auto blocks = MOHFrontline::Materials::LoadCompressedTexture(Filename(level_path), name))
+    {
+      auto result = std::make_shared<VideoCommon::CustomTextureData>();
+      result->m_slices.emplace_back();
+      for (const auto& source : *blocks)
+      {
+        VideoCommon::CustomTextureData::ArraySlice::Level mip;
+        mip.width = source.width; mip.height = source.height; mip.row_length = (source.width+3u)&~3u;
+        mip.format = source.format == PS3TextureDecoder::BlockFormat::BC1 ? AbstractTextureFormat::DXT1 :
+                     source.format == PS3TextureDecoder::BlockFormat::BC2 ? AbstractTextureFormat::DXT3 : AbstractTextureFormat::DXT5;
+        mip.data.reset(source.blocks.size());
+        std::copy(source.blocks.begin(), source.blocks.end(), mip.data.begin());
+        result->m_slices[0].m_levels.push_back(std::move(mip));
+      }
+      return result;
+    }
+  }
   const auto levels = MOHFrontline::Materials::LoadTexture(Filename(level_path), name);
   return levels ? BuildCustomTextureFromPS3Levels(*levels) : nullptr;
+}
+
+struct RSXUploadIdentity { std::string level, name; u64 hash = 0; };
+std::mutex rsx_debug_mutex;
+std::unordered_map<u32, RSXUploadIdentity> rsx_pending_uploads;
+std::unordered_set<std::string> rsx_reported_uploads;
+bool RSXTraceEnabled()
+{
+  static const bool enabled = [] { const auto* v=std::getenv("MOH_PS3_RSX_TRACE"); return v && std::string_view(v)=="1"; }();
+  return enabled;
+}
+bool RSXDumpEnabled()
+{
+  static const bool enabled = [] { const auto* v=std::getenv("MOH_PS3_RSX_DUMP"); return v && std::string_view(v)=="1"; }();
+  return enabled;
+}
+void QueueRSXUpload(const TextureInfo& info, std::string_view level, std::string_view name)
+{
+  if ((!RSXTraceEnabled() && !RSXDumpEnabled()) || !info.GetData()) return;
+  std::scoped_lock lock(rsx_debug_mutex);
+  rsx_pending_uploads[info.GetRawAddress()] = {std::string(level), std::string(name),
+      ExactFNV1a64(info.GetData(), info.GetTextureSize())};
+}
+void ReportRSXUpload(const TextureInfo& info)
+{
+  if (!RSXTraceEnabled() && !RSXDumpEnabled()) return;
+  RSXUploadIdentity identity;
+  {
+    std::scoped_lock lock(rsx_debug_mutex);
+    const auto it=rsx_pending_uploads.find(info.GetRawAddress());
+    if (it==rsx_pending_uploads.end()) return;
+    identity=std::move(it->second); rsx_pending_uploads.erase(it);
+    if (!rsx_reported_uploads.insert(identity.level+"/"+identity.name+"/"+std::to_string(identity.hash)).second) return;
+  }
+  const auto resource=MOHFrontline::Materials::FindTextureResource(identity.level, identity.name);
+  if (!resource) return;
+  const auto& r=resource->texture;
+  const auto& d=r.descriptor;
+  const unsigned width=(d[8]<<8)|d[9], height=(d[10]<<8)|d[11];
+  const unsigned pitch=(unsigned(d[16])<<24)|(unsigned(d[17])<<16)|(unsigned(d[18])<<8)|d[19];
+  if (RSXTraceEnabled())
+    std::fprintf(stderr, "[PS3-RSX] uploaded PS3 replacement: GC=%08x hash=%016llX %ux%u format=%u -> %s record=%u metadata=%s+0x%X rsx=%s+0x%X size=%u %ux%u format=0x%02X mips=%u pitch=%u\n",
+        info.GetRawAddress(), static_cast<unsigned long long>(identity.hash), info.GetRawWidth(), info.GetRawHeight(),
+        unsigned(info.GetTextureFormat()), r.name.c_str(), r.record_index, resource->metadata_source.c_str(), r.metadata_offset,
+        resource->rsx_source.c_str(), r.offset, r.size, width, height, d[0], d[1], pitch);
+  if (!RSXDumpEnabled()) return;
+  std::ostringstream hash; hash << std::hex << std::setw(16) << std::setfill('0') << identity.hash;
+  const auto* override_dir=std::getenv("MOH_PS3_RSX_DUMP_DIR");
+  const auto root=override_dir && *override_dir ? std::filesystem::path(override_dir) :
+      std::filesystem::path(File::GetUserPath(D_USER_IDX))/"ps3-rsx-dump";
+  std::string safe_level=identity.level;
+  for (auto& c : safe_level) if (!std::isalnum(static_cast<unsigned char>(c)) && c!='_') c='_';
+  const auto dir=root/("gc_"+hash.str())/(safe_level+"_record_"+std::to_string(r.record_index));
+  std::error_code error; std::filesystem::create_directories(dir, error);
+  if (error) { std::fprintf(stderr,"[PS3-RSX] dump directory failed: %s\n",error.message().c_str()); return; }
+  std::ofstream gc(dir/"gc_info.txt");
+  gc << "hash_algorithm=FNV1a64\nhash=" << hash.str() << "\naddress=" << info.GetRawAddress()
+     << "\nwidth=" << info.GetRawWidth() << "\nheight=" << info.GetRawHeight()
+     << "\nformat=" << unsigned(info.GetTextureFormat()) << "\nsize=" << info.GetTextureSize() << '\n';
+  std::ofstream ps3(dir/"ps3_info.txt");
+  ps3 << "name=" << r.name << "\nmetadata=" << resource->metadata_source << "\nmetadata_offset=" << r.metadata_offset
+      << "\nrsx=" << resource->rsx_source << "\nrsx_offset=" << r.offset << "\nrsx_size=" << r.size
+      << "\nwidth=" << width << "\nheight=" << height << "\nformat=" << unsigned(d[0])
+      << "\nmips=" << unsigned(d[1]) << "\npitch=" << pitch << "\ndescriptor_hex=";
+  for (const auto byte : d) ps3 << std::hex << std::setw(2) << std::setfill('0') << unsigned(byte);
+  ps3 << '\n';
+  auto write=[&](const char* name, std::span<const u8> bytes) {
+    std::ofstream file(dir/name, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  };
+  write("gc_payload.bin", {info.GetData(), info.GetTextureSize()});
+  write("ps3_payload.bin", MOHFrontline::Materials::ReadTexturePayload(identity.level, identity.name));
+  if (const auto blocks=MOHFrontline::Materials::LoadCompressedTexture(identity.level, identity.name))
+    write("ps3_texture.dds", MOHFrontline::PS3::EncodeDDS(std::span<const PS3TextureDecoder::CompressedLevel>(*blocks)));
+  else if (const auto rgba=MOHFrontline::Materials::LoadTexture(identity.level, identity.name))
+    write("ps3_texture.dds", MOHFrontline::PS3::EncodeDDS(std::span<const PS3TextureDecoder::Level>(*rgba)));
 }
 
 std::shared_ptr<VideoCommon::CustomTextureData>
@@ -2943,6 +3043,7 @@ FindExactTPK1_1(const TextureInfo& info)
 
     if (decoded)
     {
+      QueueRSXUpload(info, "1_1", entry.name);
       std::fprintf(stderr,
                    "[moh-ps3-tpk] EXACT MATCH: GC %ux%u fmt=%u hash=%016llX -> %s\n",
                    info.GetRawWidth(), info.GetRawHeight(),
@@ -3501,6 +3602,7 @@ FindExactLevelPortTexture(
               .string()
               .c_str());
 
+  QueueRSXUpload(info, level, material_name);
   return decoded;
 }
 
@@ -3984,11 +4086,11 @@ int TPKIndex(std::string_view name)
   if (!PS3AssetPort::IsTPKRSXEnabled()) return -1;
   const auto level = MOHFrontline::NativeAssets::GetCurrentLevel();
   if (level.empty()) return -1;
-  const auto decoded = MOHFrontline::Materials::LoadTexture(level, name);
+  const auto decoded = DecodeExactPS3TPKTexture(level, name);
   if (!decoded) return -1;
   return MaterialIndex("data/" + level.substr(0, 1) + "/" + level +
                        "/level.viv::tpk" + level + ".tpk::" + std::string(name),
-                       BuildCustomTextureFromPS3Levels(*decoded));
+                       decoded);
 }
 
 void MarkNamedSkyAddress(u32 address)
@@ -4003,6 +4105,7 @@ void MarkNamedSkyAddress(u32 address)
 
 void NotifyTextureUploaded(const TextureInfo& info)
 {
+  ReportRSXUpload(info);
   std::scoped_lock lock(mutex);
   const u32 address = info.GetRawAddress();
   if (uploaded_named_sky.contains(address))
@@ -4156,6 +4259,8 @@ std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
     }
   }
 
+  if (const auto marker = relative_path.find(".tpk::"); marker != std::string::npos)
+    QueueRSXUpload(info, MOHFrontline::NativeAssets::GetCurrentLevel(), relative_path.substr(marker+6));
   return decoded;
 }
 
@@ -4169,6 +4274,10 @@ std::vector<u32> ConsumeSkyCacheInvalidations()
 
 void Shutdown()
 {
+  {
+    std::scoped_lock lock(rsx_debug_mutex);
+    rsx_pending_uploads.clear(); rsx_reported_uploads.clear();
+  }
   {
     std::scoped_lock auto_lock(auto3d_mutex);
     auto3d_level_scope.clear();

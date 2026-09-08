@@ -1082,4 +1082,46 @@ constexpr u32 CELL_GCM_TEXTURE_A8R8G8B8 = 0x85;
   return true;
 }
 
+bool DecodeCompressed(std::span<const std::uint8_t> file, std::vector<CompressedLevel>* levels)
+{
+  if (!levels) return false;
+  levels->clear();
+  if (file.size() < 48 || BE32(file.data()) != 0x02010100 ||
+      BE32(file.data()+8) != 1 || BE32(file.data()+16) != 20 ||
+      file[26] != 2 || file[27] != 0 || BE16(file.data()+36) != 1 ||
+      BE32(file.data()+28) != 0xaae4) return false;
+  const auto format = file[24] & ~0x60u;
+  if (format < 0x86 || format > 0x88) return false;
+  const bool linear = (file[24] & 0x20) != 0;
+  const unsigned block_bytes = format == 0x86 ? 8 : 16;
+  const auto block_format = format == 0x86 ? BlockFormat::BC1 :
+                            format == 0x87 ? BlockFormat::BC2 : BlockFormat::BC3;
+  unsigned width = BE16(file.data()+32), height = BE16(file.data()+34);
+  const unsigned mips = file[25], pitch = BE32(file.data()+40);
+  const std::size_t payload_size = BE32(file.data()+20);
+  if (!width || !height || width > 4096 || height > 4096 || !mips ||
+      mips > std::bit_width(std::max(width, height)) || payload_size > file.size()-48)
+    return false;
+  std::size_t offset = 0;
+  std::vector<CompressedLevel> parsed;
+  for (unsigned mip = 0; mip < mips; ++mip)
+  {
+    const unsigned rows = (height+3)/4;
+    const std::size_t row_bytes = std::size_t((width+3)/4)*block_bytes;
+    const std::size_t source_pitch = linear ? pitch : row_bytes;
+    if (source_pitch < row_bytes || source_pitch % block_bytes ||
+        offset > payload_size || rows > (payload_size-offset)/source_pitch)
+      return false;
+    CompressedLevel level{width, height, block_format, std::vector<u8>(rows*row_bytes)};
+    for (unsigned row = 0; row < rows; ++row)
+      std::copy_n(file.data()+48+offset+row*source_pitch, row_bytes,
+                  level.blocks.data()+row*row_bytes);
+    parsed.push_back(std::move(level));
+    offset += rows*source_pitch;
+    width = std::max(1u, width/2);
+    height = std::max(1u, height/2);
+  }
+  *levels = std::move(parsed);
+  return true;
+}
 }  // namespace PS3TextureDecoder

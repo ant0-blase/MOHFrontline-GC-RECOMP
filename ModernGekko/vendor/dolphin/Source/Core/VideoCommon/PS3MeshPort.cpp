@@ -530,10 +530,17 @@ std::vector<int> MapGCNodesToPS3Submeshes(const std::vector<OriginalGCNode>& nod
   if (nodes.empty() || mesh.submeshes.empty())
     return mapping;
 
-  // The platform layouts preserve authored node/submesh order for the normal
-  // case. This covers the overwhelming majority of Frontline MSH files and is
-  // exact (no fuzzy runtime matching).
-  if (nodes.size() == mesh.submeshes.size())
+  const std::string source_name = Lower(mesh.source_name);
+  const bool thompson =
+      source_name.find("thompson") != std::string::npos ||
+      source_name.find("tommy") != std::string::npos;
+
+  // The platform layouts preserve authored node/submesh order for most assets.
+  // Thompson is an exception: GC and PS3 can contain the same 15 parts in a
+  // different material/submesh order. Mapping 1:1 by ordinal then puts the
+  // correct TOM_* texture on the wrong piece of geometry. Force a bounds-based
+  // permutation for Thompson even when the node counts are equal.
+  if (nodes.size() == mesh.submeshes.size() && !thompson)
   {
     for (std::size_t i = 0; i < nodes.size(); ++i)
       mapping[i] = static_cast<int>(i);
@@ -565,7 +572,8 @@ std::vector<int> MapGCNodesToPS3Submeshes(const std::vector<OriginalGCNode>& nod
     return a.score < b.score;
   });
 
-  const float maximum_score = EnvFloatLocal("MOH_PS3_MSH_NODE_SCORE", 0.10f, 0.001f, 1.0f);
+  const float maximum_score = EnvFloatLocal(
+      "MOH_PS3_MSH_NODE_SCORE", thompson ? 0.20f : 0.10f, 0.001f, 1.0f);
   std::vector<bool> used_ps3(mesh.submeshes.size(), false);
   for (const auto& pair : pairs)
   {
@@ -576,6 +584,32 @@ std::vector<int> MapGCNodesToPS3Submeshes(const std::vector<OriginalGCNode>& nod
     mapping[pair.gc] = static_cast<int>(pair.ps3);
     used_ps3[pair.ps3] = true;
   }
+
+  if (thompson)
+  {
+    const std::size_t mapped =
+        static_cast<std::size_t>(std::count_if(
+            mapping.begin(), mapping.end(), [](int value) { return value >= 0; }));
+
+    if (mapped != nodes.size() || mapped != mesh.submeshes.size())
+    {
+      // Never create a half-GC/half-PS3 Thompson. If the permutation cannot be
+      // proven complete, retain all GC parts instead of mixing material orders.
+      std::fill(mapping.begin(), mapping.end(), -1);
+      std::fprintf(
+          stderr,
+          "[moh-ps3-msh] Thompson bounds remap REJECT: %zu/%zu parts; keeping complete GC model\n",
+          mapped, nodes.size());
+    }
+    else
+    {
+      std::fprintf(
+          stderr,
+          "[moh-ps3-msh] Thompson bounds remap ACTIVE: %zu/%zu parts matched by geometry, not ordinal\n",
+          mapped, nodes.size());
+    }
+  }
+
   return mapping;
 }
 

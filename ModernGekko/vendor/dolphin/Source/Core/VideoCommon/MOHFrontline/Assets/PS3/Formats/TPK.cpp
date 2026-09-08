@@ -22,12 +22,18 @@ bool Parse(std::span<const std::uint8_t> b, std::vector<Texture>* out)
     if (end == b.begin() + p || offset > b.size() || b.size() - offset < 48) return false;
     Texture t;
     t.name.assign(b.begin() + p, end);
+    t.record_index = i;
+    t.metadata_offset = offset;
+    t.data_base = u32(4);
+    t.relative_offset = u32(offset + 8);
     t.size = u32(offset + 4);
     const std::uint64_t absolute = std::uint64_t(u32(4)) + u32(offset + 8);
     if (absolute > std::numeric_limits<std::uint32_t>::max()) return false;
     t.offset = static_cast<std::uint32_t>(absolute);
     std::copy_n(b.begin() + offset + 16, 24, t.descriptor.begin());
-    if (!t.size || t.descriptor[2] != 2 || t.descriptor[3] != 0 || !t.descriptor[1]) return false;
+    // Unsupported dimensions/formats are individual decoder failures, not a
+    // reason to discard every other named resource in this catalog.
+    if (!t.size) continue;
     parsed.push_back(std::move(t));
   }
   *out = std::move(parsed);

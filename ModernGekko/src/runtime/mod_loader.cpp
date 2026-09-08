@@ -76,21 +76,18 @@ std::string CanonicalKnownPS3FontForGCAsset(const std::string& gc_name)
 {
   const std::string font = NormalizePS3FontAssetName(gc_name);
 
-  if (font == "popupdisplay.sfn" ||
-      font == "objfont.sfn" ||
-      font == "subtitlefont.sfn" ||
-      font == "pausescreenfont.sfn" ||
-      font == "ddayintro.sfn" ||
-      font == "comicfont.sfn")
-  {
-    return font;
-  }
-
   if (font == "upcomicfont.sfn")
     return "comicfont.sfn";
 
   if (font.starts_with("mohgamefont_") && font.ends_with(".sfn"))
     return "mohgamefont_72.sfn";
+
+  // Keep the actual CFont role. PS3FontParser indexes SFNs embedded in
+  // shell.viv as well as standalone files, so debugFont, MissionLogFont,
+  // Difficulty_, PlayerStatsFont, SaveLoadFont, etc. can select their exact
+  // PS3 atlas instead of being collapsed to langFont.
+  if (font.ends_with(".sfn"))
+    return font;
 
   return {};
 }

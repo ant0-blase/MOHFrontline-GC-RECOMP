@@ -1,4 +1,5 @@
 #include "VideoCommon/PS3FontParser.h"
+#include "VideoCommon/PS3RemasterAssets.h"
 
 #include <algorithm>
 #include <cctype>
@@ -327,15 +328,23 @@ bool DecodeFrontlineGTFAtlas(Font* font)
 bool ParseSFNH(
     const std::filesystem::path& path,
     const std::filesystem::path& root,
-    Font* out)
+    Font* out,
+    const std::vector<u8>* supplied_data = nullptr,
+    const std::string* relative_override = nullptr)
 {
-  std::vector<u8> data;
+  std::vector<u8> file_data;
 
-  if (!ReadWholeFile(path, &data) ||
-      !IsSFNH(data))
+  if (!supplied_data &&
+      !ReadWholeFile(path, &file_data))
   {
     return false;
   }
+
+  const std::vector<u8>& data =
+      supplied_data ? *supplied_data : file_data;
+
+  if (!IsSFNH(data))
+    return false;
 
   const u32 glyph_count =
       Read32BE(data.data() + 0x04);
@@ -382,9 +391,11 @@ bool ParseSFNH(
           ec);
 
   font.relative_path =
-      ec ?
-          font.filename :
-          relative.generic_string();
+      relative_override ?
+          *relative_override :
+          (ec ?
+               font.filename :
+               relative.generic_string());
 
   font.glyph_count =
       glyph_count;
@@ -642,14 +653,56 @@ void Initialize(
         std::move(font));
   }
 
+  // Most frontend/menu fonts are members of shell.viv, not standalone files.
+  // PS3RemasterAssets has already built its BIGF index before this Initialize()
+  // call, so consume those SFNH entries directly from the archive.
+  std::size_t embedded_fonts = 0;
+  if (PS3RemasterAssets::IsReady())
+  {
+    for (const auto& asset : PS3RemasterAssets::GetAssets())
+    {
+      if (!asset.embedded ||
+          Lower(std::filesystem::path(asset.filename).extension().string()) != ".sfn")
+      {
+        continue;
+      }
+
+      const std::string key = Lower(asset.filename);
+      if (s_by_filename.contains(key))
+        continue;
+
+      const std::vector<u8> data = PS3RemasterAssets::ReadBinary(asset);
+      if (!IsSFNH(data))
+        continue;
+
+      Font font;
+      const std::filesystem::path virtual_path =
+          root / "__embedded_sfn__" / asset.filename;
+
+      if (!ParseSFNH(virtual_path, root, &font, &data, &asset.relative_path))
+        continue;
+
+      const std::size_t index = s_fonts.size();
+      s_by_filename.emplace(key, index);
+
+      std::fprintf(
+          stderr,
+          "[moh-ps3-font] embedded SFNH parsed %s <- %s glyphs=%u atlas=%ux%u ready=%d\n",
+          font.filename.c_str(), asset.relative_path.c_str(), font.glyph_count,
+          font.atlas_width, font.atlas_height, font.atlas_rgba_ready ? 1 : 0);
+
+      s_fonts.emplace_back(std::move(font));
+      ++embedded_fonts;
+    }
+  }
+
   s_ready = true;
 
   std::fprintf(
       stderr,
-      "[moh-ps3-font] parsed %zu fonts "
-      "(%zu SFNH)\n",
+      "[moh-ps3-font] parsed %zu fonts (%zu embedded SFNH)\n",
       s_fonts.size(),
-      s_fonts.size());
+      embedded_fonts);
 }
 
 void Shutdown()
