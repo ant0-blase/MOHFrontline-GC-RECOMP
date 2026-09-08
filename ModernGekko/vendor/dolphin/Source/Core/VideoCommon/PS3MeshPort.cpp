@@ -1193,6 +1193,41 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
     pair->ps3_group_to_gc[i] = static_cast<s16>(it->second[occurrence++]);
     ++pair->mapped_skin_groups;
   }
+
+  // Some remaster DMFs keep exactly the same authored group/bone ordering but
+  // rename the bone strings between platforms.  A name-only join then produces
+  // mapped_groups=0 even though the binary skin topology is identical (the
+  // uhm*_head family is one example observed at runtime).  Only accept the
+  // fallback when the complete arrays have the same sizes and EVERY group has
+  // the same bone indices and exact legacy 4.12 coefficient at the same index.
+  // This is structural identity, not fuzzy name matching.
+  if (pair->mapped_skin_groups == 0 && decoded.skin_groups.size() == gc_group_count &&
+      decoded.bone_refs.size() == gc_bones.size())
+  {
+    bool identical = true;
+    for (u32 i = 0; i < gc_group_count; ++i)
+    {
+      const u8* q = gc_bytes.data() + gc_group_offset + static_cast<std::size_t>(i) * 4;
+      const auto& group = decoded.skin_groups[i];
+      const int ps3_blend_q = static_cast<int>(group.blend * 4096.0f);
+      if (group.bone_a != q[0] || group.bone_b != q[1] || ps3_blend_q != BE16(q + 2))
+      {
+        identical = false;
+        break;
+      }
+    }
+    if (identical)
+    {
+      pair->ps3_group_to_gc.resize(gc_group_count);
+      for (u32 i = 0; i < gc_group_count; ++i)
+        pair->ps3_group_to_gc[i] = static_cast<s16>(i);
+      pair->mapped_skin_groups = gc_group_count;
+      std::fprintf(stderr,
+                   "[moh-ps3-dmf] STRUCTURAL GROUP MAP: ps3=%s groups=%u "
+                   "bone/group order is binary-identical despite renamed refs\n",
+                   pair->ps3->source_name.c_str(), gc_group_count);
+    }
+  }
 }
 
 void BindDMFPairsToSkeletons()
@@ -1533,8 +1568,10 @@ void PreloadCurrentLevelMSH(std::string_view level)
 
   for (const auto& asset : PS3RemasterAssets::GetAssets())
   {
-    const std::string filename = Lower(asset.filename);
-    if (!filename.ends_with(".msh") || !BelongsToLevel(asset, level))
+    const std::string raw_filename = Lower(asset.filename);
+    const std::string filename = CanonicalModelName(raw_filename);
+    if ((!raw_filename.ends_with(".msh") && !raw_filename.ends_with(".msf")) ||
+        !BelongsToLevel(asset, level))
       continue;
 
     ++candidates;
@@ -1569,6 +1606,7 @@ void PreloadCurrentLevelMSH(std::string_view level)
     }
 
     next[filename] = mesh;
+    next[raw_filename] = mesh;
     next[Lower(asset.relative_path)] = mesh;
   }
 
@@ -1600,8 +1638,10 @@ void PreloadCurrentLevelDMF(std::string_view level)
 
   for (const auto& asset : PS3RemasterAssets::GetAssets())
   {
-    const std::string filename = Lower(asset.filename);
-    if (!filename.ends_with(".dmf") || !BelongsToLevel(asset, level))
+    const std::string raw_filename = Lower(asset.filename);
+    const std::string filename = CanonicalDMFName(raw_filename);
+    if ((!raw_filename.ends_with(".dmf") && !raw_filename.ends_with(".dmt")) ||
+        !BelongsToLevel(asset, level))
       continue;
 
     ++candidates;
@@ -1652,6 +1692,7 @@ void PreloadCurrentLevelDMF(std::string_view level)
       resource->source_name = asset.relative_path;
       resource->bytes = std::make_shared<const std::vector<u8>>(bytes);
       next[filename] = resource;
+      next[raw_filename] = resource;
       next[Lower(asset.relative_path)] = resource;
       continue;
     }
@@ -1675,6 +1716,7 @@ void PreloadCurrentLevelDMF(std::string_view level)
     }
 
     next[filename] = resource;
+    next[raw_filename] = resource;
     next[Lower(asset.relative_path)] = resource;
   }
 
@@ -1905,28 +1947,37 @@ void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const
   if (!filename.ends_with(".msh"))
     filename += ".msh";
 
-  const auto* asset = PS3RemasterAssets::FindByRelativePath(scope + "level.viv::" + filename);
-  if (!asset)
-    asset = PS3RemasterAssets::FindByRelativePath(scope + filename);
-  if (!asset)
-    return;
-
   std::shared_ptr<StaticMesh> mesh;
   {
     std::scoped_lock lock(g_msh_cache_mutex);
-    if (auto it = g_msh_cache.find(Lower(asset->relative_path)); it != g_msh_cache.end())
-      mesh = it->second;
-    else if (auto it = g_msh_cache.find(filename); it != g_msh_cache.end())
+    if (auto it = g_msh_cache.find(filename); it != g_msh_cache.end())
       mesh = it->second;
   }
+
   if (!mesh)
   {
+    const auto* asset =
+        PS3RemasterAssets::FindByRelativePath(scope + "level.viv::" + filename);
+    if (!asset)
+      asset = PS3RemasterAssets::FindByRelativePath(scope + filename);
+    if (!asset && filename.ends_with(".msh"))
+    {
+      std::string alias = filename;
+      alias.replace(alias.size() - 4, 4, ".msf");
+      asset = PS3RemasterAssets::FindByRelativePath(scope + "level.viv::" + alias);
+      if (!asset)
+        asset = PS3RemasterAssets::FindByRelativePath(scope + alias);
+    }
+    if (!asset)
+      return;
+
     mesh = std::make_shared<StaticMesh>();
     mesh->source_name = asset->relative_path;
     if (!ParseMSHv8(PS3RemasterAssets::ReadBinary(*asset), mesh.get()) || !IsHostRenderable(*mesh))
       return;
     std::scoped_lock lock(g_msh_cache_mutex);
     g_msh_cache[filename] = mesh;
+    g_msh_cache[Lower(asset->filename)] = mesh;
     g_msh_cache[Lower(asset->relative_path)] = mesh;
   }
 
@@ -1964,7 +2015,7 @@ void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const
     if (register_logs++ < 32)
       std::fprintf(stderr,
                    "[moh-ps3-msh] LIVE EXACT MESH RESOURCE: level=%s gc=%s ps3=%s nodes=%zu submeshes=%zu registered=%zu base=%08x\n",
-                   level.c_str(), filename.c_str(), asset->relative_path.c_str(), nodes.size(),
+                   level.c_str(), filename.c_str(), mesh->source_name.c_str(), nodes.size(),
                    mesh->submeshes.size(), registered, address);
   }
 }
@@ -2322,6 +2373,19 @@ void PrepareDMFDraws()
 {
   std::scoped_lock lock(g_dmf_cache_mutex);
   // CPU level-load phase only. Prepared objects own every view used by the GPU.
+  std::unordered_map<std::string, std::size_t> material_draw_counts;
+  for (const auto& [signature, candidates] : g_dmf_display_list_candidates)
+  {
+    (void)signature;
+    for (const auto& candidate : candidates)
+    {
+      const std::string key = candidate.gc_name + "\n" +
+                              std::to_string(candidate.material_index) + "\n" +
+                              candidate.gc_material_name;
+      ++material_draw_counts[key];
+    }
+  }
+
   std::size_t draws = 0;
   for (auto& [signature, candidates] : g_dmf_display_list_candidates)
   {
@@ -2350,9 +2414,31 @@ void PrepareDMFDraws()
       prepared->readiness.geometry_valid = candidate.ps3 && candidate.ps3->decoded;
       prepared->readiness.palettes_valid = prepared->analysis.valid &&
           !prepared->analysis.ambiguous_triangles && !prepared->analysis.unmapped_triangles;
-      prepared->readiness.skeleton_valid = pair->second.bind && pair->second.bind->valid;
-      prepared->readiness.bind_valid = pair->second.bind_vertices_valid;
-      // PS3 bind validation alone does not establish GC conversion or whole-model coverage.
+      const bool direct_bind = candidate.ps3 && candidate.ps3->decoded &&
+          candidate.ps3->decoded->bind_tables_valid &&
+          candidate.ps3->decoded->inverse_bind_by_ref.size() ==
+              candidate.ps3->decoded->bone_refs.size();
+      // Runtime animation remains the GC/XF palette.  A PS3 SKL is useful for
+      // validation/diagnostics but is not required to undo PS3 model-bind space
+      // because the authoritative inverse-bind table is embedded in the DMF.
+      prepared->readiness.skeleton_valid =
+          direct_bind || (pair->second.bind && pair->second.bind->valid);
+      prepared->readiness.bind_valid = direct_bind || pair->second.bind_vertices_valid;
+
+      const std::string material_key = candidate.gc_name + "\n" +
+                                       std::to_string(candidate.material_index) + "\n" +
+                                       candidate.gc_material_name;
+      const auto count_it = material_draw_counts.find(material_key);
+      const std::size_t gc_draws =
+          count_it == material_draw_counts.end() ? 0 : count_it->second;
+      prepared->readiness.materials_valid =
+          gc_draws == 1 && prepared->analysis.compatible_ps3_materials == 1 &&
+          prepared->analysis.ps3_material_clusters == 1;
+      prepared->readiness.all_required_parts_mapped =
+          prepared->analysis.valid && prepared->analysis.total_triangles != 0 &&
+          prepared->analysis.selected_triangles == prepared->analysis.total_triangles &&
+          prepared->analysis.ambiguous_triangles == 0 &&
+          prepared->analysis.unmapped_triangles == 0;
       candidate.prepared = std::move(prepared);
       ++draws;
     }
@@ -2375,9 +2461,10 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   // full-palette proof below.  M1 is deliberately enabled here now that its
   // 0x0502 skin-group coefficients no longer make the decoder reject the file.
   static const bool replace = EnvSwitchLocal("MOH_PS3_DMF_REPLACE", true);
+  static const bool generic_exact = EnvSwitchLocal("MOH_PS3_DMF_GENERIC_EXACT", true);
   const auto& draw = g_current_dmf_draw;
   if (!replace || !draw.prepared || !draw.owner || !draw.owner->decoded ||
-      !IsSupportedPlayerWeaponDMF(draw.gc_name))
+      (!generic_exact && !IsSupportedPlayerWeaponDMF(draw.gc_name)))
     return {};
 
   const auto& ready = draw.prepared->readiness;
@@ -2493,7 +2580,17 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
     return {};
   };
 
+  // PS3 positions are model/bind-space. Use the inverse bind authored in THIS
+  // DMF by ref index; do not require a sibling SKL and never estimate offsets.
+  const auto& decoded = *draw.owner->decoded;
+  if (!decoded.bind_tables_valid ||
+      decoded.inverse_bind_by_ref.size() != decoded.bone_refs.size())
+    return matrix_reject("dmf-bind-table-unavailable", 0, 0xffffu, 0xffffu, -1);
+  const auto& inverse_bind_by_ref = decoded.inverse_bind_by_ref;
+
   std::vector<u8> matrix_indices(selected_cluster->positions.size());
+  std::vector<std::array<float, 12>> model_to_gc_local(draw.gc_palette_groups.size());
+  std::vector<bool> local_transform_ready(draw.gc_palette_groups.size(), false);
   for (std::size_t vertex = 0; vertex < selected_cluster->positions.size(); ++vertex)
   {
     const u16 local_slot = selected_cluster->vertex_palette_slots[vertex];
@@ -2521,6 +2618,62 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
     if (matrix_id > 255u)
       return matrix_reject("matrix-id-overflow", vertex, local_slot, ps3_group, gc_group);
     matrix_indices[vertex] = static_cast<u8>(matrix_id);
+
+    if (ps3_group >= draw.owner->decoded->skin_groups.size())
+      return matrix_reject("ps3-skin-group-out-of-range", vertex, local_slot, ps3_group,
+                           gc_group);
+
+    const auto& skin_group = draw.owner->decoded->skin_groups[ps3_group];
+    const float legacy_blend_q = skin_group.blend * 4096.0f;
+    if (!std::isfinite(legacy_blend_q))
+      return matrix_reject("nonfinite-bind-weight", vertex, local_slot, ps3_group, gc_group);
+
+    // Proven rigid endpoints only. 4096 is 100% bone_a (the M1
+    // Weapon/Bolt/Clip groups); 0 is 100% bone_b. Equal refs are rigid too.
+    // A genuinely blended group needs the game's exact CPart blend rule and
+    // stays GC instead of using guessed matrix math.
+    int rigid_ref = -1;
+    if (std::abs(legacy_blend_q - 4096.0f) <= 0.5f)
+      rigid_ref = skin_group.bone_a;
+    else if (std::abs(legacy_blend_q) <= 0.5f)
+      rigid_ref = skin_group.bone_b;
+    else if (skin_group.bone_a == skin_group.bone_b)
+      rigid_ref = skin_group.bone_a;
+    else
+      return matrix_reject("non-rigid-bind-group", vertex, local_slot, ps3_group, gc_group);
+
+    if (rigid_ref < 0 || static_cast<std::size_t>(rigid_ref) >= inverse_bind_by_ref.size())
+      return matrix_reject("bind-ref-out-of-range", vertex, local_slot, ps3_group, gc_group);
+
+    std::array<float, 12> inverse_bind{};
+    const auto& source_inverse = inverse_bind_by_ref[static_cast<std::size_t>(rigid_ref)];
+    for (std::size_t row = 0; row < 3; ++row)
+    {
+      for (std::size_t column = 0; column < 4; ++column)
+      {
+        const double value = source_inverse[row * 4 + column];
+        if (!std::isfinite(value) || std::abs(value) > 1000000.0)
+          return matrix_reject("invalid-inverse-bind", vertex, local_slot, ps3_group, gc_group);
+        inverse_bind[row * 4 + column] = static_cast<float>(value);
+      }
+    }
+
+    if (!local_transform_ready[matrix_slot])
+    {
+      model_to_gc_local[matrix_slot] = inverse_bind;
+      local_transform_ready[matrix_slot] = true;
+    }
+    else
+    {
+      // One GC matrix slot must represent one bind-local space. If two PS3
+      // groups collapse onto the same GC group but disagree, retain GC.
+      for (std::size_t element = 0; element < inverse_bind.size(); ++element)
+      {
+        if (std::abs(model_to_gc_local[matrix_slot][element] - inverse_bind[element]) >
+            1.0e-5f)
+          return matrix_reject("bind-space-conflict", vertex, local_slot, ps3_group, gc_group);
+      }
+    }
   }
 
   static std::unordered_set<std::string> logged_weapon_materials;
@@ -2542,10 +2695,25 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
                  draw.ps3_group_to_gc.size());
   }
 
+  static std::unordered_set<std::string> bind_local_logged;
+  if (bind_local_logged.insert(log_key).second)
+  {
+    const std::size_t ready_slots = static_cast<std::size_t>(
+        std::count(local_transform_ready.begin(), local_transform_ready.end(), true));
+    std::fprintf(stderr,
+                 "[moh-ps3-skin] BIND-LOCAL READY: gc=%.*s gc_material_index=%u "
+                 "ps3_material_index=%u material=%s slots=%zu/%zu | "
+                 "PS3 model-bind -> GC skin-group-local (authored inverse bind)\n",
+                 static_cast<int>(draw.gc_name.size()), draw.gc_name.data(), draw.material_index,
+                 analysis.ps3_material_index, draw.gc_material_name.data(), ready_slots,
+                 model_to_gc_local.size());
+  }
+
   SkinnedDrawReplacement replacement;
   replacement.owner = draw.owner;
   replacement.cluster = selected_cluster;
   replacement.position_matrix_indices = std::move(matrix_indices);
+  replacement.model_to_gc_local = std::move(model_to_gc_local);
   replacement.gc_material_draws = gc_material_draws;
   return replacement;
 }
@@ -2822,6 +2990,40 @@ bool DecodeDMF0502(std::span<const u8> bytes, DMFDecoded* out)
     if (name.empty())
       return false;
     out->bone_refs.push_back(name);
+  }
+
+  // The inverse-world bind matrices are authored inside the DMF immediately
+  // after the 6-byte-per-ref Euler table (16-byte aligned).  Decode them by
+  // DMF ref index so runtime replacement does not depend on finding a separate
+  // SKL just to undo model-bind space.  The file stores matrices transposed;
+  // convert them to row-major 4x4 like SkinBind::Binding does.
+  const u32 bind_angle_offset = BE32(bytes.data() + 0x50);
+  const std::size_t bind_angles_size = static_cast<std::size_t>(bone_count) * 6;
+  const std::size_t inverse_bind_offset =
+      (static_cast<std::size_t>(bind_angle_offset) + bind_angles_size + 15u) & ~std::size_t(15u);
+  if (bind_angle_offset <= bytes.size() && bind_angles_size <= bytes.size() - bind_angle_offset &&
+      inverse_bind_offset <= bytes.size() &&
+      static_cast<std::size_t>(bone_count) * 64 <= bytes.size() - inverse_bind_offset)
+  {
+    bool bind_ok = true;
+    out->inverse_bind_by_ref.resize(bone_count);
+    for (u32 ref = 0; ref < bone_count && bind_ok; ++ref)
+      for (std::size_t row = 0; row < 4 && bind_ok; ++row)
+        for (std::size_t column = 0; column < 4; ++column)
+        {
+          const float value = BEFloat(bytes.data() + inverse_bind_offset +
+                                      static_cast<std::size_t>(ref) * 64 +
+                                      (column * 4 + row) * 4);
+          if (!std::isfinite(value))
+          {
+            bind_ok = false;
+            break;
+          }
+          out->inverse_bind_by_ref[ref][row * 4 + column] = value;
+        }
+    out->bind_tables_valid = bind_ok;
+    if (!bind_ok)
+      out->inverse_bind_by_ref.clear();
   }
 
   out->skin_groups.reserve(group_count);

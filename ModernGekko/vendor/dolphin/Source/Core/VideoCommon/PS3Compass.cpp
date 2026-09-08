@@ -3,6 +3,7 @@
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/PS3WorldCPT.h"
+#include "VideoCommon/PS3WorldCPTRuntime.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 
@@ -4485,10 +4486,10 @@ FindAuto3D(const TextureInfo& info)
       info.GetData() &&
       info.GetTextureSize())
   {
-    if (auto world = PS3WorldCPT::Find(info))
+    if (auto world = PS3WorldCPTRuntime::Find(info))
       return world;
 
-    if (PS3WorldCPT::IsKnownWorldTexture(info))
+    if (PS3WorldCPTRuntime::IsKnownWorldTexture(info))
       return nullptr;
   }
 

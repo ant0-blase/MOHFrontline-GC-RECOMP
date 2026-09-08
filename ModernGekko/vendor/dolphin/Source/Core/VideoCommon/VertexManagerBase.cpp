@@ -2073,6 +2073,7 @@ void VertexManagerBase::RenderDrawCall(
                        cluster.positions.size() == cluster.normals.size() &&
                        cluster.positions.size() == cluster.uv0.size() &&
                        cluster.positions.size() == replacement.position_matrix_indices.size() &&
+                       !replacement.model_to_gc_local.empty() &&
                        !cluster.indices.empty() && (cluster.indices.size() % 3) == 0;
 
       for (std::size_t tex = 1; stream_ok && tex < decl.texcoords.size(); ++tex)
@@ -2111,6 +2112,19 @@ void VertexManagerBase::RenderDrawCall(
       {
         if (!stream_ok || (matrix_id % 3) != 0)
           break;
+        const std::size_t local_slot = matrix_id / 3u;
+        if (local_slot >= replacement.model_to_gc_local.size())
+        {
+          stream_ok = false;
+          break;
+        }
+        for (const float value : replacement.model_to_gc_local[local_slot])
+        {
+          if (!std::isfinite(value))
+            stream_ok = false;
+        }
+        if (!stream_ok)
+          break;
         const std::size_t base = std::size_t(matrix_id) * 4;
         if (base + 11 >= std::size(xfmem.posMatrices))
         {
@@ -2136,6 +2150,39 @@ void VertexManagerBase::RenderDrawCall(
         if (index >= cluster.positions.size())
           stream_ok = false;
 
+      // Validate the complete model-bind -> group-local conversion before
+      // ResetBuffer(). A failed PS3 conversion therefore leaves the original
+      // GC batch untouched and can still fall through safely.
+      for (std::size_t i = 0; stream_ok && i < cluster.positions.size(); ++i)
+      {
+        const u32 matrix_id = replacement.position_matrix_indices[i];
+        const std::size_t local_slot = matrix_id / 3u;
+        if (local_slot >= replacement.model_to_gc_local.size())
+        {
+          stream_ok = false;
+          break;
+        }
+        const auto& m = replacement.model_to_gc_local[local_slot];
+        const auto& p = cluster.positions[i];
+        const auto& n = cluster.normals[i];
+        std::array<float, 3> local_position{};
+        std::array<float, 3> local_normal{};
+        for (std::size_t row = 0; row < 3; ++row)
+        {
+          local_position[row] = m[row * 4 + 0] * p[0] + m[row * 4 + 1] * p[1] +
+                                m[row * 4 + 2] * p[2] + m[row * 4 + 3];
+          local_normal[row] = m[row * 4 + 0] * n[0] + m[row * 4 + 1] * n[1] +
+                              m[row * 4 + 2] * n[2];
+          if (!std::isfinite(local_position[row]) || !std::isfinite(local_normal[row]))
+            stream_ok = false;
+        }
+        const float normal_length = std::sqrt(local_normal[0] * local_normal[0] +
+                                              local_normal[1] * local_normal[1] +
+                                              local_normal[2] * local_normal[2]);
+        if (!std::isfinite(normal_length) || normal_length <= 1.0e-8f)
+          stream_ok = false;
+      }
+
       if (stream_ok)
       {
         const std::vector<u8> gc_template(gc_vertices.begin(),
@@ -2145,16 +2192,41 @@ void VertexManagerBase::RenderDrawCall(
         {
           u8* destination = m_cur_buffer_pointer;
           std::memcpy(destination, gc_template.data(), vertex_stride);
-          std::memcpy(destination + decl.position.offset, cluster.positions[i].data(),
+
+          const u32 matrix_id = replacement.position_matrix_indices[i];
+          const std::size_t local_slot = matrix_id / 3u;
+          const auto& model_to_local = replacement.model_to_gc_local[local_slot];
+          const auto& model_position = cluster.positions[i];
+          const auto& model_normal = cluster.normals[i];
+          std::array<float, 3> local_position{};
+          std::array<float, 3> local_normal{};
+          for (std::size_t row = 0; row < 3; ++row)
+          {
+            local_position[row] =
+                model_to_local[row * 4 + 0] * model_position[0] +
+                model_to_local[row * 4 + 1] * model_position[1] +
+                model_to_local[row * 4 + 2] * model_position[2] +
+                model_to_local[row * 4 + 3];
+            local_normal[row] =
+                model_to_local[row * 4 + 0] * model_normal[0] +
+                model_to_local[row * 4 + 1] * model_normal[1] +
+                model_to_local[row * 4 + 2] * model_normal[2];
+          }
+          const float normal_length = std::sqrt(local_normal[0] * local_normal[0] +
+                                                local_normal[1] * local_normal[1] +
+                                                local_normal[2] * local_normal[2]);
+          for (float& component : local_normal)
+            component /= normal_length;
+
+          std::memcpy(destination + decl.position.offset, local_position.data(),
                       sizeof(float) * 3);
-          std::memcpy(destination + decl.normals[0].offset, cluster.normals[i].data(),
+          std::memcpy(destination + decl.normals[0].offset, local_normal.data(),
                       sizeof(float) * 3);
           std::memcpy(destination + decl.texcoords[0].offset, cluster.uv0[i].data(),
                       sizeof(float) * 2);
 
           // PosMtx_ReadDirect_UByte expands the guest byte to a host u32 in the
           // portable vertex.  Reproduce that exact representation here.
-          const u32 matrix_id = replacement.position_matrix_indices[i];
           std::memcpy(destination + decl.posmtx.offset, &matrix_id, sizeof(matrix_id));
           m_cur_buffer_pointer += vertex_stride;
         }

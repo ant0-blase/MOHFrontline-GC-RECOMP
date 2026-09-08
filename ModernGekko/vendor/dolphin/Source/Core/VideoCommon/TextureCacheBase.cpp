@@ -4,6 +4,7 @@
 #include "VideoCommon/TextureCacheBase.h"
 #include "VideoCommon/PS3Compass.h"
 #include "VideoCommon/PS3WorldCPT.h"
+#include "VideoCommon/PS3WorldCPTRuntime.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1330,7 +1331,7 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
   const u64 ps3_draw_fast_key =
       PS3Compass::CurrentDrawMaterialKey(ps3_draw_texture_info);
   const u64 ps3_world_fast_key =
-      PS3WorldCPT::ReplacementKey(ps3_draw_texture_info);
+      PS3WorldCPTRuntime::ReplacementKey(ps3_draw_texture_info);
   const u64 ps3_expected_fast_key =
       ps3_draw_fast_key != 0 ? ps3_draw_fast_key : ps3_world_fast_key;
 
@@ -1398,7 +1399,7 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
 
   const u64 ps3_draw_material_key =
       PS3Compass::CurrentDrawMaterialKey(texture_info);
-  const u64 ps3_world_material_key = PS3WorldCPT::ReplacementKey(texture_info);
+  const u64 ps3_world_material_key = PS3WorldCPTRuntime::ReplacementKey(texture_info);
   const u64 ps3_expected_material_key =
       ps3_draw_material_key != 0 ? ps3_draw_material_key : ps3_world_material_key;
 
@@ -1730,7 +1731,7 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     PS3Compass::NotifyTextureUploaded(texture_info);
   if (ps3_compass && ps3_world_material_key != 0 &&
       ps3_material_key == ps3_world_material_key)
-    PS3WorldCPT::NotifyUploaded(texture_info);
+    PS3WorldCPTRuntime::NotifyUploaded(texture_info);
   entry->hires_texture = std::move(hires_texture);
   entry->last_load_time = load_time;
   entry->texture_info_name = std::move(texture_name);

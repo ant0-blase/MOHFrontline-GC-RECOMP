@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gmfe69_postgen import apply_gmfe69_generated_postgen, apply_gmfe69_export_postgen
+from gmfe69_hotstack_postgen import apply_gmfe69_hotstack_postgen
 from elf_symbols import (
     FunctionSymbol,
     extract_function_symbols,
@@ -1140,6 +1141,7 @@ def main() -> int:
             image.symbol_header = published_header
         if args.game_id == "GMFE69":
             apply_gmfe69_generated_postgen(generated)
+            apply_gmfe69_hotstack_postgen(generated)
         write_adapter(image, prefix)
         images.append(image)
 

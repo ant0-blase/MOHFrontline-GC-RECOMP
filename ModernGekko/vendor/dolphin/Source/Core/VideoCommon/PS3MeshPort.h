@@ -62,6 +62,11 @@ struct DMFDecoded
 {
   bool valid = false;
   std::vector<std::string> bone_refs;
+  // Authored PS3 DMF inverse-bind matrices, indexed directly by DMF bone-ref.
+  // These tables live in the DMF itself and therefore do not require a .skl
+  // just to convert model/bind-space vertices back to GC skin-group local space.
+  std::vector<std::array<float, 16>> inverse_bind_by_ref;
+  bool bind_tables_valid = false;
   std::vector<DMFSkinGroup> skin_groups;
   std::vector<DMFCluster> clusters;
   std::size_t total_vertices = 0;
@@ -165,12 +170,19 @@ struct SkinnedDrawReplacement
   std::shared_ptr<const DMFResource> owner;
   const DMFCluster* cluster = nullptr;
   std::vector<u8> position_matrix_indices;
+  // PS3 0x0502 DMF positions are stored in model bind space. Retail GC DMF
+  // display lists feed group-local positions to the live GX/XF skin matrix.
+  // One inverse-bind affine matrix per GC palette slot converts PS3 model-space
+  // vertices back into the exact local space expected by that GC matrix slot.
+  // UVs remain authored PS3 UV0 and are never modified here.
+  std::vector<std::array<float, 12>> model_to_gc_local;
   std::size_t gc_material_draws = 0;
 
   explicit operator bool() const
   {
     return owner != nullptr && cluster != nullptr &&
-           position_matrix_indices.size() == cluster->positions.size();
+           position_matrix_indices.size() == cluster->positions.size() &&
+           !model_to_gc_local.empty();
   }
 };
 
