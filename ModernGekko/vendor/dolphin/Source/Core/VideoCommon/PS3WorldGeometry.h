@@ -77,6 +77,12 @@ inline bool TraceEnabled()
   return enabled;
 }
 
+inline bool MaterialTraceEnabled()
+{
+  static const bool enabled = EnvSwitch("MOH_PS3_WORLD_MATERIAL_TRACE", false);
+  return enabled;
+}
+
 inline u16 BE16(const u8* p)
 {
   return static_cast<u16>((u16(p[0]) << 8) | u16(p[1]));
@@ -274,6 +280,344 @@ inline bool ParseDescriptor(std::span<const u8> bytes, std::size_t p, Descriptor
   return out->position != nullptr;
 }
 
+inline bool MaterialTokenChar(unsigned char c)
+{
+  return std::isalnum(c) || c == '_' || c == '-' || c == '.' || c == '/';
+}
+
+// Diagnostic-only material discovery. CPT world geometry is structurally
+// decoded now, but its material table is not yet understood. Preserve printable
+// identifiers immediately preceding a proven geometry descriptor so the next
+// bridge can correlate them with TPK/RSX resources without guessing offsets.
+inline std::vector<std::string> ProbeMaterialHints(std::span<const u8> bytes,
+                                                   const Descriptor& d)
+{
+  std::vector<std::string> out;
+  const std::size_t begin = d.source_offset > 0x180 ? d.source_offset - 0x180 : 0;
+  const std::size_t end = d.source_offset;
+  std::size_t p = begin;
+  while (p < end)
+  {
+    while (p < end && !MaterialTokenChar(bytes[p]))
+      ++p;
+    const std::size_t token_begin = p;
+    bool has_alpha = false;
+    while (p < end && MaterialTokenChar(bytes[p]))
+    {
+      has_alpha |= std::isalpha(bytes[p]) != 0;
+      ++p;
+    }
+    const std::size_t length = p - token_begin;
+    if (!has_alpha || length < 3 || length > 48)
+      continue;
+    std::string token(reinterpret_cast<const char*>(bytes.data() + token_begin), length);
+    if (std::find(out.begin(), out.end(), token) == out.end())
+      out.push_back(std::move(token));
+    if (out.size() >= 12)
+      break;
+  }
+  return out;
+}
+
+inline void TraceMaterialProbe(std::span<const u8> bytes, const Descriptor& d,
+                               const StaticMesh& mesh)
+{
+  if (!MaterialTraceEnabled())
+    return;
+  static unsigned logs = 0;
+  if (logs++ >= 256)
+    return;
+
+  const auto word_before = [&](std::size_t distance) -> u32 {
+    return d.source_offset >= distance ? BE32(bytes.data() + d.source_offset - distance) : 0;
+  };
+  const u8 b10 = d.source_offset + 10 < bytes.size() ? bytes[d.source_offset + 10] : 0;
+  const u8 b11 = d.source_offset + 11 < bytes.size() ? bytes[d.source_offset + 11] : 0;
+  std::fprintf(stderr,
+               "[moh-ps3-world-mat] desc=%s off=0x%zX pre=%08X/%08X/%08X/%08X bytes10-11=%02X/%02X hints=",
+               mesh.source_name.c_str(), d.source_offset, word_before(16), word_before(12),
+               word_before(8), word_before(4), b10, b11);
+  const auto& hints = mesh.submeshes.front().material_hints;
+  if (hints.empty())
+  {
+    std::fputs("<none>", stderr);
+  }
+  else
+  {
+    for (std::size_t i = 0; i < hints.size(); ++i)
+      std::fprintf(stderr, "%s%s", i ? "," : "", hints[i].c_str());
+  }
+  std::fputc('\n', stderr);
+}
+
+
+struct CPTHeaderTable
+{
+  u32 offset = 0;
+  u32 count = 0;
+  std::size_t span = 0;
+  std::size_t record_size = 0;
+  std::size_t remainder = 0;
+  bool valid = false;
+};
+
+inline std::vector<std::string> ExtractRecordTokens(std::span<const u8> record,
+                                                    std::size_t max_tokens = 12)
+{
+  std::vector<std::string> out;
+  std::size_t p = 0;
+  while (p < record.size())
+  {
+    while (p < record.size() && !MaterialTokenChar(record[p]))
+      ++p;
+    const std::size_t begin = p;
+    bool has_alpha = false;
+    while (p < record.size() && MaterialTokenChar(record[p]))
+    {
+      has_alpha |= std::isalpha(record[p]) != 0;
+      ++p;
+    }
+    const std::size_t len = p - begin;
+    if (!has_alpha || len < 3 || len > 64)
+      continue;
+    std::string token(reinterpret_cast<const char*>(record.data() + begin), len);
+    if (std::find(out.begin(), out.end(), token) == out.end())
+      out.push_back(std::move(token));
+    if (out.size() >= max_tokens)
+      break;
+  }
+  return out;
+}
+
+inline std::array<CPTHeaderTable, 4> DescribeCPTHeaderTables(std::span<const u8> bytes)
+{
+  std::array<CPTHeaderTable, 4> tables{};
+  if (bytes.size() < 0x30)
+    return tables;
+
+  for (std::size_t i = 0; i < tables.size(); ++i)
+  {
+    const std::size_t pair = 0x10 + i * 8;
+    tables[i].offset = BE32(bytes.data() + pair);
+    tables[i].count = BE32(bytes.data() + pair + 4);
+    if (!tables[i].offset || !tables[i].count || tables[i].offset >= bytes.size())
+      continue;
+
+    std::size_t boundary = bytes.size();
+    for (std::size_t j = 0; j < tables.size(); ++j)
+    {
+      if (i == j)
+        continue;
+      const std::size_t other_pair = 0x10 + j * 8;
+      const u32 other_offset = BE32(bytes.data() + other_pair);
+      if (other_offset > tables[i].offset && other_offset < boundary)
+        boundary = other_offset;
+    }
+    if (boundary <= tables[i].offset)
+      continue;
+
+    tables[i].span = boundary - tables[i].offset;
+    tables[i].record_size = tables[i].span / tables[i].count;
+    tables[i].remainder = tables[i].span % tables[i].count;
+    tables[i].valid = tables[i].record_size != 0;
+  }
+  return tables;
+}
+
+struct CPTDescriptorLink
+{
+  bool valid = false;
+  std::size_t link_record = 0;
+  std::size_t node_record = 0;
+  std::size_t material_table = 0;
+  std::size_t material_record = 0;
+  u32 node_offset = 0;
+  u32 material_offset = 0;
+  u32 descriptor_offset = 0;
+  u32 word1 = 0;
+  u32 word4 = 0;
+};
+
+inline bool ResolveCPTDescriptorLink(std::span<const u8> bytes, std::size_t descriptor_offset,
+                                     CPTDescriptorLink* out)
+{
+  if (!out || descriptor_offset > std::numeric_limits<u32>::max())
+    return false;
+
+  const auto tables = DescribeCPTHeaderTables(bytes);
+  const auto& links = tables[2];
+  const auto& nodes = tables[3];
+  if (!links.valid || !links.offset || !links.count || !nodes.valid || !nodes.offset ||
+      !nodes.count)
+    return false;
+
+  // v9.7 proved TABLE2 is a fixed 0x14-byte pointer record table.  The
+  // apparent 0x18/0x1c sizes in one-record chunks are only inter-table padding.
+  constexpr std::size_t LINK_RECORD_SIZE = 0x14;
+  constexpr std::size_t MATERIAL_RECORD_SIZE = 0x94;
+  constexpr std::size_t NODE_RECORD_SIZE = 0x70;
+  if (std::size_t(links.count) > (bytes.size() - links.offset) / LINK_RECORD_SIZE)
+    return false;
+
+  const auto exact_record = [&](const CPTHeaderTable& table, u32 offset,
+                                std::size_t stride, std::size_t* record) {
+    if (!table.valid || !table.offset || !table.count || offset < table.offset)
+      return false;
+    const std::size_t delta = std::size_t(offset) - table.offset;
+    if ((delta % stride) != 0)
+      return false;
+    const std::size_t index = delta / stride;
+    if (index >= table.count || std::size_t(offset) > bytes.size() ||
+        stride > bytes.size() - std::size_t(offset))
+      return false;
+    if (record)
+      *record = index;
+    return true;
+  };
+
+  for (std::size_t record = 0; record < links.count; ++record)
+  {
+    const std::size_t off = std::size_t(links.offset) + record * LINK_RECORD_SIZE;
+    if (off > bytes.size() || LINK_RECORD_SIZE > bytes.size() - off)
+      break;
+    const u32 w0 = BE32(bytes.data() + off);
+    const u32 w1 = BE32(bytes.data() + off + 4);
+    const u32 w2 = BE32(bytes.data() + off + 8);
+    const u32 w3 = BE32(bytes.data() + off + 12);
+    const u32 w4 = BE32(bytes.data() + off + 16);
+    if (w3 != static_cast<u32>(descriptor_offset))
+      continue;
+
+    std::size_t node_record = 0;
+    if (!exact_record(nodes, w0, NODE_RECORD_SIZE, &node_record))
+      continue;
+
+    std::size_t material_table = 0;
+    std::size_t material_record = 0;
+    bool material_ok = false;
+    for (std::size_t table_index = 0; table_index < 2; ++table_index)
+    {
+      if (exact_record(tables[table_index], w2, MATERIAL_RECORD_SIZE, &material_record))
+      {
+        material_table = table_index;
+        material_ok = true;
+        break;
+      }
+    }
+    if (!material_ok)
+      continue;
+
+    out->valid = true;
+    out->link_record = record;
+    out->node_record = node_record;
+    out->material_table = material_table;
+    out->material_record = material_record;
+    out->node_offset = w0;
+    out->material_offset = w2;
+    out->descriptor_offset = w3;
+    out->word1 = w1;
+    out->word4 = w4;
+    return true;
+  }
+  return false;
+}
+
+inline void AttachCPTDescriptorLink(Submesh* submesh, const CPTDescriptorLink& link)
+{
+  if (!submesh || !link.valid)
+    return;
+  submesh->material_hints.clear();
+  submesh->material_hints.push_back(
+      "@cpt-link=" + std::to_string(link.link_record) +
+      ";node=" + std::to_string(link.node_record) +
+      ";mat=" + std::to_string(link.material_table) + ":" +
+      std::to_string(link.material_record) +
+      ";desc=" + std::to_string(link.descriptor_offset) +
+      ";w1=" + std::to_string(link.word1) +
+      ";w4=" + std::to_string(link.word4));
+}
+
+inline void TraceExactCPTDescriptorLink(std::span<const u8> bytes, const AssetInfo& cpt,
+                                        const Descriptor& d, const CPTDescriptorLink& link)
+{
+  if (!MaterialTraceEnabled() || !link.valid)
+    return;
+
+  static unsigned link_logs = 0;
+  if (link_logs < 256)
+  {
+    ++link_logs;
+    std::fprintf(stderr,
+                 "[moh-ps3-world-mat] EXACT LINK: source=%s desc=0x%zX link=%zu node=%zu@0x%08X mat=%zu:%zu@0x%08X w1=%08X w4=%08X\n",
+                 cpt.relative_path.c_str(), d.source_offset, link.link_record,
+                 link.node_record, link.node_offset, link.material_table,
+                 link.material_record, link.material_offset, link.word1, link.word4);
+  }
+
+  // Dump full records only once per exact pointer target.  This keeps the log
+  // useful while exposing enough structure to identify PS3 texture/sampler
+  // fields and the NODE70 affine transform in the next bridge.
+  static std::unordered_set<std::string> dumped_materials;
+  static std::unordered_set<std::string> dumped_nodes;
+  static unsigned material_dumps = 0;
+  static unsigned node_dumps = 0;
+
+  const std::string material_key = cpt.relative_path + "#" + std::to_string(link.material_offset);
+  if (material_dumps < 96 && dumped_materials.insert(material_key).second &&
+      std::size_t(link.material_offset) <= bytes.size() &&
+      0x94 <= bytes.size() - std::size_t(link.material_offset))
+  {
+    ++material_dumps;
+    std::fprintf(stderr,
+                 "[moh-ps3-world-mat] MAT94 EXACT: source=%s mat=%zu:%zu off=0x%08X words=",
+                 cpt.relative_path.c_str(), link.material_table, link.material_record,
+                 link.material_offset);
+    for (std::size_t off = 0; off < 0x94; off += 4)
+      std::fprintf(stderr, "%s%08X", off ? "/" : "", BE32(bytes.data() + link.material_offset + off));
+    std::fputc('\n', stderr);
+  }
+
+  const std::string node_key = cpt.relative_path + "#" + std::to_string(link.node_offset);
+  if (node_dumps < 96 && dumped_nodes.insert(node_key).second &&
+      std::size_t(link.node_offset) <= bytes.size() &&
+      0x70 <= bytes.size() - std::size_t(link.node_offset))
+  {
+    ++node_dumps;
+    std::fprintf(stderr,
+                 "[moh-ps3-world-mat] NODE70 EXACT: source=%s node=%zu off=0x%08X words=",
+                 cpt.relative_path.c_str(), link.node_record, link.node_offset);
+    for (std::size_t off = 0; off < 0x70; off += 4)
+      std::fprintf(stderr, "%s%08X", off ? "/" : "", BE32(bytes.data() + link.node_offset + off));
+    std::fputc('\n', stderr);
+  }
+}
+
+inline void TraceCPTHeaderTables(std::span<const u8> bytes, const AssetInfo& cpt)
+{
+  if (!MaterialTraceEnabled())
+    return;
+
+  const auto tables = DescribeCPTHeaderTables(bytes);
+  for (std::size_t i = 0; i < tables.size(); ++i)
+  {
+    const auto& t = tables[i];
+    const bool exact_material = i < 2 && t.valid && t.record_size == 0x94;
+    const bool fixed_link = i == 2 && t.valid && t.offset && t.count &&
+                            std::size_t(t.count) <= (bytes.size() - t.offset) / 0x14;
+    const bool exact_node = i == 3 && t.valid && t.record_size == 0x70;
+    std::fprintf(stderr,
+                 "[moh-ps3-world-mat] TABLE%zu: source=%s off=0x%08X count=%u span=0x%zX rec=0x%zX rem=%zu%s\n",
+                 i, cpt.relative_path.c_str(), t.offset, t.count, t.span, t.record_size,
+                 t.remainder,
+                 exact_material ? " [material 0x94]" :
+                 fixed_link ? " [link 0x14 + tail padding]" :
+                 exact_node ? " [node 0x70]" : "");
+  }
+  std::fprintf(stderr,
+               "[moh-ps3-world-mat] POINTER GRAPH: source=%s TABLE2.W3=descriptor TABLE2.W2=MAT94 TABLE2.W0=NODE70 | exact-link decode enabled\n",
+               cpt.relative_path.c_str());
+}
+
 inline bool QuickProbe(const Descriptor& d, std::span<const u8> vertices,
                        std::span<const u8> index_bytes)
 {
@@ -444,6 +788,17 @@ inline std::vector<std::shared_ptr<StaticMesh>> Decode(const AssetInfo& cpt, Dec
   if (bytes.size() < 32)
     return meshes;
 
+  if (MaterialTraceEnabled())
+  {
+    std::fprintf(stderr, "[moh-ps3-world-mat] CPT HEADER: %s size=%zu words=",
+                 cpt.relative_path.c_str(), bytes.size());
+    const std::size_t words = std::min<std::size_t>(22, bytes.size() / 4);
+    for (std::size_t i = 0; i < words; ++i)
+      std::fprintf(stderr, "%s%08X", i ? "," : "", BE32(bytes.data() + i * 4));
+    std::fputc('\n', stderr);
+    TraceCPTHeaderTables(bytes, cpt);
+  }
+
   DecodeStats local;
   std::unordered_set<u64> accepted_keys;
   constexpr std::size_t MAX_DESCRIPTORS = 256;
@@ -542,6 +897,20 @@ inline std::vector<std::shared_ptr<StaticMesh>> Decode(const AssetInfo& cpt, Dec
     {
       ++local.rejected;
       continue;
+    }
+
+    CPTDescriptorLink descriptor_link;
+    if (ResolveCPTDescriptorLink(bytes, d.source_offset, &descriptor_link))
+    {
+      AttachCPTDescriptorLink(&decoded->submeshes.front(), descriptor_link);
+      TraceExactCPTDescriptorLink(bytes, cpt, d, descriptor_link);
+    }
+    else
+    {
+      // Keep the old diagnostic fallback only for descriptors that are not
+      // present in the exact TABLE2 pointer graph.
+      decoded->submeshes.front().material_hints = ProbeMaterialHints(bytes, d);
+      TraceMaterialProbe(bytes, d, *decoded);
     }
 
     const Submesh& sub = decoded->submeshes.front();

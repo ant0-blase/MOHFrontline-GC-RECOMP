@@ -1,0 +1,204 @@
+#include "VideoCommon/MOHFrontline/Engine/Renderer/NativeRenderBridge.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+
+#include "VideoCommon/PS3MeshPort.h"
+
+namespace MOHFrontline::NativeRender
+{
+namespace
+{
+std::mutex s_mutex;
+Submitter s_submitter = nullptr;
+void* s_userdata = nullptr;
+
+std::string Lower(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+bool BuildStatic(DrawPacket* out)
+{
+  const auto& current = PS3MeshPort::CurrentStaticDraw();
+  if (!current || !current.submesh)
+    return false;
+
+  const auto& sub = *current.submesh;
+  if (sub.position_uv.size() != sub.vertex_count || sub.indices.empty())
+    return false;
+
+  DrawPacket packet;
+  packet.skinned = false;
+  packet.source_name =
+      current.mesh && !current.mesh->source_name.empty() ? current.mesh->source_name : "PS3-MSH";
+  if (!sub.material_hints.empty())
+    packet.material_name = sub.material_hints.front();
+
+  packet.vertices.reserve(sub.position_uv.size());
+  for (const auto& source : sub.position_uv)
+  {
+    Vertex vertex;
+    vertex.position = source.position;
+    vertex.normal = source.normal;
+    vertex.uv0 = source.uv0;
+    packet.vertices.push_back(vertex);
+  }
+
+  packet.indices.reserve(sub.indices.size());
+  for (u16 index : sub.indices)
+  {
+    if (index >= packet.vertices.size())
+      return false;
+    packet.indices.push_back(index);
+  }
+
+  *out = std::move(packet);
+  return true;
+}
+
+bool BuildSkinned(DrawPacket* out)
+{
+  const auto context = PS3MeshPort::CurrentSkinnedDraw();
+  if (!context)
+    return false;
+
+  const auto replacement = PS3MeshPort::BuildCurrentSkinnedReplacement();
+  if (!replacement || !replacement.cluster)
+    return false;
+
+  const auto& cluster = *replacement.cluster;
+  if (cluster.positions.empty() || cluster.indices.empty() ||
+      replacement.position_matrix_indices.size() != cluster.positions.size())
+    return false;
+
+  DrawPacket packet;
+  packet.skinned = true;
+  packet.source_name =
+      replacement.owner ? replacement.owner->source_name : std::string("PS3-DMF");
+  packet.material_name = cluster.material_name;
+  packet.model_to_gc_local = replacement.model_to_gc_local;
+  packet.vertices.resize(cluster.positions.size());
+
+  for (std::size_t i = 0; i < packet.vertices.size(); ++i)
+  {
+    packet.vertices[i].position = cluster.positions[i];
+    if (i < cluster.normals.size())
+      packet.vertices[i].normal = cluster.normals[i];
+    if (i < cluster.uv0.size())
+      packet.vertices[i].uv0 = cluster.uv0[i];
+    packet.vertices[i].matrix_index = replacement.position_matrix_indices[i];
+  }
+
+  packet.indices.reserve(cluster.indices.size());
+  for (u16 index : cluster.indices)
+  {
+    if (index >= packet.vertices.size())
+      return false;
+    packet.indices.push_back(index);
+  }
+
+  *out = std::move(packet);
+  return true;
+}
+}  // namespace
+
+Mode GetMode()
+{
+  const char* value = std::getenv("MOH_NATIVE_RENDER");
+  if (!value || !*value)
+    return Mode::Off;
+
+  const std::string v = Lower(value);
+  if (v == "shadow" || v == "capture" || v == "probe")
+    return Mode::Shadow;
+  if (v == "native" || v == "prefer" || v == "prefer-native" || v == "prefer_native")
+    return Mode::PreferNative;
+  return Mode::Off;
+}
+
+const char* ModeName(Mode mode)
+{
+  switch (mode)
+  {
+  case Mode::Shadow: return "shadow";
+  case Mode::PreferNative: return "prefer-native";
+  default: return "off";
+  }
+}
+
+void SetSubmitter(Submitter submitter, void* userdata)
+{
+  std::scoped_lock lock(s_mutex);
+  s_submitter = submitter;
+  s_userdata = userdata;
+}
+
+bool HasSubmitter()
+{
+  std::scoped_lock lock(s_mutex);
+  return s_submitter != nullptr;
+}
+
+bool BuildCurrentDraw(DrawPacket* out)
+{
+  if (!out)
+    return false;
+
+  if (BuildStatic(out))
+    return true;
+  return BuildSkinned(out);
+}
+
+bool TrySubmitCurrentDraw()
+{
+  const Mode mode = GetMode();
+  if (mode == Mode::Off)
+    return false;
+
+  Submitter submitter = nullptr;
+  void* userdata = nullptr;
+  {
+    std::scoped_lock lock(s_mutex);
+    submitter = s_submitter;
+    userdata = s_userdata;
+  }
+
+  if (!submitter)
+  {
+    static bool logged = false;
+    if (!logged)
+    {
+      logged = true;
+      std::fprintf(stderr,
+                   "[moh-native-render] mode=%s, no native backend registered -> GX fallback\n",
+                   ModeName(mode));
+    }
+    return false;
+  }
+
+  DrawPacket packet;
+  if (!BuildCurrentDraw(&packet))
+    return false;
+
+  const bool accepted = submitter(packet, userdata);
+
+  static unsigned logs = 0;
+  if (logs++ < 128)
+  {
+    std::fprintf(stderr,
+                 "[moh-native-render] %s source=%s material=%s vertices=%zu indices=%zu accepted=%d\n",
+                 packet.skinned ? "DMF" : "MSH", packet.source_name.c_str(),
+                 packet.material_name.c_str(), packet.vertices.size(), packet.indices.size(),
+                 accepted ? 1 : 0);
+  }
+
+  return mode == Mode::PreferNative && accepted;
+}
+}  // namespace MOHFrontline::NativeRender

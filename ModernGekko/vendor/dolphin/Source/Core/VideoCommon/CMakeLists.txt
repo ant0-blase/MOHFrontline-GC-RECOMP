@@ -135,6 +135,12 @@ add_library(videocommon
   MOHFrontline/Assets/PS3/Formats/MSH.cpp
   PS3MeshPort.cpp
   PS3AssetPort.cpp
+  MOHFrontline/Engine/Filesystem/NativeVFS.cpp
+  MOHFrontline/Engine/Filesystem/NativeVFS.h
+  MOHFrontline/Engine/Audio/NativeAudio.cpp
+  MOHFrontline/Engine/Audio/NativeAudio.h
+  MOHFrontline/Engine/Renderer/NativeRenderBridge.cpp
+  MOHFrontline/Engine/Renderer/NativeRenderBridge.h
   PS3Compass.cpp
   PS3Compass.h
   PS3TextureDecoder.cpp
@@ -285,6 +291,7 @@ else()
 endif()
 
 if(FFmpeg_FOUND)
+  target_compile_definitions(videocommon PRIVATE MOH_NATIVE_AUDIO_FFMPEG=1)
   target_sources(videocommon PRIVATE
     FrameDumpFFMpeg.cpp
   )

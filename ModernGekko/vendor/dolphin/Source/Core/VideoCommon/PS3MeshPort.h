@@ -109,6 +109,20 @@ struct SkinnedPaletteAnalysis
   // bridge resolves a PS3 material slot by exact skin-palette identity and
   // records the winning PS3 index here; 0xffffffff means unresolved.
   u32 ps3_material_index = 0xffffffffu;
+  // Global ordinal in DMFDecoded::clusters for a structurally proven
+  // GC material-cluster -> PS3 cluster match.  This is separate from
+  // material_index because remaster material tables are platform-local.
+  u32 ps3_cluster_ordinal = 0xffffffffu;
+  bool exact_cluster_identity = false;
+
+  // v12: the PS3 material can be split into a completely different number
+  // of clusters from the GC material. In that case all PS3 triangles are
+  // partitioned exactly once across the authored GC DLs by:
+  //   * exact material identity;
+  //   * exact total triangle count;
+  //   * PS3 skin-group -> GC skin-group compatibility;
+  //   * exact per-GC-DL triangle quota.
+  bool exact_triangle_partition = false;
   std::size_t ps3_material_candidates = 0;
   std::size_t compatible_ps3_materials = 0;
   std::size_t ps3_material_clusters = 0;
@@ -176,13 +190,19 @@ struct SkinnedDrawReplacement
   // vertices back into the exact local space expected by that GC matrix slot.
   // UVs remain authored PS3 UV0 and are never modified here.
   std::vector<std::array<float, 12>> model_to_gc_local;
+  // Non-rigid skin groups are not orthonormal.  Positions use inverse(group
+  // bind), while normals require transpose(group bind).  Keep the normal
+  // transform separate so generic two-bone groups do not inherit the rigid
+  // weapon shortcut.
+  std::vector<std::array<float, 9>> model_to_gc_local_normal;
   std::size_t gc_material_draws = 0;
 
   explicit operator bool() const
   {
     return owner != nullptr && cluster != nullptr &&
            position_matrix_indices.size() == cluster->positions.size() &&
-           !model_to_gc_local.empty();
+           !model_to_gc_local.empty() &&
+           model_to_gc_local_normal.size() == model_to_gc_local.size();
   }
 };
 
@@ -237,6 +257,12 @@ struct StaticDrawMatch
   bool bounds_valid = false;
   std::array<float, 3> bounds_min{}, bounds_max{};
 
+  // v9.3 world-CPT local-origin bridge.  Some PS3 CPT clusters keep the same
+  // authored shape/scale as the GC batch but use a different local origin.
+  // Only strict centered-bounds matches set this translation.
+  bool world_translation_valid = false;
+  std::array<float, 3> world_translation{};
+
   explicit operator bool() const { return mesh != nullptr && submesh != nullptr; }
 };
 
@@ -252,6 +278,7 @@ bool IsStaticBootstrapEnabled();
 SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette();
 SkinnedDrawReplacement BuildCurrentSkinnedReplacement();
 void NotifyStaticDrawSubmitted();
+void RejectStaticDrawCandidate();
 void NotifySkinnedDrawSubmitted(const SkinnedDrawReplacement& replacement);
 void PrintDrawStatistics();
 
@@ -259,7 +286,8 @@ bool IsStaticDrawReplacementEnabled();
 StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices,
                                 u32 gc_vertex_count,
                                 u32 gc_vertex_stride,
-                                u32 gc_position_offset);
+                                u32 gc_position_offset,
+                                u32 gc_triangle_count = 0);
 
 bool ParseMSHv8(std::span<const u8> bytes, StaticMesh* out);
 DMFInfo InspectDMF(std::span<const u8> bytes);

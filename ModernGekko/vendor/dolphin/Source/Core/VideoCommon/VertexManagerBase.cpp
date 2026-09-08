@@ -41,6 +41,7 @@
 #include "VideoCommon/PerfQueryBase.h"
 #include "VideoCommon/PixelShaderGen.h"
 #include "VideoCommon/PS3MeshPort.h"
+#include "VideoCommon/MOHFrontline/Engine/Renderer/NativeRenderBridge.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/TextureCacheBase.h"
@@ -589,6 +590,9 @@ void VertexManagerBase::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 ba
   {
     g_bounding_box->Flush();
   }
+
+  if (MOHFrontline::NativeRender::TrySubmitCurrentDraw())
+    return;
 
   g_gfx->DrawIndexed(base_index, num_indices, base_vertex);
 }
@@ -2074,6 +2078,8 @@ void VertexManagerBase::RenderDrawCall(
                        cluster.positions.size() == cluster.uv0.size() &&
                        cluster.positions.size() == replacement.position_matrix_indices.size() &&
                        !replacement.model_to_gc_local.empty() &&
+                       replacement.model_to_gc_local_normal.size() ==
+                           replacement.model_to_gc_local.size() &&
                        !cluster.indices.empty() && (cluster.indices.size() % 3) == 0;
 
       for (std::size_t tex = 1; stream_ok && tex < decl.texcoords.size(); ++tex)
@@ -2123,6 +2129,12 @@ void VertexManagerBase::RenderDrawCall(
           if (!std::isfinite(value))
             stream_ok = false;
         }
+        if (local_slot >= replacement.model_to_gc_local_normal.size())
+          stream_ok = false;
+        else
+          for (const float value : replacement.model_to_gc_local_normal[local_slot])
+            if (!std::isfinite(value))
+              stream_ok = false;
         if (!stream_ok)
           break;
         const std::size_t base = std::size_t(matrix_id) * 4;
@@ -2163,6 +2175,7 @@ void VertexManagerBase::RenderDrawCall(
           break;
         }
         const auto& m = replacement.model_to_gc_local[local_slot];
+        const auto& normal_m = replacement.model_to_gc_local_normal[local_slot];
         const auto& p = cluster.positions[i];
         const auto& n = cluster.normals[i];
         std::array<float, 3> local_position{};
@@ -2171,8 +2184,9 @@ void VertexManagerBase::RenderDrawCall(
         {
           local_position[row] = m[row * 4 + 0] * p[0] + m[row * 4 + 1] * p[1] +
                                 m[row * 4 + 2] * p[2] + m[row * 4 + 3];
-          local_normal[row] = m[row * 4 + 0] * n[0] + m[row * 4 + 1] * n[1] +
-                              m[row * 4 + 2] * n[2];
+          local_normal[row] = normal_m[row * 3 + 0] * n[0] +
+                              normal_m[row * 3 + 1] * n[1] +
+                              normal_m[row * 3 + 2] * n[2];
           if (!std::isfinite(local_position[row]) || !std::isfinite(local_normal[row]))
             stream_ok = false;
         }
@@ -2196,6 +2210,8 @@ void VertexManagerBase::RenderDrawCall(
           const u32 matrix_id = replacement.position_matrix_indices[i];
           const std::size_t local_slot = matrix_id / 3u;
           const auto& model_to_local = replacement.model_to_gc_local[local_slot];
+          const auto& normal_to_local =
+              replacement.model_to_gc_local_normal[local_slot];
           const auto& model_position = cluster.positions[i];
           const auto& model_normal = cluster.normals[i];
           std::array<float, 3> local_position{};
@@ -2208,9 +2224,9 @@ void VertexManagerBase::RenderDrawCall(
                 model_to_local[row * 4 + 2] * model_position[2] +
                 model_to_local[row * 4 + 3];
             local_normal[row] =
-                model_to_local[row * 4 + 0] * model_normal[0] +
-                model_to_local[row * 4 + 1] * model_normal[1] +
-                model_to_local[row * 4 + 2] * model_normal[2];
+                normal_to_local[row * 3 + 0] * model_normal[0] +
+                normal_to_local[row * 3 + 1] * model_normal[1] +
+                normal_to_local[row * 3 + 2] * model_normal[2];
           }
           const float normal_length = std::sqrt(local_normal[0] * local_normal[0] +
                                                 local_normal[1] * local_normal[1] +
@@ -2319,13 +2335,34 @@ void VertexManagerBase::RenderDrawCall(
                      gc_vertex_count, vertex_stride, g_backend_info.bSupportsPrimitiveRestart ? 1 : 0);
       }
       const std::span<const u8> gc_vertices(m_base_buffer_pointer, gc_vertex_bytes);
+
+      // The IndexGenerator has already converted every GX triangle primitive to
+      // the backend topology.  Recover the number of authored triangles from
+      // that generated stream so direct world CPT matching has a topology check
+      // instead of relying on AABB equality alone.
+      const u32 gc_index_count = m_index_generator.GetIndexLen();
+      u32 gc_triangle_count = 0;
+      if (g_backend_info.bSupportsPrimitiveRestart &&
+          primitive_type == PrimitiveType::TriangleStrip && gc_index_count >= gc_vertex_count)
+      {
+        const u32 restart_count = gc_index_count - gc_vertex_count;
+        if (restart_count <= gc_vertex_count / 2)
+          gc_triangle_count = gc_vertex_count - restart_count * 2;
+      }
+      else if (primitive_type == PrimitiveType::Triangles)
+      {
+        gc_triangle_count = gc_index_count / 3;
+      }
+
       const auto match =
           PS3MeshPort::MatchStaticDraw(gc_vertices, gc_vertex_count, vertex_stride,
-                                       static_cast<u32>(decl.position.offset));
+                                       static_cast<u32>(decl.position.offset), gc_triangle_count);
 
       if (match)
       {
         const PS3MeshPort::Submesh& submesh = *match.submesh;
+        const bool world_cpt_match =
+            match.mesh && match.mesh->source_name.find(".cpt#cpt-") != std::string::npos;
 
         auto attribute_is_float = [vertex_stride](const AttributeFormat& attribute,
                                                   int minimum_components) {
@@ -2355,20 +2392,43 @@ void VertexManagerBase::RenderDrawCall(
             (!decl.texcoords[0].enable || submesh.has_uv0) &&
             (!decl.texcoords[1].enable || submesh.has_uv1);
 
-        // Preserve GC constant tint, but do not broadcast an authored varying
-        // vertex-color field onto an unrelated PS3 vertex ordering.
+        const bool base_stream_ok = stream_ok;
+        bool color_layout_ok = true;
+        bool color_constant = true;
+
+        // Ordinary MSH replacement still requires constant GC colors.  World
+        // CPT is different: its PS3 vertex ordering cannot preserve a varying
+        // GC color stream yet, but refusing the draw entirely prevented any CPT
+        // geometry from reaching the renderer.  For the strict direct CPT path
+        // only, keep the first GC color/tint as the template until the PS3 color
+        // semantic is decoded. Invalid color declarations still hard-fail.
         for (const auto& color : decl.colors)
         {
-          if (!stream_ok || !color.enable) continue;
+          if (!stream_ok || !color.enable)
+            continue;
           const std::size_t bytes = std::size_t(GetElementSize(color.type)) * color.components;
           if (color.offset < 0 || std::size_t(color.offset) + bytes > vertex_stride)
-          { stream_ok = false; break; }
+          {
+            color_layout_ok = false;
+            stream_ok = false;
+            break;
+          }
           for (u32 i = 1; i < gc_vertex_count; ++i)
+          {
             if (std::memcmp(gc_vertices.data() + color.offset,
-                            gc_vertices.data() + std::size_t(i) * vertex_stride + color.offset, bytes))
-            { stream_ok = false; break; }
+                            gc_vertices.data() + std::size_t(i) * vertex_stride + color.offset,
+                            bytes) != 0)
+            {
+              color_constant = false;
+              if (!world_cpt_match)
+                stream_ok = false;
+              break;
+            }
+          }
         }
 
+        bool posmtx_layout_ok = true;
+        bool posmtx_constant = true;
         // Rigid replacement may reuse a per-vertex position-matrix index only
         // when the whole original draw used exactly the same index/value.
         if (stream_ok && decl.posmtx.enable)
@@ -2379,6 +2439,7 @@ void VertexManagerBase::RenderDrawCall(
           if (decl.posmtx.offset < 0 ||
               std::size_t(decl.posmtx.offset) + matrix_bytes > vertex_stride)
           {
+            posmtx_layout_ok = false;
             stream_ok = false;
           }
           else
@@ -2390,10 +2451,23 @@ void VertexManagerBase::RenderDrawCall(
                   gc_vertices.data() + std::size_t(i) * vertex_stride + decl.posmtx.offset;
               if (std::memcmp(first, current, matrix_bytes) != 0)
               {
+                posmtx_constant = false;
                 stream_ok = false;
                 break;
               }
             }
+          }
+        }
+
+        if (world_cpt_match && stream_ok && !color_constant)
+        {
+          static unsigned world_color_logs = 0;
+          if (world_color_logs++ < 32)
+          {
+            std::fprintf(stderr,
+                         "[moh-ps3-world-geo] WORLD COLOR BRIDGE: ps3=%s GCverts=%u GCtris=%u stride=%u | varying GC color retained as first-vertex material tint until CPT color semantic decode\n",
+                         match.mesh->source_name.c_str(), gc_vertex_count, gc_triangle_count,
+                         vertex_stride);
           }
         }
 
@@ -2416,7 +2490,14 @@ void VertexManagerBase::RenderDrawCall(
                           vertex_stride);
 
               const auto& source = submesh.position_uv[i];
-              std::memcpy(destination + decl.position.offset, source.position.data(),
+              std::array<float, 3> ps3_position = source.position;
+              if (world_cpt_match && match.world_translation_valid)
+              {
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                  ps3_position[axis] += match.world_translation[axis];
+              }
+
+              std::memcpy(destination + decl.position.offset, ps3_position.data(),
                           sizeof(float) * 3);
 
               if (decl.normals[0].enable)
@@ -2442,6 +2523,24 @@ void VertexManagerBase::RenderDrawCall(
 
             submitted_ps3_mesh = true;
           }
+        }
+        else if (world_cpt_match)
+        {
+          static unsigned world_stream_reject_logs = 0;
+          if (world_stream_reject_logs++ < 64)
+          {
+            std::fprintf(stderr,
+                         "[moh-ps3-world-geo] WORLD STREAM REJECT: ps3=%s GCverts=%u GCtris=%u stride=%u base=%d color-layout=%d color-constant=%d posmtx-layout=%d posmtx-constant=%d nrm=%d uv0=%d uv1=%d -> GC\n",
+                         match.mesh->source_name.c_str(), gc_vertex_count, gc_triangle_count,
+                         vertex_stride, base_stream_ok ? 1 : 0, color_layout_ok ? 1 : 0,
+                         color_constant ? 1 : 0, posmtx_layout_ok ? 1 : 0,
+                         posmtx_constant ? 1 : 0, decl.normals[0].enable ? 1 : 0,
+                         decl.texcoords[0].enable ? 1 : 0, decl.texcoords[1].enable ? 1 : 0);
+          }
+          // v9.1 waited for the *next* MatchStaticDraw() to expire a failed
+          // transient match. If this was the final draw of the run, the shared
+          // owner survived into shutdown. Reject it immediately instead.
+          PS3MeshPort::RejectStaticDrawCandidate();
         }
       }
     }
