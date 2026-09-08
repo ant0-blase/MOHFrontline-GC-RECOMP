@@ -190,6 +190,111 @@ inline u64 FNV1a64(const u8* data, std::size_t size)
   return hash;
 }
 
+/* MOH_PS3_RUNTIME_CPT_HASH_CACHE_V1
+ *
+ * ReplacementKey() is queried from TextureCacheBase::LoadImpl before the
+ * normal Dolphin texture-cache fast path. The old runtime-CPT code therefore
+ * re-hashed the complete guest texture for every bind.
+ *
+ * Keep full FNV-1a as the authoritative value on cache miss. Repeated binds
+ * validate pointer/address reuse with 128 bytes sampled across the texture.
+ */
+struct RuntimeTextureHashCacheLine
+{
+  const u8* data = nullptr;
+  u32 address = 0;
+  std::size_t size = 0;
+  u32 width = 0;
+  u32 height = 0;
+  u32 format = 0;
+  u64 sample = 0;
+  u64 hash = 0;
+  bool valid = false;
+};
+
+inline thread_local std::array<RuntimeTextureHashCacheLine, 1024> runtime_texture_hash_cache{};
+
+inline u64 RuntimeTextureSampleSignature(const u8* data, std::size_t size)
+{
+  if (!data || !size)
+    return 0;
+
+  constexpr std::size_t windows = 8;
+  constexpr std::size_t bytes_per_window = 16;
+
+  u64 hash = 0xcbf29ce484222325ULL;
+  hash ^= static_cast<u64>(size);
+  hash *= 0x100000001b3ULL;
+
+  for (std::size_t window = 0; window < windows; ++window)
+  {
+    const std::size_t span =
+        size > bytes_per_window ? size - bytes_per_window : 0;
+    const std::size_t base =
+        windows > 1 ? (span * window) / (windows - 1) : 0;
+    const std::size_t count =
+        std::min(bytes_per_window, size - base);
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      hash ^= data[base + i];
+      hash *= 0x100000001b3ULL;
+    }
+  }
+
+  return hash;
+}
+
+inline u64 RuntimeTextureHash(const TextureInfo& info)
+{
+  const u8* data = info.GetData();
+  const std::size_t size = info.GetTextureSize();
+  if (!data || !size)
+    return 0;
+
+  const u32 address = info.GetRawAddress();
+  const u32 width = info.GetRawWidth();
+  const u32 height = info.GetRawHeight();
+  const u32 format = static_cast<u32>(info.GetTextureFormat());
+  const u64 sample = RuntimeTextureSampleSignature(data, size);
+
+  const std::uintptr_t pointer_bits =
+      reinterpret_cast<std::uintptr_t>(data);
+  u64 index_key = static_cast<u64>(pointer_bits);
+  index_key ^= static_cast<u64>(address) * 0x9E3779B185EBCA87ULL;
+  index_key ^= static_cast<u64>(size) * 0xC2B2AE3D27D4EB4FULL;
+  index_key ^= static_cast<u64>(width) << 17;
+  index_key ^= static_cast<u64>(height) << 33;
+  index_key ^= static_cast<u64>(format) << 49;
+
+  RuntimeTextureHashCacheLine& line =
+      runtime_texture_hash_cache[index_key & (runtime_texture_hash_cache.size() - 1)];
+
+  if (line.valid &&
+      line.data == data &&
+      line.address == address &&
+      line.size == size &&
+      line.width == width &&
+      line.height == height &&
+      line.format == format &&
+      line.sample == sample)
+  {
+    return line.hash;
+  }
+
+  const u64 hash = FNV1a64(data, size);
+  line.data = data;
+  line.address = address;
+  line.size = size;
+  line.width = width;
+  line.height = height;
+  line.format = format;
+  line.sample = sample;
+  line.hash = hash;
+  line.valid = true;
+  return hash;
+}
+
 inline u64 IdentityKey(u64 hash, u32 width, u32 height, u32 format)
 {
   u64 key = hash;
@@ -963,17 +1068,48 @@ inline std::shared_ptr<Catalog> GetCatalog()
 {
   if (!Enabled() || !PS3RemasterAssets::IsReady())
     return {};
-  const std::string level = Lower(std::string(MOHFrontline::NativeAssets::GetCurrentLevel()));
-  if (level.empty())
-    return {};
+
   const auto generation = PS3RemasterAssets::GetIndexGeneration();
+  const std::string_view raw_level = MOHFrontline::NativeAssets::GetCurrentLevel();
+  if (raw_level.empty())
+    return {};
+
+  // MOH_PS3_RUNTIME_CPT_RESULT_CACHE_V1
+  // The video thread asks for the same level catalog thousands of times per
+  // second. Avoid allocating/lowercasing a std::string and taking the global
+  // catalog mutex on every texture bind.
+  thread_local std::shared_ptr<Catalog> tls_catalog;
+
+  if (tls_catalog && tls_catalog->generation == generation &&
+      tls_catalog->level.size() == raw_level.size())
+  {
+    bool same_level = true;
+    for (std::size_t i = 0; i < raw_level.size(); ++i)
+    {
+      if (tls_catalog->level[i] !=
+          static_cast<char>(std::tolower(static_cast<unsigned char>(raw_level[i]))))
+      {
+        same_level = false;
+        break;
+      }
+    }
+    if (same_level)
+      return tls_catalog;
+  }
+
+  const std::string level = Lower(std::string(raw_level));
 
   std::scoped_lock lock(catalog_mutex);
   if (current_catalog && current_catalog->generation == generation &&
       current_catalog->level == level)
-    return current_catalog;
+  {
+    tls_catalog = current_catalog;
+    return tls_catalog;
+  }
+
   current_catalog = BuildCatalog(level);
-  return current_catalog;
+  tls_catalog = current_catalog;
+  return tls_catalog;
 }
 
 inline std::vector<Entry>::const_iterator FindFirst(const Catalog& catalog, u64 hash)
@@ -994,7 +1130,7 @@ inline bool Lookup(const TextureInfo& info, Entry* out, u64* out_hash = nullptr)
   if (!catalog || catalog->entries.empty())
     return false;
 
-  const u64 hash = FNV1a64(info.GetData(), info.GetTextureSize());
+  const u64 hash = RuntimeTextureHash(info);
   if (out_hash)
     *out_hash = hash;
 
@@ -1036,7 +1172,7 @@ inline bool Known(const TextureInfo& info)
   const auto catalog = GetCatalog();
   if (!catalog)
     return false;
-  const u64 hash = FNV1a64(info.GetData(), info.GetTextureSize());
+  const u64 hash = RuntimeTextureHash(info);
   return catalog->known.contains(IdentityKey(hash, info.GetRawWidth(), info.GetRawHeight(),
                                               static_cast<u32>(info.GetTextureFormat())));
 }
@@ -1092,6 +1228,118 @@ inline u64 ReplacementKeyFor(const Entry& entry, u64 gc_hash)
   key ^= static_cast<u64>(entry.descriptor[10]) << 32;
   key ^= static_cast<u64>(entry.descriptor[11]) << 24;
   return key ? key : 1;
+}
+
+/* MOH_PS3_RUNTIME_CPT_RESULT_CACHE_V1
+ *
+ * ReplacementKey() is the hottest runtime-CPT caller. It only needs one u64,
+ * but the old path called Lookup(), performed lower_bound/scanning and copied
+ * the whole Entry (including std::string fields) on every bind.
+ *
+ * Cache both matches and misses by exact texture hash + dimensions + format +
+ * catalog identity. RuntimeTextureHash() (Round16) remains responsible for
+ * validating repeated guest-memory contents.
+ */
+struct RuntimeReplacementKeyCacheLine
+{
+  const Catalog* catalog = nullptr;
+  std::uint64_t generation = 0;
+  u64 level_tag = 0;
+  u64 texture_hash = 0;
+  u32 width = 0;
+  u32 height = 0;
+  u32 format = 0;
+  u64 replacement_key = 0;
+  bool valid = false;
+};
+
+inline thread_local std::array<RuntimeReplacementKeyCacheLine, 2048>
+    runtime_replacement_key_cache{};
+
+inline u64 CatalogLevelTag(const Catalog& catalog)
+{
+  u64 hash = 0xcbf29ce484222325ULL;
+  for (unsigned char c : catalog.level)
+  {
+    hash ^= c;
+    hash *= 0x100000001b3ULL;
+  }
+  hash ^= catalog.generation;
+  hash *= 0x100000001b3ULL;
+  return hash;
+}
+
+inline u64 LookupReplacementKeyFast(const TextureInfo& info)
+{
+  if (!info.GetData() || !info.GetTextureSize() || !info.IsDataValid() ||
+      info.GetTextureFormat() == TextureFormat::XFB)
+  {
+    return 0;
+  }
+
+  const auto catalog = GetCatalog();
+  if (!catalog || catalog->entries.empty())
+    return 0;
+
+  const u64 texture_hash = RuntimeTextureHash(info);
+  const u32 width = info.GetRawWidth();
+  const u32 height = info.GetRawHeight();
+  const u32 format = static_cast<u32>(info.GetTextureFormat());
+  const u64 level_tag = CatalogLevelTag(*catalog);
+
+  u64 slot_key = texture_hash;
+  slot_key ^= static_cast<u64>(width) * 0x9E3779B185EBCA87ULL;
+  slot_key ^= static_cast<u64>(height) * 0xC2B2AE3D27D4EB4FULL;
+  slot_key ^= static_cast<u64>(format) * 0x165667B19E3779F9ULL;
+  slot_key ^= static_cast<u64>(reinterpret_cast<std::uintptr_t>(catalog.get()));
+
+  RuntimeReplacementKeyCacheLine& line =
+      runtime_replacement_key_cache[slot_key & (runtime_replacement_key_cache.size() - 1)];
+
+  if (line.valid && line.catalog == catalog.get() &&
+      line.generation == catalog->generation &&
+      line.level_tag == level_tag &&
+      line.texture_hash == texture_hash &&
+      line.width == width && line.height == height && line.format == format)
+  {
+    return line.replacement_key;
+  }
+
+  auto it = FindFirst(*catalog, texture_hash);
+  const Entry* match = nullptr;
+  unsigned matches = 0;
+  for (; it != catalog->entries.end() && it->gc_hash == texture_hash; ++it)
+  {
+    if (it->gc_width != width || it->gc_height != height || it->gc_format != format)
+      continue;
+    match = &*it;
+    ++matches;
+  }
+
+  u64 replacement_key = 0;
+  if (matches == 1 && match)
+  {
+    replacement_key = ReplacementKeyFor(*match, texture_hash);
+  }
+  else if (matches > 1 && TraceEnabled())
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-cpt] AMBIGUOUS fast identity: level=%s "
+                 "GC=%ux%u fmt=%u hash=%016llX matches=%u -> GC fallback\n",
+                 catalog->level.c_str(), width, height, format,
+                 static_cast<unsigned long long>(texture_hash), matches);
+  }
+
+  line.catalog = catalog.get();
+  line.generation = catalog->generation;
+  line.level_tag = level_tag;
+  line.texture_hash = texture_hash;
+  line.width = width;
+  line.height = height;
+  line.format = format;
+  line.replacement_key = replacement_key;
+  line.valid = true;
+  return replacement_key;
 }
 
 inline std::mutex decode_mutex;
@@ -1191,11 +1439,7 @@ inline std::shared_ptr<VideoCommon::CustomTextureData> Decode(const Entry& entry
 
 inline u64 ReplacementKey(const TextureInfo& info)
 {
-  detail::Entry entry;
-  u64 hash = 0;
-  if (!detail::Lookup(info, &entry, &hash))
-    return 0;
-  return detail::ReplacementKeyFor(entry, hash);
+  return detail::LookupReplacementKeyFast(info);
 }
 
 inline bool IsKnownWorldTexture(const TextureInfo& info)

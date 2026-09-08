@@ -1331,7 +1331,9 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
   const u64 ps3_draw_fast_key =
       PS3Compass::CurrentDrawMaterialKey(ps3_draw_texture_info);
   const u64 ps3_world_fast_key =
-      PS3WorldCPTRuntime::ReplacementKey(ps3_draw_texture_info);
+      ps3_draw_fast_key == 0 ?
+          PS3WorldCPTRuntime::ReplacementKey(ps3_draw_texture_info) :
+          0;
   const u64 ps3_expected_fast_key =
       ps3_draw_fast_key != 0 ? ps3_draw_fast_key : ps3_world_fast_key;
 
@@ -1399,7 +1401,10 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
 
   const u64 ps3_draw_material_key =
       PS3Compass::CurrentDrawMaterialKey(texture_info);
-  const u64 ps3_world_material_key = PS3WorldCPTRuntime::ReplacementKey(texture_info);
+  const u64 ps3_world_material_key =
+      ps3_draw_material_key == 0 ?
+          PS3WorldCPTRuntime::ReplacementKey(texture_info) :
+          0;
   const u64 ps3_expected_material_key =
       ps3_draw_material_key != 0 ? ps3_draw_material_key : ps3_world_material_key;
 

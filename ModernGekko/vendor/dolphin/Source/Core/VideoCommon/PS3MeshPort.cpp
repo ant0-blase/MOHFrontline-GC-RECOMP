@@ -8,6 +8,7 @@
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/MSH.h"
 #include "VideoCommon/PS3RemasterAssets.h"
+#include "VideoCommon/PS3WorldGeometry.h"
 
 #include <array>
 #include <algorithm>
@@ -148,6 +149,10 @@ std::unordered_map<DisplayListSignatureKey, std::vector<OriginalGCDrawCandidate>
                    DisplayListSignatureKeyHash>
     g_display_list_candidates;
 thread_local StaticDrawMatch g_current_draw;
+// CPT world batches are often submitted directly and therefore have no
+// GXCallDisplayList identity. Keep their strict geometry match for one draw
+// only, and cache the result by the actual GC geometry signature.
+thread_local bool g_current_draw_transient_world = false;
 struct ActiveDisplayListContext
 {
   u32 address = 0;
@@ -157,6 +162,8 @@ struct ActiveDisplayListContext
   explicit operator bool() const { return address != 0 && size > 52; }
 };
 thread_local ActiveDisplayListContext g_active_display_list;
+std::unordered_map<u64, StaticDrawMatch> g_world_direct_matches;
+std::unordered_set<u64> g_world_direct_rejected;
 std::atomic<u64> g_matches{0}, g_draws{0}, g_vertices{0}, g_indices{0}, g_fallbacks{0};
 std::unordered_set<std::string> g_draw_logged;
 std::atomic<u64> g_dmf_draws{0}, g_dmf_vertices{0}, g_dmf_indices{0};
@@ -478,6 +485,41 @@ float BoundsScore(const Bounds3& gc, const Bounds3& ps3)
   }
 
   return extent_error / 3.0f + (center_error / 3.0f) * 0.20f;
+}
+
+bool IsWorldCPTMesh(const StaticMesh& mesh)
+{
+  const std::string_view source(mesh.source_name);
+  return source.find(".cpt#cpt-inline-") != std::string_view::npos ||
+         source.find(".cpt#cpt-rsx-") != std::string_view::npos;
+}
+
+u64 WorldDirectKey(std::span<const u8> vertices, u32 count, u32 stride, u32 position_offset,
+                   const Bounds3& bounds)
+{
+  // Runtime cache identity only -- this is not used to decide GC<->PS3
+  // equivalence. Include bounds plus samples of the real portable positions
+  // so two world draws with the same AABB do not alias.
+  constexpr u64 offset_basis = 1469598103934665603ULL;
+  constexpr u64 prime = 1099511628211ULL;
+  u64 hash = offset_basis;
+  const auto mix = [&](const void* data, std::size_t size) {
+    const auto* p = static_cast<const u8*>(data);
+    for (std::size_t i = 0; i < size; ++i)
+    {
+      hash ^= p[i];
+      hash *= prime;
+    }
+  };
+
+  mix(bounds.minimum.data(), sizeof(float) * bounds.minimum.size());
+  mix(bounds.maximum.data(), sizeof(float) * bounds.maximum.size());
+  mix(&count, sizeof(count));
+  mix(&stride, sizeof(stride));
+  const u32 step = std::max(1u, count / 16u);
+  for (u32 i = 0; i < count; i += step)
+    mix(vertices.data() + std::size_t(i) * stride + position_offset, sizeof(float) * 3);
+  return hash;
 }
 
 StaticDrawMatch BuildStaticDrawMatch(const std::shared_ptr<StaticMesh>& mesh,
@@ -1529,6 +1571,10 @@ void ClearMSHCache()
   g_msh_cache.clear();
   g_display_lists.clear();
   g_display_list_candidates.clear();
+  g_world_direct_matches.clear();
+  g_world_direct_rejected.clear();
+  g_current_draw = {};
+  g_current_draw_transient_world = false;
 }
 
 void ClearDMFCache()
@@ -1610,9 +1656,43 @@ void PreloadCurrentLevelMSH(std::string_view level)
     next[Lower(asset.relative_path)] = mesh;
   }
 
+  // v9: the PS3 level world is authored in *_ART_cN.cpt, not as ordinary MSH files.
+  // Decode strict CPT/RSX geometry candidates into one-submesh StaticMesh objects and feed
+  // them to the already-proven MSH renderer/bootstrap.  Unrecognized chunks remain 100% GC.
+  PS3WorldGeometry::DecodeStats world_geo_stats{};
+  std::size_t world_cpt_chunks = 0;
+  std::size_t world_meshes = 0;
+  if (PS3WorldGeometry::Enabled())
+  {
+    for (const auto& asset : PS3RemasterAssets::GetAssets())
+    {
+      if (!PS3WorldGeometry::IsWorldChunk(asset) || !BelongsToLevel(asset, level))
+        continue;
+      ++world_cpt_chunks;
+      auto converted = PS3WorldGeometry::Decode(asset, &world_geo_stats);
+      for (auto& mesh : converted)
+      {
+        if (!mesh || mesh->submeshes.size() != 1 || mesh->submeshes[0].indices.empty() ||
+            mesh->submeshes[0].position_uv.empty())
+          continue;
+        next["@world-cpt/" + std::to_string(world_meshes)] = mesh;
+        next[Lower(mesh->source_name)] = mesh;
+        ++world_meshes;
+      }
+    }
+    std::fprintf(stderr,
+                 "[moh-ps3-world-geo] CACHE READY: level=%.*s chunks=%zu descriptors=%zu inline=%zu rsx=%zu meshes=%zu duplicate=%zu rejected=%zu | renderer=PS3MeshPort strict-bootstrap\n",
+                 static_cast<int>(level.size()), level.data(), world_cpt_chunks,
+                 world_geo_stats.descriptor_candidates, world_geo_stats.inline_candidates,
+                 world_geo_stats.rsx_candidates, world_meshes, world_geo_stats.duplicate,
+                 world_geo_stats.rejected);
+  }
+
   {
     std::scoped_lock lock(g_msh_cache_mutex);
     g_display_lists.clear();
+    g_world_direct_matches.clear();
+    g_world_direct_rejected.clear();
     g_msh_cache = std::move(next);
   }
 
@@ -2108,18 +2188,26 @@ void SetDisplayListContext(u32 address, std::span<const u8> commands)
   // Every GX display-list invocation gets an isolated context. This also
   // guarantees that a bootstrap match cannot leak into the next display list.
   g_current_draw = {};
+  g_current_draw_transient_world = false;
   g_current_dmf_draw = {};
   g_active_display_list = {};
-  if (!IsStaticBootstrapEnabled() || !address || commands.size() <= 52)
+  if (!address || commands.size() <= 52)
     return;
 
+  // Always remember that we are inside GXCallDisplayList, even when geometry
+  // bootstrap is disabled. Direct CPT world matching must run only for
+  // primitive batches that are NOT part of a display list.
   g_active_display_list.address = address & 0x1fffffff;
   g_active_display_list.size = static_cast<u32>(commands.size());
   g_active_display_list.command_hash =
       Common::GetHash64(commands.data() + 52, commands.size() - 52, 0);
 }
 
-void SetDisplayListMatch(StaticDrawMatch match) { g_current_draw = std::move(match); }
+void SetDisplayListMatch(StaticDrawMatch match)
+{
+  g_current_draw_transient_world = false;
+  g_current_draw = std::move(match);
+}
 const StaticDrawMatch& CurrentStaticDraw() { return g_current_draw; }
 
 SkinnedDrawMatch CurrentSkinnedDraw() { return g_current_dmf_draw; }
@@ -2723,6 +2811,15 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
   if (g_current_dmf_draw || !IsStaticDrawReplacementEnabled() || count < 3)
     return {};
 
+  // A direct CPT match has no OpcodeDecoding display-list boundary. If the
+  // previous candidate failed a later stream validation, Notify... was never
+  // called, so expire it here before processing the next batch.
+  if (g_current_draw_transient_world)
+  {
+    g_current_draw = {};
+    g_current_draw_transient_world = false;
+  }
+
   if (g_current_draw)
   {
     // Thompson is authored as 15 parts, but only a subset of those display
@@ -2753,16 +2850,124 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     return g_current_draw;
   }
 
-  // The loader hostcall used by the texture/font path does not see static-MSH
-  // loads in Frontline, so there is no resource address to seed g_display_lists.
-  // Bootstrap the identity once, inside the *actual* GX display list, using the
-  // previous strict geometry test. Once learned, later frames use only
-  // display-list address + command hash.
-  if (!g_active_display_list || !IsStaticBootstrapEnabled())
-    return {};
-
   const auto gc = BoundsFromGC(gc_vertices, count, stride, offset);
   if (!gc.valid)
+    return {};
+
+  // The PS3 level world is not an ordinary .msh. Its GX primitive batches are
+  // commonly emitted directly rather than through GXCallDisplayList. v9
+  // already decoded *_ART_cN.cpt into one-submesh StaticMesh objects, so match
+  // ONLY those CPT objects here by strict world-space bounds.
+  if (!g_active_display_list && PS3WorldGeometry::Enabled())
+  {
+    const u64 direct_key = WorldDirectKey(gc_vertices, count, stride, offset, gc);
+
+    {
+      std::scoped_lock lock(g_msh_cache_mutex);
+      if (const auto cached = g_world_direct_matches.find(direct_key);
+          cached != g_world_direct_matches.end())
+      {
+        g_current_draw = cached->second;
+        g_current_draw_transient_world = true;
+        return g_current_draw;
+      }
+      if (g_world_direct_rejected.contains(direct_key))
+        return {};
+    }
+
+    float best_score = std::numeric_limits<float>::infinity();
+    float second_score = std::numeric_limits<float>::infinity();
+    std::shared_ptr<StaticMesh> best_owner;
+    std::size_t considered = 0;
+
+    {
+      std::unordered_set<const StaticMesh*> seen;
+      std::scoped_lock lock(g_msh_cache_mutex);
+      for (const auto& [key, holder] : g_msh_cache)
+      {
+        (void)key;
+        if (!holder || !seen.insert(holder.get()).second || !IsWorldCPTMesh(*holder) ||
+            holder->submeshes.size() != 1)
+          continue;
+
+        const auto& submesh = holder->submeshes[0];
+        if (!submesh.vertex_count || submesh.position_uv.size() != submesh.vertex_count ||
+            submesh.indices.empty() || (submesh.indices.size() % 3) != 0)
+          continue;
+
+        ++considered;
+        const float score = BoundsScore(gc, BoundsFromPS3(submesh));
+        if (!std::isfinite(score))
+          continue;
+        if (score < best_score)
+        {
+          second_score = best_score;
+          best_score = score;
+          best_owner = holder;
+        }
+        else if (score < second_score)
+        {
+          second_score = score;
+        }
+      }
+    }
+
+    const float maximum_direct_score =
+        EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_DIRECT_SCORE", 0.025f, 0.00001f, 0.25f);
+    const float minimum_direct_margin =
+        EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_DIRECT_MARGIN", 0.0025f, 0.0f, 0.25f);
+    const float margin = std::isfinite(second_score) ? second_score - best_score :
+                                                       std::numeric_limits<float>::infinity();
+    const bool accepted =
+        best_owner && best_score <= maximum_direct_score &&
+        (!std::isfinite(second_score) || margin >= minimum_direct_margin);
+
+    if (!accepted)
+    {
+      {
+        std::scoped_lock lock(g_msh_cache_mutex);
+        g_world_direct_rejected.insert(direct_key);
+      }
+      static thread_local unsigned reject_logs = 0;
+      if (reject_logs++ < 96)
+      {
+        std::fprintf(stderr,
+                     "[moh-ps3-world-geo] DIRECT MATCH REJECT: GCverts=%u candidates=%zu best=%s score=%.6f second=%.6f margin=%.6f max=%.6f required-margin=%.6f -> GC\n",
+                     count, considered, best_owner ? best_owner->source_name.c_str() : "<none>",
+                     best_score, second_score, margin, maximum_direct_score,
+                     minimum_direct_margin);
+      }
+      return {};
+    }
+
+    StaticDrawMatch learned = BuildStaticDrawMatch(best_owner, 0);
+    if (!learned)
+      return {};
+    learned.score = best_score;
+    learned.display_list = 0;
+    {
+      std::scoped_lock lock(g_msh_cache_mutex);
+      g_world_direct_matches[direct_key] = learned;
+    }
+    g_current_draw = learned;
+    g_current_draw_transient_world = true;
+    ++g_matches;
+
+    static thread_local unsigned match_logs = 0;
+    if (match_logs++ < 192)
+    {
+      const auto& sub = best_owner->submeshes[0];
+      std::fprintf(stderr,
+                   "[moh-ps3-world-geo] DIRECT MATCH: GCverts=%u -> PS3=%s verts=%u indices=%zu score=%.6f second=%.6f margin=%.6f candidates=%zu | transient world draw\n",
+                   count, best_owner->source_name.c_str(), sub.vertex_count, sub.indices.size(),
+                   best_score, second_score, margin, considered);
+    }
+    return learned;
+  }
+
+  // Unknown draws that are inside GXCallDisplayList keep the old diagnostic
+  // MSH bootstrap path. Direct CPT world matching never runs inside a DL.
+  if (!g_active_display_list || !IsStaticBootstrapEnabled())
     return {};
 
   const float maximum_score =
@@ -2816,8 +3021,19 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     }
   }
 
-  if (!best_owner || best_score > maximum_score ||
-      (std::isfinite(second_score) && second_score - best_score < minimum_margin))
+  // CPT world geometry has many neighbouring sectors with similar bounds, so use a separate
+  // but still strict threshold.  This does not affect normal MSH bootstrap behaviour.
+  const bool best_is_world_cpt =
+      best_owner && best_owner->source_name.find(".cpt#") != std::string::npos;
+  const float effective_maximum_score = best_is_world_cpt ?
+      EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_BOOTSTRAP_SCORE", 0.035f, 0.0001f, 0.25f) :
+      maximum_score;
+  const float effective_minimum_margin = best_is_world_cpt ?
+      EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_BOOTSTRAP_MARGIN", 0.004f, 0.0f, 0.25f) :
+      minimum_margin;
+
+  if (!best_owner || best_score > effective_maximum_score ||
+      (std::isfinite(second_score) && second_score - best_score < effective_minimum_margin))
   {
     static thread_local unsigned bootstrap_miss_logs = 0;
     if (bootstrap_miss_logs++ < 24)
@@ -2829,8 +3045,8 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
       std::fprintf(stderr,
                    "[moh-ps3-msh] BOOTSTRAP MISS: gx_stream_verts=%u best=%s ps3_vertices=%u ps3_indices=%zu score=%.5f second=%.5f max=%.5f margin=%.5f DL=%08x\n",
                    count, best_owner ? best_owner->source_name.c_str() : "none",
-                   best_ps3_vertices, best_ps3_indices, best_score, second_score, maximum_score,
-                   minimum_margin, g_active_display_list.address);
+                   best_ps3_vertices, best_ps3_indices, best_score, second_score, effective_maximum_score,
+                   effective_minimum_margin, g_active_display_list.address);
     }
     return {};
   }
@@ -2902,6 +3118,14 @@ void NotifyStaticDrawSubmitted()
     std::fprintf(stderr, "[moh-ps3-msh] FIRST REAL PS3 DRAW: gc_resource=%08x ps3=%s DL=%08x | replacement active; current GX model/view/projection and CSM preserved\n",
                  g_current_draw.guest_resource, g_current_draw.mesh->source_name.c_str(),
                  g_current_draw.display_list);
+
+  // Direct world matches exist only for the current primitive batch. Do not
+  // let one CPT sector leak into the next unrelated GameCube world draw.
+  if (g_current_draw_transient_world)
+  {
+    g_current_draw = {};
+    g_current_draw_transient_world = false;
+  }
 }
 
 void NotifySkinnedDrawSubmitted(const SkinnedDrawReplacement& replacement)
