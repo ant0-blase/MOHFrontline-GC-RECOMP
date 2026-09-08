@@ -1520,8 +1520,34 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
             static_cast<float>(
                 f2);
 
-    constexpr std::uint32_t rgba =
-        0xFFFFFFFFu;
+    // Moh2RelGC.elf is non-stripped: CFont owns FONT* at +0x20. The live
+    // FONT draw state is color +0x20, height +0x24 and X/Y scale +0x38/+0x3c.
+    // Feed that state into the EBOOT-compatible host quad builder instead of
+    // inventing one logical font height for every CFont role.
+    std::uint32_t rgba = 0xFFFFFFFFu;
+    float font_height = 0.0f;
+    float font_scale_x = 1.0f;
+    float font_scale_y = 1.0f;
+
+    const std::uint32_t cfont_object = state->gpr[3];
+    if (IsMem1Address(cfont_object) && cfont_object <= 0x817FFFDCu)
+    {
+      const std::uint32_t gc_font = ReadGuestU32(state, cfont_object + 0x20u);
+      if (IsMem1Address(gc_font) && gc_font <= 0x817FFFC0u)
+      {
+        rgba = ReadGuestU32(state, gc_font + 0x20u);
+        const float live_height = ReadGuestF32(state, gc_font + 0x24u);
+        const float live_scale_x = ReadGuestF32(state, gc_font + 0x38u);
+        const float live_scale_y = ReadGuestF32(state, gc_font + 0x3Cu);
+
+        if (std::isfinite(live_height) && live_height > 0.0f && live_height <= 512.0f)
+          font_height = live_height;
+        if (std::isfinite(live_scale_x) && live_scale_x > 0.0f && live_scale_x <= 16.0f)
+          font_scale_x = live_scale_x;
+        if (std::isfinite(live_scale_y) && live_scale_y > 0.0f && live_scale_y <= 16.0f)
+          font_scale_y = live_scale_y;
+      }
+    }
 
     static unsigned log_count = 0;
 
@@ -1532,13 +1558,15 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
       std::fprintf(
           stderr,
           "[moh-ps3-font] verified capture "
-          "font=%s r%d=%08X x=%.2f y=%.2f centered=%d text=\"%s\"\n",
+          "font=%s r%d=%08X x=%.2f y=%.2f centered=%d "
+          "height=%.2f scale=(%.3f,%.3f) rgba=%08X text=\"%s\"\n",
           exact_font.c_str(),
           source_reg,
           state->gpr[source_reg],
           draw_x,
           draw_y,
           centered ? 1 : 0,
+          font_height, font_scale_x, font_scale_y, rgba,
           text_value.c_str());
     }
 
@@ -1550,7 +1578,10 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
                 draw_y,
                 centered,
                 exact_font.c_str(),
-                rgba);
+                rgba,
+                font_scale_x,
+                font_scale_y,
+                font_height);
 
     state->gpr[0] =
         accepted ?

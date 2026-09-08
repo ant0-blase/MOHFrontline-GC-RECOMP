@@ -260,6 +260,9 @@ struct PS3FontDrawRequest
   float y = 0.0f;
   bool centered = false;
   u32 rgba = 0xFFFFFFFF;
+  float scale_x = 1.0f;
+  float scale_y = 1.0f;
+  float requested_height = 0.0f;
 };
 
 std::mutex s_ps3_font_draw_mutex;
@@ -2361,7 +2364,10 @@ bool QueuePS3FontDraw(
     float y,
     bool centered,
     const char* font_filename,
-    u32 rgba)
+    u32 rgba,
+    float scale_x,
+    float scale_y,
+    float requested_height)
 {
   if (!text ||
       !*text)
@@ -2389,6 +2395,16 @@ bool QueuePS3FontDraw(
     return false;
   }
 
+  if (!std::isfinite(scale_x) || scale_x <= 0.0f || scale_x > 16.0f)
+    scale_x = 1.0f;
+  if (!std::isfinite(scale_y) || scale_y <= 0.0f || scale_y > 16.0f)
+    scale_y = 1.0f;
+  if (!std::isfinite(requested_height) || requested_height < 0.0f ||
+      requested_height > 512.0f)
+  {
+    requested_height = 0.0f;
+  }
+
   PS3FontDrawRequest request;
 
   request.text = text;
@@ -2398,6 +2414,9 @@ bool QueuePS3FontDraw(
   request.y = y;
   request.centered = centered;
   request.rgba = rgba;
+  request.scale_x = scale_x;
+  request.scale_y = scale_y;
+  request.requested_height = requested_height;
 
   std::scoped_lock lock(
       s_ps3_font_draw_mutex);
@@ -2418,6 +2437,9 @@ bool QueuePS3FontDraw(
             request.font_filename &&
         it->rgba ==
             request.rgba &&
+        std::abs(it->scale_x - request.scale_x) < 0.0001f &&
+        std::abs(it->scale_y - request.scale_y) < 0.0001f &&
+        std::abs(it->requested_height - request.requested_height) < 0.0001f &&
         it->text ==
             request.text &&
         std::abs(
@@ -2457,144 +2479,16 @@ void DrawPS3FontUI(
         s_ps3_font_draw_requests);
   }
 
-  struct RetainedPS3FontDraw
-  {
-    PS3FontDrawRequest request;
-    std::chrono::steady_clock::time_point last_seen;
-  };
-
-  static std::vector<
-      RetainedPS3FontDraw>
-      retained;
-
-  static bool last_gameplay =
-      s.gameplay.load(
-          std::memory_order_relaxed);
-
-  const bool gameplay =
-      s.gameplay.load(
-          std::memory_order_relaxed);
-
-  const auto now =
-      std::chrono::steady_clock::now();
-
-  // Never carry HUD strings into the frontend or vice versa.
-  if (gameplay !=
-      last_gameplay)
-  {
-    retained.clear();
-    last_gameplay =
-        gameplay;
-  }
-
   if (s.movie_active.load(
           std::memory_order_relaxed))
   {
-    retained.clear();
     return;
   }
 
-  const double hold_ms =
-      std::clamp(
-          EnvDouble(
-              "MOH_PS3_FONT_HOLD_MS",
-              gameplay ?
-                  180.0 :
-                  110.0),
-          40.0,
-          1000.0);
-
-  for (auto& request :
-       incoming)
-  {
-    bool refreshed =
-        false;
-
-    for (auto& entry :
-         retained)
-    {
-      const float dx =
-          std::abs(
-              entry.request.x -
-              request.x);
-
-      const float dy =
-          std::abs(
-              entry.request.y -
-              request.y);
-
-      const bool same_font =
-          entry.request.font_filename ==
-              request.font_filename;
-
-      const bool same_slot =
-          same_font &&
-          entry.request.centered ==
-              request.centered &&
-          dx < 8.0f &&
-          dy < 8.0f;
-
-      const bool same_text_near =
-          same_font &&
-          entry.request.text ==
-              request.text &&
-          dx < 64.0f &&
-          dy < 64.0f;
-
-      if (same_slot ||
-          same_text_near)
-      {
-        entry.request =
-            std::move(request);
-
-        entry.last_seen =
-            now;
-
-        refreshed =
-            true;
-
-        break;
-      }
-    }
-
-    if (!refreshed &&
-        retained.size() <
-            256u)
-    {
-      retained.push_back(
-          {
-              std::move(request),
-              now
-          });
-    }
-  }
-
-  for (auto it =
-           retained.begin();
-       it !=
-           retained.end();)
-  {
-    const double age_ms =
-        std::chrono::duration<
-            double,
-            std::milli>(
-                now -
-                it->last_seen)
-            .count();
-
-    if (age_ms >
-        hold_ms)
-    {
-      it =
-          retained.erase(it);
-    }
-    else
-    {
-      ++it;
-    }
-  }
-
-  if (retained.empty() ||
+  // EBOOT submits CFont quads in the same frame. The previous host-only
+  // temporal hold kept obsolete menu/ammo strings alive and could visibly
+  // overprint newer values.
+  if (incoming.empty() ||
       !g_gfx)
   {
     return;
@@ -2621,9 +2515,11 @@ void DrawPS3FontUI(
       display.x /
       640.0f;
 
+  // EBOOT draw core uses 1/320 in X and 1/224 in Y: 640x448 is the actual
+  // PPU->RSX CFont viewport. SFNH's 640x480 header values are asset metadata.
   const float game_y_scale =
       display.y /
-      480.0f;
+      448.0f;
 
   const float requested_scale =
       static_cast<float>(
@@ -2637,12 +2533,9 @@ void DrawPS3FontUI(
   static std::vector<std::string>
       logged_fonts;
 
-  for (const auto& entry :
-       retained)
+  for (const auto& request :
+       incoming)
   {
-    const auto& request =
-        entry.request;
-
     const std::string font_name =
         request.font_filename.empty() ?
             ResolvePS3FontFilename(
@@ -2743,41 +2636,6 @@ void DrawPS3FontUI(
       continue;
     }
 
-    u32 native_line_height = 0;
-
-    for (const auto& glyph :
-         font->glyphs)
-    {
-      native_line_height =
-          std::max(
-              native_line_height,
-              glyph.height);
-    }
-
-    const float line_height =
-        static_cast<float>(
-            std::max<u32>(
-                native_line_height,
-                1u));
-
-    const float target_logical_height =
-        static_cast<float>(
-            std::clamp(
-                EnvDouble(
-                    "MOH_PS3_FONT_HEIGHT",
-                    DefaultPS3FontHeight(
-                        font_name)),
-                12.0,
-                72.0));
-
-    const float glyph_scale =
-        game_y_scale *
-        requested_scale *
-        target_logical_height /
-        std::max(
-            line_height,
-            1.0f);
-
     const auto glyph_for =
         [&](unsigned char ch)
         {
@@ -2804,6 +2662,23 @@ void DrawPS3FontUI(
           return glyph;
         };
 
+    // EBOOT 0x36CE0..0x36E68. Normal draws use CFont X/Y scale; a positive
+    // requested height replaces both axes with height/currentGlyphHeight.
+    const auto glyph_scale =
+        [&](const PS3FontParser::Glyph& glyph)
+        {
+          float sx = request.scale_x;
+          float sy = request.scale_y;
+          if (request.requested_height > 0.0f && glyph.height > 0)
+          {
+            sx = request.requested_height / static_cast<float>(glyph.height);
+            sy = sx;
+          }
+          return std::pair<float, float>{
+              sx * game_x_scale * requested_scale,
+              sy * game_y_scale * requested_scale};
+        };
+
     const auto text_width =
         [&](std::string_view text)
         {
@@ -2828,10 +2703,11 @@ void DrawPS3FontUI(
 
             if (glyph)
             {
-              width +=
-                  static_cast<float>(
-                      glyph->advance) *
-                  glyph_scale;
+              const auto [sx, sy] = glyph_scale(*glyph);
+              (void)sy;
+              width += static_cast<float>(
+                  static_cast<int>(glyph->bearing) +
+                  static_cast<int>(glyph->advance)) * sx;
             }
           }
 
@@ -2860,6 +2736,14 @@ void DrawPS3FontUI(
     float pen_x =
         origin_x;
 
+    float native_line_height = 1.0f;
+    for (const auto& glyph : font->glyphs)
+      native_line_height = std::max(native_line_height, static_cast<float>(glyph.height));
+    const float logical_line_height =
+        request.requested_height > 0.0f ? request.requested_height :
+        native_line_height * request.scale_y;
+    bool first_glyph_on_line = true;
+
     const ImU32 color =
         IM_COL32(
             static_cast<u8>(
@@ -2884,9 +2768,10 @@ void DrawPS3FontUI(
             origin_x;
 
         pen_y +=
-            target_logical_height *
+            logical_line_height *
             game_y_scale *
             requested_scale;
+        first_glyph_on_line = true;
 
         continue;
       }
@@ -2897,33 +2782,30 @@ void DrawPS3FontUI(
       if (!glyph)
         continue;
 
+      const auto [sx, sy] = glyph_scale(*glyph);
+
+      // EBOOT exact ordering: +0x14 spacing is applied before every glyph
+      // except the first one on a line; the first receives it after its quad.
+      if (!first_glyph_on_line)
+        pen_x += static_cast<float>(glyph->bearing) * sx;
+
       if (ch != ' ' &&
           glyph->width > 0 &&
           glyph->height > 0)
       {
         const float x0 =
-            pen_x +
-            static_cast<float>(
-                glyph->bearing) *
-            glyph_scale;
+            pen_x;
 
         const float y0 =
             pen_y;
 
         const float x1 =
             x0 +
-            static_cast<float>(
-                glyph->width) *
-            glyph_scale;
+            static_cast<float>(glyph->width) * sx;
 
         const float y1 =
             y0 +
-            static_cast<float>(
-                glyph->height) *
-            glyph_scale;
-
-        constexpr float uv_inset =
-            0.5f;
+            static_cast<float>(glyph->height) * sy;
 
         const float atlas_w =
             static_cast<float>(
@@ -2934,26 +2816,12 @@ void DrawPS3FontUI(
                 font->atlas_height);
 
         const ImVec2 uv0(
-            (static_cast<float>(
-                 glyph->x) +
-             uv_inset) /
-                atlas_w,
-            (static_cast<float>(
-                 glyph->y) +
-             uv_inset) /
-                atlas_h);
+            static_cast<float>(glyph->x) / atlas_w,
+            static_cast<float>(glyph->y) / atlas_h);
 
         const ImVec2 uv1(
-            (static_cast<float>(
-                 glyph->x +
-                 glyph->width) -
-             uv_inset) /
-                atlas_w,
-            (static_cast<float>(
-                 glyph->y +
-                 glyph->height) -
-             uv_inset) /
-                atlas_h);
+            static_cast<float>(glyph->x + glyph->width) / atlas_w,
+            static_cast<float>(glyph->y + glyph->height) / atlas_h);
 
         draw->AddImage(
             *gpu_atlas->texture,
@@ -2968,10 +2836,10 @@ void DrawPS3FontUI(
             color);
       }
 
-      pen_x +=
-          static_cast<float>(
-              glyph->advance) *
-          glyph_scale;
+      pen_x += static_cast<float>(glyph->advance) * sx;
+      if (first_glyph_on_line)
+        pen_x += static_cast<float>(glyph->bearing) * sx;
+      first_glyph_on_line = false;
     }
 
     if (std::find(
@@ -2985,11 +2853,11 @@ void DrawPS3FontUI(
 
       std::fprintf(
           stderr,
-          "[moh-ps3-font] exact replacement ACTIVE: "
-          "font=%s native-height=%.1f logical-height=%.1f\n",
-          font_name.c_str(),
-          line_height,
-          target_logical_height);
+          "[moh-ps3-font] EBOOT CFont geometry ACTIVE: "
+          "font=%s canvas=640x448 scale=(%.3f,%.3f) height=%.2f "
+          "signed-spacing raw-UV no-hold\n",
+          font_name.c_str(), request.scale_x, request.scale_y,
+          request.requested_height);
     }
   }
 }

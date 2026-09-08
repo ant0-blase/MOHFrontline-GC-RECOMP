@@ -466,7 +466,7 @@ bool ParseSFNH(
             bearing_advance >> 16);
 
     glyph.advance =
-        static_cast<u16>(
+        static_cast<std::int16_t>(
             bearing_advance & 0xffffu);
 
     font.glyphs.emplace_back(
@@ -517,7 +517,7 @@ void LogGlyph(
       stderr,
       "[moh-ps3-font]   U+%04X "
       "xy=%u,%u wh=%ux%u "
-      "bearing=%d advance=%u "
+      "spacing-before=%d spacing-after=%d "
       "flags=%04X\n",
       static_cast<unsigned>(
           glyph->codepoint),
@@ -527,7 +527,7 @@ void LogGlyph(
       glyph->height,
       static_cast<int>(
           glyph->bearing),
-      static_cast<unsigned>(
+      static_cast<int>(
           glyph->advance),
       static_cast<unsigned>(
           glyph->flags));

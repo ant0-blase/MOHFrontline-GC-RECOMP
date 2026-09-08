@@ -1266,6 +1266,12 @@ TCacheEntry* TextureCacheBase::Load(u32 stage)
 
 TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
 {
+  const TextureInfo ps3_draw_texture_info = TextureInfo::FromStage(stage);
+  const u64 ps3_draw_fast_key =
+      PS3Compass::CurrentDrawMaterialKey(ps3_draw_texture_info);
+  if (ps3_draw_fast_key != 0)
+    force_reload = true;
+
   // if this stage was not invalidated by changes to texture registers, keep the current texture
   if (!force_reload && TMEM::IsValid(stage) && m_bound_textures[stage])
   {
@@ -1325,6 +1331,9 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
 {
   if (!texture_info.IsDataValid())
     return {};
+
+  const u64 ps3_draw_material_key =
+      PS3Compass::CurrentDrawMaterialKey(texture_info);
 
   // Hash assigned to texcache entry (also used to generate filenames used for texture dumping and
   // custom texture lookup)
@@ -1480,7 +1489,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     else
     {
       // For normal textures, all texture parameters need to match
-      if (!entry->IsEfbCopy() && entry->hash == full_hash && entry->format == full_format &&
+      const bool ps3_material_context_matches =
+          ps3_draw_material_key != 0 ?
+              (entry->is_ps3_compass &&
+               entry->ps3_material_key == ps3_draw_material_key) :
+              (entry->ps3_material_key == 0);
+
+      if (!entry->IsEfbCopy() && ps3_material_context_matches &&
+          entry->hash == full_hash && entry->format == full_format &&
           entry->native_levels >= texture_info.GetLevelCount() &&
           entry->native_width == texture_info.GetRawWidth() &&
           entry->native_height == texture_info.GetRawHeight())
@@ -1536,8 +1552,14 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     }
   }
 
-  // This lookup runs only after normal address-cache hits have been exhausted.
-  auto ps3_compass = PS3Compass::Find(texture_info);
+  // Exact MSH/DMF material -> current-level TPK -> rsx.viv wins first.
+  // Legacy hash/name/fingerprint lookup is only a fallback when the draw has no
+  // proven authored material identity.
+  const auto ps3_draw_material = PS3Compass::FindDrawMaterial(texture_info);
+  auto ps3_compass = ps3_draw_material ? ps3_draw_material.data :
+                                       PS3Compass::Find(texture_info);
+  const u64 ps3_material_key =
+      ps3_draw_material ? ps3_draw_material.key : 0;
 
   // Search the texture cache for normal textures by hash
   //
@@ -1634,6 +1656,7 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
                          has_arbitrary_mipmaps, skip_texture_dump);
   if (!entry) return entry;
   entry->is_ps3_compass = bool(ps3_compass);
+  entry->ps3_material_key = ps3_material_key;
   if (ps3_compass)
     PS3Compass::NotifyTextureUploaded(texture_info);
   entry->hires_texture = std::move(hires_texture);

@@ -19,8 +19,11 @@ struct Glyph
   std::uint32_t width = 0;
   std::uint32_t height = 0;
 
+  // EBOOT 0x36E78/0x36FDC consumes both halves of SFNH +0x14 as
+  // signed horizontal spacing. They are not a conventional bearing plus
+  // unsigned advance pair.
   std::int16_t bearing = 0;
-  std::uint16_t advance = 0;
+  std::int16_t advance = 0;
 };
 
 struct Font

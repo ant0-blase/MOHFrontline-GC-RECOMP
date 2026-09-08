@@ -201,6 +201,22 @@ std::optional<TextureResource> FindTextureResource(std::string_view level, std::
   if (it == c.records.end() || !c.rsx) return {};
   return TextureResource{it->second, c.metadata_source, c.rsx->relative_path};
 }
+
+std::vector<TextureResource> ListTextureResources(std::string_view level)
+{
+  std::scoped_lock lock(mutex);
+  auto& c = Get(level);
+  std::vector<TextureResource> resources;
+  if (!c.rsx)
+    return resources;
+
+  resources.reserve(c.records.size());
+  for (const auto& entry : c.records)
+    resources.push_back(TextureResource{entry.second, c.metadata_source, c.rsx->relative_path});
+
+  return resources;
+}
+
 std::vector<std::uint8_t> ReadTexturePayload(std::string_view level, std::string_view name)
 {
   std::scoped_lock lock(mutex);

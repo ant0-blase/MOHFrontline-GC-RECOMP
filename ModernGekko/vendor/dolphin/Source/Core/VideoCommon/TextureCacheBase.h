@@ -132,6 +132,9 @@ struct TCacheEntry
   bool is_efb_copy = false;
   bool is_custom_tex = false;
   bool is_ps3_compass = false;
+  // Authored PS3 material identity for an active MSH/DMF draw.
+  // Keeps the texture cache from reusing a different material at the same GC address.
+  u64 ps3_material_key = 0;
   bool may_have_overlapping_textures = true;
   // indicates that the mips in this texture are arbitrary content, aren't just downscaled
   bool has_arbitrary_mips = false;

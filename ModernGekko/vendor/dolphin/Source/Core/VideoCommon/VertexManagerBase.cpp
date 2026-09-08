@@ -2267,18 +2267,6 @@ void VertexManagerBase::RenderDrawCall(
         const std::size_t ps3_index_count =
             submesh.indices.size() +
             (g_backend_info.bSupportsPrimitiveRestart ? submesh.indices.size() / 3 : 0);
-        // Thompson PS3 MSH carries a secondary UV set which is not the diffuse
-        // map used by the GameCube TEV pass. Feeding that UV1 into texcoord1
-        // makes the diffuse texture look scrambled on the replacement model.
-        // Until the PS3 material/TEV bridge owns the draw, mirror authored UV0
-        // into both GC texture coordinates for this weapon only.
-        const std::string_view ps3_source =
-            match.owner ? std::string_view(match.owner->source_name) : std::string_view{};
-        const bool thompson_uv0 =
-            ps3_source.find("thompson") != std::string_view::npos ||
-            ps3_source.find("Thompson") != std::string_view::npos ||
-            ps3_source.find("tommy") != std::string_view::npos ||
-            ps3_source.find("Tommy") != std::string_view::npos;
 
         bool stream_ok =
             submesh.vertex_count <= 65535 &&
@@ -2291,8 +2279,7 @@ void VertexManagerBase::RenderDrawCall(
             attribute_is_float(decl.texcoords[0], 2) &&
             attribute_is_float(decl.texcoords[1], 2) &&
             (!decl.texcoords[0].enable || submesh.has_uv0) &&
-            (!decl.texcoords[1].enable || submesh.has_uv1 ||
-             (thompson_uv0 && submesh.has_uv0));
+            (!decl.texcoords[1].enable || submesh.has_uv1);
 
         // Preserve GC constant tint, but do not broadcast an authored varying
         // vertex-color field onto an unrelated PS3 vertex ordering.
@@ -2369,22 +2356,8 @@ void VertexManagerBase::RenderDrawCall(
                 std::memcpy(destination + decl.texcoords[0].offset, source.uv0.data(),
                             sizeof(float) * 2);
               if (decl.texcoords[1].enable)
-              {
-                const auto& uv1 = thompson_uv0 ? source.uv0 : source.uv1;
-                std::memcpy(destination + decl.texcoords[1].offset, uv1.data(),
+                std::memcpy(destination + decl.texcoords[1].offset, source.uv1.data(),
                             sizeof(float) * 2);
-              }
-
-              if (thompson_uv0)
-              {
-                static bool thompson_uv_logged = false;
-                if (!thompson_uv_logged)
-                {
-                  thompson_uv_logged = true;
-                  std::fprintf(stderr,
-                               "[moh-ps3-msh] Thompson UV fix ACTIVE: PS3 UV0 mirrored to GC texcoord1\n");
-                }
-              }
 
               m_cur_buffer_pointer += vertex_stride;
             }

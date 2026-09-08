@@ -996,6 +996,7 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
   const auto& decoded = *pair->ps3->decoded;
   pair->ps3_group_to_gc.assign(decoded.skin_groups.size(), -1);
   pair->mapped_skin_groups = 0;
+  std::unordered_map<std::string, std::size_t> next_occurrence;
   for (std::size_t i = 0; i < decoded.skin_groups.size(); ++i)
   {
     const auto& group = decoded.skin_groups[i];
@@ -1004,11 +1005,19 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
     // Codex recovery probe established that PS3 stores the old 12-bit blend
     // coefficient as float/4096. Preserve truncation; do not renormalize it.
     const int blend_q = static_cast<int>(group.blend * 4096.0f);
-    const auto it = gc_by_key.find(
-        SkinGroupKey(decoded.bone_refs[group.bone_a], decoded.bone_refs[group.bone_b], blend_q));
-    if (it == gc_by_key.end() || it->second.size() != 1)
+    const std::string key =
+        SkinGroupKey(decoded.bone_refs[group.bone_a], decoded.bone_refs[group.bone_b], blend_q);
+    const auto it = gc_by_key.find(key);
+    if (it == gc_by_key.end())
       continue;
-    pair->ps3_group_to_gc[i] = static_cast<s16>(it->second.front());
+
+    // Thompson contains duplicate groups with identical bone/blend keys. Consume
+    // equal keys in authored occurrence order; strict palette validation below
+    // still rejects an uncertain draw before any PS3 vertex is submitted.
+    std::size_t& occurrence = next_occurrence[key];
+    if (occurrence >= it->second.size())
+      continue;
+    pair->ps3_group_to_gc[i] = static_cast<s16>(it->second[occurrence++]);
     ++pair->mapped_skin_groups;
   }
 }
@@ -2065,18 +2074,104 @@ SkinnedPaletteAnalysis AnalyzeCurrentSkinnedPalette()
 
 SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
 {
-  // No legacy unsafe bypass: finite XF values and names never prove a bind.
-  // Partial debugging cannot bypass the mathematical validation either.
-  static const bool replace = EnvSwitchLocal("MOH_PS3_DMF_REPLACE", false);
-  static const bool allow_partial = EnvSwitchLocal("MOH_PS3_DMF_ALLOW_PARTIAL", false);
+  // Thompson-only bridge. The existing VertexManager path still performs the
+  // final declaration/XF/finite-matrix checks before replacing the GC draw.
+  static const bool replace = EnvSwitchLocal("MOH_PS3_DMF_REPLACE", true);
   const auto& draw = g_current_dmf_draw;
-  if (!replace || !draw.prepared)
+  if (!replace || !draw.prepared || !draw.owner || !draw.owner->decoded ||
+      draw.gc_name != "th_weapondday.dmf")
     return {};
+
   const auto& ready = draw.prepared->readiness;
-  if (!ready.bind_valid || !ready.skeleton_valid || (!allow_partial && !ready.Ready()))
+  if (!ready.geometry_valid || !ready.bind_valid || !ready.skeleton_valid)
     return {};
-  // Prepared corrected vertex buffers are required before this gate can open.
-  return {};
+
+  const auto& analysis = draw.prepared->analysis;
+  if (!analysis.valid || analysis.ps3_material_clusters != 1 ||
+      analysis.total_triangles == 0 ||
+      analysis.selected_triangles != analysis.total_triangles ||
+      analysis.ambiguous_triangles != 0 || analysis.unmapped_triangles != 0)
+    return {};
+
+  std::size_t gc_material_draws = 0;
+  for (const auto& [signature, candidates] : g_dmf_display_list_candidates)
+  {
+    (void)signature;
+    for (const auto& candidate : candidates)
+      if (candidate.gc_name == draw.gc_name &&
+          candidate.gc_material_name == draw.gc_material_name)
+        ++gc_material_draws;
+  }
+  if (gc_material_draws != 1)
+    return {};
+
+  const DMFCluster* selected_cluster = nullptr;
+  for (const auto& cluster : draw.owner->decoded->clusters)
+  {
+    if (cluster.material_name != draw.gc_material_name)
+      continue;
+    if (selected_cluster)
+      return {};
+    selected_cluster = &cluster;
+  }
+
+  if (!selected_cluster || !selected_cluster->has_position ||
+      !selected_cluster->has_normal || !selected_cluster->has_uv0 ||
+      selected_cluster->positions.empty() ||
+      selected_cluster->positions.size() != selected_cluster->normals.size() ||
+      selected_cluster->positions.size() != selected_cluster->uv0.size() ||
+      selected_cluster->positions.size() != selected_cluster->vertex_palette_slots.size())
+    return {};
+
+  std::vector<u8> matrix_indices(selected_cluster->positions.size());
+  for (std::size_t vertex = 0; vertex < selected_cluster->positions.size(); ++vertex)
+  {
+    const u16 local_slot = selected_cluster->vertex_palette_slots[vertex];
+    if (local_slot >= selected_cluster->palette_groups.size())
+      return {};
+    const u16 ps3_group = selected_cluster->palette_groups[local_slot];
+    if (ps3_group >= draw.ps3_group_to_gc.size())
+      return {};
+    const s16 gc_group = draw.ps3_group_to_gc[ps3_group];
+    if (gc_group < 0 || gc_group > 255)
+      return {};
+
+    const auto first = std::find(draw.gc_palette_groups.begin(), draw.gc_palette_groups.end(),
+                                 static_cast<u8>(gc_group));
+    if (first == draw.gc_palette_groups.end())
+      return {};
+    if (std::find(first + 1, draw.gc_palette_groups.end(), static_cast<u8>(gc_group)) !=
+        draw.gc_palette_groups.end())
+      return {};
+
+    const std::size_t matrix_slot =
+        static_cast<std::size_t>(std::distance(draw.gc_palette_groups.begin(), first));
+    const std::size_t matrix_id = matrix_slot * 3u;
+    if (matrix_id > 255u)
+      return {};
+    matrix_indices[vertex] = static_cast<u8>(matrix_id);
+  }
+
+  static bool logged = false;
+  if (!logged)
+  {
+    logged = true;
+    std::fprintf(stderr,
+                 "[moh-ps3-dmf] Thompson STRICT replacement READY: material=%s "
+                 "verts=%zu tris=%zu palette=%zu groups=%zu/%zu\n",
+                 draw.gc_material_name.data(), selected_cluster->positions.size(),
+                 selected_cluster->indices.size() / 3, draw.gc_palette_groups.size(),
+                 std::count_if(draw.ps3_group_to_gc.begin(), draw.ps3_group_to_gc.end(),
+                               [](s16 value) { return value >= 0; }),
+                 draw.ps3_group_to_gc.size());
+  }
+
+  SkinnedDrawReplacement replacement;
+  replacement.owner = draw.owner;
+  replacement.cluster = selected_cluster;
+  replacement.position_matrix_indices = std::move(matrix_indices);
+  replacement.gc_material_draws = gc_material_draws;
+  return replacement;
 }
 
 StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 stride, u32 offset)

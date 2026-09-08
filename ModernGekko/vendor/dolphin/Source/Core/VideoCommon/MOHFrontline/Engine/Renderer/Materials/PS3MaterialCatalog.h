@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include <optional>
+#include <vector>
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/TPK.h"
 #include <array>
 #include "VideoCommon/PS3RemasterAssets.h"
@@ -18,6 +19,7 @@ struct TextureResource
   std::string metadata_source, rsx_source;
 };
 std::optional<TextureResource> FindTextureResource(std::string_view level, std::string_view name);
+std::vector<TextureResource> ListTextureResources(std::string_view level);
 std::shared_ptr<const std::vector<PS3TextureDecoder::CompressedLevel>> LoadCompressedTexture(
     std::string_view level, std::string_view exact_name);
 std::vector<std::uint8_t> ReadTexturePayload(std::string_view level, std::string_view name);

@@ -1,6 +1,7 @@
 #include "VideoCommon/PS3Compass.h"
 #include "VideoCommon/PS3NamedSky.h"
 #include "VideoCommon/PS3AssetPort.h"
+#include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -37,6 +39,11 @@ namespace PS3Compass
 {
 namespace
 {
+std::shared_ptr<VideoCommon::CustomTextureData>
+DecodeExactPS3TPKTexture(std::string_view scope, std::string_view name);
+
+void QueueRSXUpload(const TextureInfo& info, std::string_view level, std::string_view name);
+
 struct Resource
 {
   std::string filename;
@@ -942,6 +949,9 @@ struct Auto3DCandidate
   std::string relative_path;
   u32 width = 0;
   u32 height = 0;
+  // True for virtual textures whose payload comes from current-level rsx.viv
+  // and whose metadata comes from tpkX_X.tpk.
+  bool from_tpk = false;
   Auto3DFingerprint fingerprint;
 };
 
@@ -962,6 +972,9 @@ std::unordered_map<
     std::shared_ptr<VideoCommon::CustomTextureData>>
     strict_level_matches;
 std::unordered_set<u64> strict_level_rejected;
+// Fuzzy TPK matching is deliberately one-to-one.  Exact hash/name mappings
+// still may reuse a material; only heuristic assignments are protected here.
+std::unordered_map<std::string, u64> strict_tpk_owners;
 
 struct SkyGCProbe
 {
@@ -1205,6 +1218,7 @@ void ResetAuto3DCacheLocked()
   auto3d_rejected.clear();
   strict_level_matches.clear();
   strict_level_rejected.clear();
+  strict_tpk_owners.clear();
   sky_gc_probes.clear();
   sky_exact_assignments.clear();
   sky_assignment_logged = false;
@@ -2224,6 +2238,9 @@ void BuildAuto3DCandidatesLocked()
 
   std::size_t tried = 0;
   std::size_t decoded_count = 0;
+  std::size_t rsx_tried = 0;
+  std::size_t rsx_decoded = 0;
+  std::unordered_set<std::string> candidate_stems;
 
   for (const auto& asset :
        PS3RemasterAssets::GetAssets())
@@ -2290,7 +2307,99 @@ void BuildAuto3DCandidatesLocked()
     auto3d_candidates.push_back(
         std::move(candidate));
 
+    candidate_stems.insert(
+        StemKey(asset.filename));
+
     ++decoded_count;
+  }
+
+  // The safe/strict matcher historically indexed only SSH resources exposed by
+  // PS3RemasterAssets. Frontline's level TPK is different: its metadata lives
+  // in tpkX_X.tpk while the actual GPU texture payloads live in rsx.viv.
+  //
+  // Add those live TPK/RSX textures to the SAME conservative fingerprint
+  // matcher instead of inventing a weaker dimension-only replacement path.
+  // Existing strict score/margin/aspect/scale gates still decide whether a GC
+  // texture is safe to replace.
+  std::string level = scope;
+  while (!level.empty() && level.back() == '/')
+    level.pop_back();
+  if (const auto slash = level.find_last_of('/'); slash != std::string::npos)
+    level.erase(0, slash + 1);
+
+  if (PS3AssetPort::IsTPKRSXEnabled() && !level.empty())
+  {
+    for (const auto& resource :
+         MOHFrontline::Materials::ListTextureResources(level))
+    {
+      std::string material_name =
+          Filename(resource.texture.name);
+
+      if (material_name.ends_with(".ssh") ||
+          material_name.ends_with(".gsh"))
+      {
+        material_name.resize(material_name.size() - 4);
+      }
+
+      // Normal maps are not substitutes for the GameCube diffuse TEV stage.
+      if (material_name.empty() ||
+          material_name.ends_with("_nm") ||
+          material_name.ends_with("-nm"))
+      {
+        continue;
+      }
+
+      const std::string stem =
+          StemKey(material_name);
+
+      // Prefer an already indexed SSH with the same authored identity. This
+      // also prevents duplicate candidates from collapsing the uniqueness
+      // margin to zero.
+      if (stem.empty() ||
+          candidate_stems.contains(stem))
+      {
+        continue;
+      }
+
+      ++rsx_tried;
+
+      const auto levels =
+          MOHFrontline::Materials::LoadTexture(
+              level, material_name);
+
+      if (!levels || levels->empty())
+        continue;
+
+      const auto& base = levels->front();
+      if (base.rgba.size() <
+              std::size_t(base.width) * base.height * 4u ||
+          base.width < 8 || base.height < 8 ||
+          base.width > 4096 || base.height > 4096)
+      {
+        continue;
+      }
+
+      Auto3DCandidate candidate;
+      candidate.relative_path =
+          Normalize(scope + "level.viv::tpk" + level +
+                    ".tpk::" + material_name);
+      candidate.width = base.width;
+      candidate.height = base.height;
+      candidate.from_tpk = true;
+      candidate.fingerprint =
+          MakeAuto3DFingerprint(
+              base.rgba.data(),
+              base.width,
+              base.height);
+
+      if (candidate.fingerprint.contrast < 0.018f)
+        continue;
+
+      auto3d_candidates.push_back(
+          std::move(candidate));
+      candidate_stems.insert(stem);
+      ++rsx_decoded;
+    }
   }
 
   auto3d_built_scope = scope;
@@ -2298,10 +2407,14 @@ void BuildAuto3DCandidatesLocked()
   std::fprintf(
       stderr,
       "[moh-ps3-auto3d] SAFE candidate index: "
-      "scope=%s eligible=%zu decoded=%zu\n",
+      "scope=%s ssh_eligible=%zu ssh_decoded=%zu "
+      "rsx_eligible=%zu rsx_decoded=%zu total=%zu\n",
       scope.c_str(),
       tried,
-      decoded_count);
+      decoded_count,
+      rsx_tried,
+      rsx_decoded,
+      auto3d_candidates.size());
 }
 
 u64 Auto3DKey(const TextureInfo& info)
@@ -2339,6 +2452,22 @@ std::shared_ptr<VideoCommon::CustomTextureData>
 DecodeAuto3DWinner(
     std::string_view relative_path)
 {
+  // TPK candidates are virtual paths: their bytes are not standalone files.
+  // Resolve the descriptor through tpkX_X.tpk and read the exact payload range
+  // from rsx.viv through PS3MaterialCatalog.
+  if (const auto marker =
+          relative_path.find(".tpk::");
+      marker != std::string_view::npos)
+  {
+    const std::string level =
+        MOHFrontline::NativeAssets::GetCurrentLevel();
+    if (level.empty())
+      return nullptr;
+
+    return DecodeExactPS3TPKTexture(
+        level, relative_path.substr(marker + 6));
+  }
+
   const auto* asset =
       PS3RemasterAssets::FindByRelativePath(
           relative_path);
@@ -2352,6 +2481,110 @@ DecodeAuto3DWinner(
       Normalize(asset->relative_path);
 
   return DecodeResource(&temporary);
+}
+
+void QueueAuto3DRSXUpload(
+    const TextureInfo& info,
+    std::string_view relative_path)
+{
+  const auto marker =
+      relative_path.find(".tpk::");
+  if (marker == std::string_view::npos)
+    return;
+
+  const std::string level =
+      MOHFrontline::NativeAssets::GetCurrentLevel();
+  if (level.empty())
+    return;
+
+  QueueRSXUpload(
+      info, level, relative_path.substr(marker + 6));
+}
+
+struct DrawTPKIdentity
+{
+  std::string level;
+  std::string name;
+  std::string source;
+  std::size_t submesh = 0;
+};
+
+std::string CanonicalDrawTPKHint(std::string_view hint)
+{
+  std::string name = Filename(hint);
+  if (name.ends_with(".ssh") || name.ends_with(".gsh") ||
+      name.ends_with(".dds") || name.ends_with(".tga") ||
+      name.ends_with(".png"))
+  {
+    name.resize(name.size() - 4);
+  }
+
+  if (name.ends_with("_nm") || name.ends_with("-nm") ||
+      name.ends_with("_normal") || name.ends_with("-normal"))
+  {
+    return {};
+  }
+  return name;
+}
+
+std::optional<DrawTPKIdentity> ResolveDrawTPKIdentity()
+{
+  if (!PS3AssetPort::IsTPKRSXEnabled())
+    return std::nullopt;
+
+  const std::string level = MOHFrontline::NativeAssets::GetCurrentLevel();
+  if (level.empty())
+    return std::nullopt;
+
+  std::unordered_set<std::string> matches;
+  std::string source;
+  std::size_t submesh = 0;
+
+  auto consider = [&](std::string_view hint, std::string_view owner, std::size_t index) {
+    const std::string candidate = CanonicalDrawTPKHint(hint);
+    if (candidate.empty() || !MOHFrontline::Materials::HasTexture(level, candidate))
+      return;
+
+    matches.insert(candidate);
+    if (source.empty())
+    {
+      source.assign(owner);
+      submesh = index;
+    }
+  };
+
+  // MSH.cpp fills material_hints only when its material table proves a strict
+  // one-record-per-submesh relationship. That makes this identity-based,
+  // not a visual/dimension guess.
+  const auto& rigid = PS3MeshPort::CurrentStaticDraw();
+  if (rigid && rigid.submesh)
+  {
+    for (const auto& hint : rigid.submesh->material_hints)
+      consider(hint, rigid.mesh ? rigid.mesh->source_name : "<static>", rigid.submesh_index);
+  }
+
+  // DMF already carries its authored prepared material name.
+  const auto skinned = PS3MeshPort::CurrentSkinnedDraw();
+  if (skinned && skinned.prepared && skinned.prepared->readiness.Ready() &&
+      !skinned.prepared->material_name.empty())
+  {
+    consider(skinned.prepared->material_name,
+             skinned.owner ? skinned.owner->source_name : "<skinned>",
+             skinned.cluster_index);
+  }
+
+  // Never guess when a material record resolves to several TPK resources.
+  if (matches.size() != 1)
+    return std::nullopt;
+
+  return DrawTPKIdentity{level, *matches.begin(), source, submesh};
+}
+
+u64 DrawTPKKey(const DrawTPKIdentity& identity)
+{
+  const std::string text = identity.level + "/" + identity.name;
+  u64 key = Common::GetHash64(reinterpret_cast<const u8*>(text.data()), text.size(), 0);
+  return key ? key : 1;
 }
 
 std::shared_ptr<VideoCommon::CustomTextureData>
@@ -2471,6 +2704,30 @@ FindStrictCurrentLevelTexture(const TextureInfo& info)
                "comp.viv::") !=
                std::string::npos);
 
+      const bool tpk_candidate =
+          candidate.from_tpk ||
+          candidate.relative_path.find(".tpk::") !=
+              std::string::npos;
+
+      // The exact hash path runs before this matcher and is allowed to map
+      // whatever authored format it proves.  This block is only the visual
+      // fallback, so keep it on the GC world-material class we have actually
+      // validated: CMPR.  This prevents CI8/RGB565/HUD 32/64px textures from
+      // turning into US5/ID_FRONT/etc.
+      if (tpk_candidate &&
+          (info.GetTextureFormat() != TextureFormat::CMPR ||
+           width < 128 || height < 128))
+      {
+        continue;
+      }
+
+      if (tpk_candidate)
+      {
+        const auto owner = strict_tpk_owners.find(candidate.relative_path);
+        if (owner != strict_tpk_owners.end() && owner->second != key)
+          continue;
+      }
+
       // This deliberately rejects global weapon/material candidates.
       if (!exact_sky &&
           !current_archive)
@@ -2520,8 +2777,33 @@ FindStrictCurrentLevelTexture(const TextureInfo& info)
           static_cast<float>(
               height);
 
-      if (!IsPowerOfTwoLikeScale(scale_x) ||
-          !IsPowerOfTwoLikeScale(scale_y))
+      if (tpk_candidate)
+      {
+        // Frontline PS3 TPK evidence from the exact mappings overwhelmingly
+        // follows GC 128 -> PS3 256 and GC 256 -> PS3 512.  Equal-size is also
+        // permitted for resources such as PISTOL_GRAFT.  Crucially, reject
+        // 64 -> 256/512, 32 -> 256 and 128 -> 512 heuristic matches.
+        const auto near_scale =
+            [](float value, float target)
+            {
+              return std::abs(
+                         std::log(
+                             std::max(value, 0.001f) /
+                             target)) <= 0.10f;
+            };
+
+        const bool same_size =
+            near_scale(scale_x, 1.0f) &&
+            near_scale(scale_y, 1.0f);
+        const bool ps3_double =
+            near_scale(scale_x, 2.0f) &&
+            near_scale(scale_y, 2.0f);
+
+        if (!same_size && !ps3_double)
+          continue;
+      }
+      else if (!IsPowerOfTwoLikeScale(scale_x) ||
+               !IsPowerOfTwoLikeScale(scale_y))
       {
         continue;
       }
@@ -2643,9 +2925,22 @@ FindStrictCurrentLevelTexture(const TextureInfo& info)
     return nullptr;
   }
 
+  QueueAuto3DRSXUpload(info, chosen);
+
   {
     std::scoped_lock lock(
         auto3d_mutex);
+
+    if (chosen.find(".tpk::") != std::string::npos)
+    {
+      const auto owner = strict_tpk_owners.find(chosen);
+      if (owner != strict_tpk_owners.end() && owner->second != key)
+      {
+        strict_level_rejected.insert(key);
+        return nullptr;
+      }
+      strict_tpk_owners[chosen] = key;
+    }
 
     strict_level_matches[key] =
         decoded;
@@ -2743,6 +3038,307 @@ u64 ExactFNV1a64(const u8* data, std::size_t size)
   }
   return hash;
 }
+
+
+struct GCTPKExactEntry
+{
+  std::string name;
+  u32 gc_width = 0;
+  u32 gc_height = 0;
+  u32 gc_format = 0;
+  u64 gc_fnv1a = 0;
+};
+
+std::mutex gc_tpk_catalog_mutex;
+std::unordered_map<std::string, std::vector<GCTPKExactEntry>> gc_tpk_catalogs;
+std::unordered_set<std::string> gc_tpk_catalog_attempted;
+
+u16 GCTPKBE16(const u8* p)
+{
+  return static_cast<u16>((u16(p[0]) << 8) | u16(p[1]));
+}
+
+u32 GCTPKBE24(const u8* p)
+{
+  return (u32(p[0]) << 16) | (u32(p[1]) << 8) | u32(p[2]);
+}
+
+bool ReadGCTPKFile(const std::filesystem::path& path, std::vector<u8>* out)
+{
+  if (!out)
+    return false;
+
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file)
+    return false;
+
+  const std::streamoff end = file.tellg();
+  if (end <= 0 || end > 512ll * 1024ll * 1024ll)
+    return false;
+
+  file.seekg(0, std::ios::beg);
+  out->resize(static_cast<std::size_t>(end));
+  return bool(file.read(reinterpret_cast<char*>(out->data()),
+                        static_cast<std::streamsize>(out->size())));
+}
+
+std::filesystem::path ResolveGCLevelVIV(std::string_view level)
+{
+  if (level.empty())
+    return {};
+
+  const auto underscore = level.find('_');
+  if (underscore == std::string_view::npos || underscore == 0)
+    return {};
+
+  const std::string mission(level.substr(0, underscore));
+  const std::filesystem::path relative =
+      std::filesystem::path("extracted") / "files" / "DATA" /
+      mission / std::string(level) / "level.viv";
+
+  std::vector<std::filesystem::path> candidates;
+
+  std::error_code cwd_error;
+  auto base = std::filesystem::current_path(cwd_error);
+  if (!cwd_error)
+  {
+    for (unsigned depth = 0; depth < 7 && !base.empty(); ++depth)
+    {
+      candidates.push_back(base / relative);
+      const auto parent = base.parent_path();
+      if (parent == base)
+        break;
+      base = parent;
+    }
+  }
+
+  if (const char* value = std::getenv("MOH_GC_FILES"); value && *value)
+  {
+    const std::filesystem::path root(value);
+    candidates.push_back(root / "DATA" / mission / std::string(level) / "level.viv");
+    candidates.push_back(root / mission / std::string(level) / "level.viv");
+    candidates.push_back(root / relative);
+  }
+
+  if (const char* value = std::getenv("MOH_PS3_FILES"); value && *value)
+  {
+    std::filesystem::path ps3(value);
+    if (Lower(ps3.filename().string()) == "ps3_files")
+    {
+      const auto repo = ps3.parent_path().parent_path();
+      candidates.push_back(repo / relative);
+    }
+  }
+
+  for (const auto& candidate : candidates)
+  {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(candidate, ec) && !ec)
+      return candidate;
+  }
+
+  return {};
+}
+
+bool ExtractGCTPKFromCompactVIV(std::span<const u8> viv,
+                               std::string_view level,
+                               std::vector<u8>* tpk)
+{
+  if (!tpk || viv.size() < 6 || viv[0] != 0xC0 || viv[1] != 0xFB)
+    return false;
+
+  const u32 count = GCTPKBE16(viv.data() + 4);
+  if (!count || count > 4096)
+    return false;
+
+  const std::string wanted = Lower("tpk" + std::string(level) + ".tpk");
+  std::size_t pos = 6;
+
+  for (u32 i = 0; i < count; ++i)
+  {
+    if (pos + 6 > viv.size())
+      return false;
+
+    const u32 offset = GCTPKBE24(viv.data() + pos);
+    const u32 size = GCTPKBE24(viv.data() + pos + 3);
+    pos += 6;
+
+    const std::size_t name_begin = pos;
+    while (pos < viv.size() && viv[pos] != 0 && pos - name_begin <= 255)
+      ++pos;
+
+    if (pos >= viv.size() || pos - name_begin > 255)
+      return false;
+
+    const std::string name(
+        reinterpret_cast<const char*>(viv.data() + name_begin),
+        pos - name_begin);
+    ++pos;
+
+    if (Lower(name) != wanted)
+      continue;
+
+    if (offset > viv.size() || size > viv.size() - offset)
+      return false;
+
+    tpk->assign(viv.begin() + offset, viv.begin() + offset + size);
+    return true;
+  }
+
+  return false;
+}
+
+std::vector<GCTPKExactEntry> ParseEmbeddedGCTPK(std::span<const u8> tpk)
+{
+  std::vector<GCTPKExactEntry> out;
+
+  if (tpk.size() < 0x80 ||
+      tpk[0] != 'T' || tpk[1] != 'P' ||
+      tpk[2] != 'A' || tpk[3] != 'C')
+  {
+    return out;
+  }
+
+  const u32 count = TPKBE32(tpk.data() + 4);
+  const u32 names_offset = TPKBE32(tpk.data() + 8);
+  const u32 pointer_table = TPKBE32(tpk.data() + 12);
+
+  if (!count || count > 512 ||
+      std::uint64_t(names_offset) + std::uint64_t(count) * 16u > tpk.size() ||
+      std::uint64_t(pointer_table) + std::uint64_t(count) * 4u > tpk.size())
+  {
+    return out;
+  }
+
+  out.reserve(count);
+
+  for (u32 i = 0; i < count; ++i)
+  {
+    const std::size_t name_pos =
+        std::size_t(names_offset) + std::size_t(i) * 16u;
+
+    std::size_t name_len = 0;
+    while (name_len < 16 && tpk[name_pos + name_len] != 0)
+      ++name_len;
+
+    if (!name_len)
+      continue;
+
+    const u32 record =
+        TPKBE32(tpk.data() + pointer_table + std::size_t(i) * 4u);
+
+    if (std::uint64_t(record) + 0x80u > tpk.size())
+      continue;
+
+    if (tpk[record + 0x40] != 'S' ||
+        tpk[record + 0x41] != 'H' ||
+        tpk[record + 0x42] != 'P' ||
+        tpk[record + 0x43] != 'G')
+    {
+      continue;
+    }
+
+    const u8 gsh_format = tpk[record + 0x70];
+    if (gsh_format != 0x1E)
+      continue;
+
+    const u32 width = GCTPKBE16(tpk.data() + record + 0x74);
+    const u32 height = GCTPKBE16(tpk.data() + record + 0x76);
+
+    if (!width || !height || width > 4096 || height > 4096)
+      continue;
+
+    const std::uint64_t blocks_x = (std::uint64_t(width) + 7u) / 8u;
+    const std::uint64_t blocks_y = (std::uint64_t(height) + 7u) / 8u;
+    const std::uint64_t payload_size64 = blocks_x * blocks_y * 32u;
+    const std::uint64_t payload_offset64 = std::uint64_t(record) + 0x80u;
+
+    if (!payload_size64 ||
+        payload_size64 > std::numeric_limits<std::size_t>::max() ||
+        payload_offset64 > tpk.size() ||
+        payload_size64 > tpk.size() - payload_offset64)
+    {
+      continue;
+    }
+
+    const std::size_t payload_offset =
+        static_cast<std::size_t>(payload_offset64);
+    const std::size_t payload_size =
+        static_cast<std::size_t>(payload_size64);
+
+    GCTPKExactEntry entry;
+    entry.name.assign(
+        reinterpret_cast<const char*>(tpk.data() + name_pos),
+        name_len);
+    entry.gc_width = width;
+    entry.gc_height = height;
+    entry.gc_format = static_cast<u32>(TextureFormat::CMPR);
+    entry.gc_fnv1a =
+        ExactFNV1a64(tpk.data() + payload_offset, payload_size);
+
+    if (entry.gc_fnv1a)
+      out.push_back(std::move(entry));
+  }
+
+  return out;
+}
+
+std::vector<GCTPKExactEntry> GetExactGCTPKCatalog(std::string_view level)
+{
+  const std::string key = Lower(std::string(level));
+
+  std::scoped_lock lock(gc_tpk_catalog_mutex);
+
+  if (const auto it = gc_tpk_catalogs.find(key);
+      it != gc_tpk_catalogs.end())
+  {
+    return it->second;
+  }
+
+  if (!gc_tpk_catalog_attempted.insert(key).second)
+    return {};
+
+  const auto level_viv = ResolveGCLevelVIV(level);
+  if (level_viv.empty())
+  {
+    std::fprintf(stderr,
+                 "[moh-gc-tpk] GC level.viv not found for level=%s "
+                 "(set MOH_GC_FILES if needed)\n",
+                 key.c_str());
+    return {};
+  }
+
+  std::vector<u8> viv;
+  std::vector<u8> tpk;
+
+  if (!ReadGCTPKFile(level_viv, &viv) ||
+      !ExtractGCTPKFromCompactVIV(viv, level, &tpk))
+  {
+    std::fprintf(stderr,
+                 "[moh-gc-tpk] failed to extract tpk%s.tpk from %s\n",
+                 key.c_str(), level_viv.string().c_str());
+    return {};
+  }
+
+  auto parsed = ParseEmbeddedGCTPK(tpk);
+
+  std::size_t ps3_named = 0;
+  for (const auto& entry : parsed)
+  {
+    if (MOHFrontline::Materials::HasTexture(key, entry.name))
+      ++ps3_named;
+  }
+
+  std::fprintf(stderr,
+               "[moh-gc-tpk] EXACT CATALOG: level=%s gc_entries=%zu "
+               "same_name_ps3=%zu source=%s\n",
+               key.c_str(), parsed.size(), ps3_named,
+               level_viv.string().c_str());
+
+  gc_tpk_catalogs.emplace(key, parsed);
+  return parsed;
+}
+
 
 const PS3RemasterAssets::AssetInfo* FindScopedPS3Asset(std::string_view scope, std::string_view filename)
 {
@@ -3007,6 +3603,124 @@ void ReportRSXUpload(const TextureInfo& info)
   else if (const auto rgba=MOHFrontline::Materials::LoadTexture(identity.level, identity.name))
     write("ps3_texture.dds", MOHFrontline::PS3::EncodeDDS(std::span<const PS3TextureDecoder::Level>(*rgba)));
 }
+
+
+std::shared_ptr<VideoCommon::CustomTextureData>
+FindExactEmbeddedGCTPKTexture(const TextureInfo& info)
+{
+  if (!PS3AssetPort::IsTPKRSXEnabled() ||
+      info.GetTextureFormat() != TextureFormat::CMPR ||
+      !info.GetData() || !info.GetTextureSize())
+  {
+    return nullptr;
+  }
+
+  std::string scope;
+  {
+    std::scoped_lock lock(auto3d_mutex);
+    scope = auto3d_level_scope;
+  }
+
+  while (!scope.empty() && scope.back() == '/')
+    scope.pop_back();
+
+  const std::string level = Filename(scope);
+  if (level.empty())
+    return nullptr;
+
+  const auto catalog = GetExactGCTPKCatalog(level);
+  if (catalog.empty())
+    return nullptr;
+
+  const u64 hash =
+      ExactFNV1a64(info.GetData(), info.GetTextureSize());
+
+  const GCTPKExactEntry* matched = nullptr;
+
+  for (const auto& entry : catalog)
+  {
+    if (entry.gc_width != info.GetRawWidth() ||
+        entry.gc_height != info.GetRawHeight() ||
+        entry.gc_format != static_cast<u32>(info.GetTextureFormat()) ||
+        entry.gc_fnv1a != hash)
+    {
+      continue;
+    }
+
+    if (matched && Lower(matched->name) != Lower(entry.name))
+    {
+      static unsigned ambiguous_logs = 0;
+      if (ambiguous_logs++ < 64)
+      {
+        std::fprintf(stderr,
+                     "[moh-gc-tpk] AMBIGUOUS exact GC payload: level=%s "
+                     "hash=%016llX names=%s/%s -> keep GC\n",
+                     level.c_str(),
+                     static_cast<unsigned long long>(hash),
+                     matched->name.c_str(), entry.name.c_str());
+      }
+      return nullptr;
+    }
+
+    matched = &entry;
+  }
+
+  if (!matched)
+    return nullptr;
+
+  if (!MOHFrontline::Materials::HasTexture(level, matched->name))
+  {
+    static unsigned missing_logs = 0;
+    if (missing_logs++ < 128)
+    {
+      std::fprintf(stderr,
+                   "[moh-gc-tpk] exact GC material has no same-name PS3 TPK "
+                   "resource: level=%s material=%s\n",
+                   level.c_str(), matched->name.c_str());
+    }
+    return nullptr;
+  }
+
+  auto decoded =
+      DecodeExactPS3TPKTexture(scope + "/", matched->name);
+
+  if (NeedsNativeMSHUV(
+          info.GetRawWidth(), info.GetRawHeight(),
+          decoded, matched->name))
+  {
+    return nullptr;
+  }
+
+  if (!decoded)
+    return nullptr;
+
+  QueueRSXUpload(info, level, matched->name);
+
+  static std::mutex exact_log_mutex;
+  static std::unordered_set<std::string> exact_logs;
+  const std::string log_key =
+      level + "/" + matched->name + "/" + std::to_string(hash);
+
+  {
+    std::scoped_lock lock(exact_log_mutex);
+    if (exact_logs.insert(log_key).second)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-gc-tpk] NATIVE EXACT: level=%s "
+          "GC=%ux%u fmt=%u hash=%016llX "
+          "GC_TPK::%s -> PS3_TPK::%s -> rsx.viv\n",
+          level.c_str(),
+          info.GetRawWidth(), info.GetRawHeight(),
+          static_cast<unsigned>(info.GetTextureFormat()),
+          static_cast<unsigned long long>(hash),
+          matched->name.c_str(), matched->name.c_str());
+    }
+  }
+
+  return decoded;
+}
+
 
 std::shared_ptr<VideoCommon::CustomTextureData>
 FindExactTPK1_1(const TextureInfo& info)
@@ -3657,6 +4371,7 @@ FindAuto3D(const TextureInfo& info)
       std::fprintf(stderr, "[moh-ps3-tpk] exact runtime bridge ON\n");
     }
 
+    if (auto exact = FindExactEmbeddedGCTPKTexture(info)) return exact;
     if (auto exact = FindExactLevelPortTexture(info)) return exact;
     if (auto exact = FindExactTPK1_1(info)) return exact;
   }
@@ -3894,6 +4609,8 @@ FindAuto3D(const TextureInfo& info)
     return nullptr;
   }
 
+  QueueAuto3DRSXUpload(info, best_path);
+
   {
     std::scoped_lock lock(auto3d_mutex);
     auto3d_matches[key] = decoded;
@@ -3918,6 +4635,61 @@ FindAuto3D(const TextureInfo& info)
 
 
 }  // namespace
+
+u64 CurrentDrawMaterialKey(const TextureInfo& info)
+{
+  // Only replace the authored diffuse stage of a draw. Other TEV stages,
+  // lightmaps and effect textures stay on the original GC path.
+  if (info.GetStage() != 0 ||
+      !PS3AssetPort::IsTPKRSXEnabled() ||
+      !MohPcLayer::IsPS3TextureReplacementEnabled() ||
+      !PS3RemasterAssets::IsReady() ||
+      !info.IsDataValid() ||
+      info.IsFromTmem() ||
+      info.GetTextureFormat() == TextureFormat::XFB)
+  {
+    return 0;
+  }
+
+  const auto identity = ResolveDrawTPKIdentity();
+  return identity ? DrawTPKKey(*identity) : 0;
+}
+
+DrawMaterialReplacement FindDrawMaterial(const TextureInfo& info)
+{
+  const u64 key = CurrentDrawMaterialKey(info);
+  if (!key)
+    return {};
+
+  const auto identity = ResolveDrawTPKIdentity();
+  if (!identity || DrawTPKKey(*identity) != key)
+    return {};
+
+  auto decoded = DecodeExactPS3TPKTexture(identity->level, identity->name);
+  if (!decoded)
+    return {};
+
+  QueueRSXUpload(info, identity->level, identity->name);
+
+  static std::mutex draw_material_log_mutex;
+  static std::unordered_set<std::string> draw_material_logs;
+  const std::string log_key = identity->level + "|" + identity->source + "|" +
+                              std::to_string(identity->submesh) + "|" + identity->name;
+  {
+    std::scoped_lock lock(draw_material_log_mutex);
+    if (draw_material_logs.insert(log_key).second)
+    {
+      std::fprintf(stderr,
+                   "[moh-ps3-material] DRAW EXACT: level=%s source=%s submesh=%zu "
+                   "stage=%u GC=%ux%u fmt=%u -> TPK::%s\n",
+                   identity->level.c_str(), identity->source.c_str(), identity->submesh,
+                   info.GetStage(), info.GetRawWidth(), info.GetRawHeight(),
+                   static_cast<unsigned>(info.GetTextureFormat()), identity->name.c_str());
+    }
+  }
+
+  return DrawMaterialReplacement{std::move(decoded), key};
+}
 
 int NameIndex(std::string_view name)
 {
@@ -4287,6 +5059,7 @@ void Shutdown()
     auto3d_rejected.clear();
     strict_level_matches.clear();
     strict_level_rejected.clear();
+    strict_tpk_owners.clear();
     sky_gc_probes.clear();
     sky_exact_assignments.clear();
     sky_assignment_logged = false;

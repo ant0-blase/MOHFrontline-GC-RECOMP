@@ -11,6 +11,15 @@ class CustomTextureData;
 }
 namespace PS3Compass
 {
+struct DrawMaterialReplacement
+{
+  std::shared_ptr<VideoCommon::CustomTextureData> data;
+  u64 key = 0;
+  explicit operator bool() const { return data != nullptr && key != 0; }
+};
+
+u64 CurrentDrawMaterialKey(const TextureInfo& info);
+DrawMaterialReplacement FindDrawMaterial(const TextureInfo& info);
 void MarkNamedSkyAddress(u32 address);
 void NotifyTextureUploaded(const TextureInfo& info);
 int NameIndex(std::string_view name);

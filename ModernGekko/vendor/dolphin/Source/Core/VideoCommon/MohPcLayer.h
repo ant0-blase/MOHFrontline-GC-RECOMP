@@ -86,7 +86,10 @@ int GetCurrentWeaponType();
 bool IsPS3FontBridgeReady(const char* font_filename = nullptr);
 bool QueuePS3FontDraw(const char* text, float x, float y, bool centered,
                       const char* font_filename = nullptr,
-                      u32 rgba = 0xFFFFFFFF);
+                      u32 rgba = 0xFFFFFFFF,
+                      float scale_x = 1.0f,
+                      float scale_y = 1.0f,
+                      float requested_height = 0.0f);
 bool IsPS3FontReplacementEnabled();
 void SetPS3FontReplacementEnabled(bool enabled);
 bool IsPS3TextureReplacementEnabled();
