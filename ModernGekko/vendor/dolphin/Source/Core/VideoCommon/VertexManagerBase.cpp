@@ -136,8 +136,10 @@ float MohEnvFloat(const char* name, float fallback)
 
 bool MohCSMEnabled()
 {
-  return MohEnvSwitch("MOH_PS3_RENDERER_ACTIVE", false) &&
-         MohEnvSwitch("MOH_PS3_CSM", true);
+  // Host cascaded shadow maps are disabled for MOH Frontline.
+  // The PS3 asset/material/lighting renderer remains enabled independently.
+  // Returning here prevents CSM state allocation, D32F targets, caster draws and sampling.
+  return false;
 }
 
 MohVec3 FindMohSunDirection(const VertexShaderConstants& constants, bool* from_gx)

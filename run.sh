@@ -226,6 +226,17 @@ mkdir -p "$ROOT/HD/PS3_FILES"
 export MOH_PC_SETTINGS_PATH="$USER_DIR/moh_pc_settings.ini"
 export MOH_PC_INPUT="$PC_INPUT"
 
+# MOH Frontline PS3 host CSM is intentionally disabled.
+# Keep this hard-off even if the parent shell exported old CSM diagnostics.
+# This does NOT disable the PS3 asset/material/lighting/font/mesh renderer.
+export MOH_PS3_CSM=0
+unset MOH_PS3_CSM_DEBUG \
+      MOH_PS3_CSM_FORCE_WRITE MOH_PS3_CSM_FLIP_Y \
+      MOH_PS3_CSM_CAMERA_TEST MOH_PS3_CSM_WORLD_PROBE \
+      MOH_PS3_CSM_WORLD_PROBE_MIN_INDICES MOH_PS3_CSM_TRACE \
+      MOH_PS3_CSM_FAR MOH_PS3_CSM_LAMBDA MOH_PS3_CSM_BIAS \
+      MOH_CSM_QUALITY 2>/dev/null || true
+
 unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_WEAPON_FOV_DEGREES \
       MOH_ASPECT_VALUE MOH_ASPECT_NUM MOH_ASPECT_DEN MOH_ASPECT_AUTO MOH_FPS_TARGET \
       MOH_UI_SAFE MOH_MOUSE_SENSITIVITY MOH_MOUSE_SENSITIVITY_X MOH_MOUSE_SENSITIVITY_Y \

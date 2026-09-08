@@ -3625,16 +3625,85 @@ FindExactEmbeddedGCTPKTexture(const TextureInfo& info)
   while (!scope.empty() && scope.back() == '/')
     scope.pop_back();
 
-  const std::string level = Filename(scope);
+  const u64 hash =
+      ExactFNV1a64(info.GetData(), info.GetTextureSize());
+
+  std::string level = Filename(scope);
+
+  // CACHELESS bootstrap:
+  // The old PS3_PORT_CACHE manifest was also acting as a level/material
+  // identity table. Do not require it. If the named-texture path has not
+  // established auto3d_level_scope yet, recover the authored level directly
+  // from the original GC level.viv -> tpkX_X.tpk catalogs.
+  auto gc_catalog_contains_texture =
+      [&](std::string_view candidate_level)
+      {
+        const auto candidate_catalog =
+            GetExactGCTPKCatalog(candidate_level);
+
+        for (const auto& entry : candidate_catalog)
+        {
+          if (entry.gc_width == info.GetRawWidth() &&
+              entry.gc_height == info.GetRawHeight() &&
+              entry.gc_format ==
+                  static_cast<u32>(info.GetTextureFormat()) &&
+              entry.gc_fnv1a == hash)
+          {
+            return true;
+          }
+        }
+
+        return false;
+      };
+
+  if (level.empty())
+  {
+    // Prefer the level already proven by NativeAssetResolver when available.
+    std::string native_level =
+        Normalize(MOHFrontline::NativeAssets::GetCurrentLevel());
+
+    while (!native_level.empty() && native_level.back() == '/')
+      native_level.pop_back();
+
+    native_level = Filename(native_level);
+
+    if (!native_level.empty() &&
+        gc_catalog_contains_texture(native_level))
+    {
+      level = std::move(native_level);
+    }
+    else
+    {
+      // Cold-start fallback: identify the level from the exact GC texture
+      // payload. This is intentionally exact, not a visual/fuzzy guess.
+      for (const std::string& candidate_level :
+           MOHFrontline::NativeAssets::GetLevels())
+      {
+        if (!gc_catalog_contains_texture(candidate_level))
+          continue;
+
+        level = candidate_level;
+        break;
+      }
+    }
+  }
+
   if (level.empty())
     return nullptr;
+
+  if (scope.empty())
+  {
+    const auto underscore = level.find('_');
+    if (underscore == std::string::npos || underscore == 0)
+      return nullptr;
+
+    scope =
+        "data/" + level.substr(0, underscore) + "/" + level;
+  }
 
   const auto catalog = GetExactGCTPKCatalog(level);
   if (catalog.empty())
     return nullptr;
-
-  const u64 hash =
-      ExactFNV1a64(info.GetData(), info.GetTextureSize());
 
   const GCTPKExactEntry* matched = nullptr;
 
@@ -3708,7 +3777,7 @@ FindExactEmbeddedGCTPKTexture(const TextureInfo& info)
     {
       std::fprintf(
           stderr,
-          "[moh-gc-tpk] NATIVE EXACT: level=%s "
+          "[moh-gc-tpk] CACHELESS EXACT: level=%s "
           "GC=%ux%u fmt=%u hash=%016llX "
           "GC_TPK::%s -> PS3_TPK::%s -> rsx.viv\n",
           level.c_str(),
@@ -4104,7 +4173,7 @@ DecodeLevelPortFile(
   return decoded;
 }
 
-std::shared_ptr<VideoCommon::CustomTextureData>
+[[maybe_unused]] std::shared_ptr<VideoCommon::CustomTextureData>
 FindExactLevelPortTexture(
     const TextureInfo& info)
 {
@@ -4392,7 +4461,9 @@ FindAuto3D(const TextureInfo& info)
     }
 
     if (auto exact = FindExactEmbeddedGCTPKTexture(info)) return exact;
-    if (auto exact = FindExactLevelPortTexture(info)) return exact;
+    // No PS3_PORT_CACHE / exact-textures.tsv in the production path.
+    // GC level.viv provides the exact identity and HD/PS3_FILES provides
+    // the PS3 TPK metadata + rsx.viv payload.
     if (auto exact = FindExactTPK1_1(info)) return exact;
   }
 
