@@ -2,6 +2,7 @@
 #include "VideoCommon/PS3NamedSky.h"
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/PS3MeshPort.h"
+#include "VideoCommon/PS3WorldCPT.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 
@@ -4344,6 +4345,25 @@ FindAuto3D(const TextureInfo& info)
                  PS3AssetPort::IsMSHEnabled() ? "ON" : "OFF",
                  PS3AssetPort::IsDMFEnabled() ? "ON" : "OFF",
                  StrictLevelTexturesEnabled() ? "ON" : "OFF");
+  }
+
+  // CPT/world textures are frequently loaded through manually managed GX
+  // texture cache/TMEM. The generic Auto3D path intentionally rejects TMEM,
+  // but doing that before the world resolver meant PS3WorldCPT was never
+  // reached for the actual level geometry.
+  if (Auto3DEnabled() &&
+      MohPcLayer::IsPS3TextureReplacementEnabled() &&
+      PS3RemasterAssets::IsReady() &&
+      info.IsDataValid() &&
+      info.GetTextureFormat() != TextureFormat::XFB &&
+      info.GetData() &&
+      info.GetTextureSize())
+  {
+    if (auto world = PS3WorldCPT::Find(info))
+      return world;
+
+    if (PS3WorldCPT::IsKnownWorldTexture(info))
+      return nullptr;
   }
 
   if (!Auto3DEnabled() ||

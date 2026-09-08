@@ -135,6 +135,9 @@ struct TCacheEntry
   // Authored PS3 material identity for an active MSH/DMF draw.
   // Keeps the texture cache from reusing a different material at the same GC address.
   u64 ps3_material_key = 0;
+  bool ps3_bind_reported = false;
+  bool ps3_draw_reported = false;
+  bool is_ps3_world_texture = false;
   bool may_have_overlapping_textures = true;
   // indicates that the mips in this texture are arbitrary content, aren't just downscaled
   bool has_arbitrary_mips = false;
@@ -288,6 +291,7 @@ public:
   RcTcacheEntry GetXFBTexture(u32 address, u32 width, u32 height, u32 stride,
                               MathUtil::Rectangle<int>* display_rect);
 
+  void NotifyPS3DrawSubmitted(u32 num_indices);
   virtual void BindTextures(BitSet32 used_textures, const std::array<SamplerState, 8>& samplers);
   void CopyRenderTargetToTexture(u32 dstAddr, EFBCopyFormat dstFormat, u32 width, u32 height,
                                  u32 dstStride, bool is_depth_copy,
@@ -425,6 +429,7 @@ private:
   // m_bound_textures are actually active in the current draw
   // It's valid for textures to be in here after they've been invalidated
   std::array<RcTcacheEntry, 8> m_bound_textures{};
+  BitSet32 m_ps3_draw_texture_stages{};
 
   TexPool m_texture_pool;
   u64 m_last_entry_id = 0;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoBackends/Vulkan/VKGfx.h"
+#include "VideoCommon/TextureCacheBase.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -605,6 +606,7 @@ void VKGfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
 
   vkCmdDrawIndexed(g_command_buffer_mgr->GetCurrentCommandBuffer(), num_indices, 1, base_index,
                    base_vertex, 0);
+  g_texture_cache->NotifyPS3DrawSubmitted(num_indices);
 }
 
 void VKGfx::DispatchComputeShader(const AbstractShader* shader, u32 groupsize_x, u32 groupsize_y,

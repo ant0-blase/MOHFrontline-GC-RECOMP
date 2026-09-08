@@ -3,6 +3,7 @@
 
 #include "VideoCommon/TextureCacheBase.h"
 #include "VideoCommon/PS3Compass.h"
+#include "VideoCommon/PS3WorldCPT.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1094,13 +1095,72 @@ void TextureCacheBase::BindTextures(BitSet32 used_textures,
       g_gfx->SetTexture(i, tentry->texture.get());
       pixel_shader_manager.SetTexDims(i, tentry->native_width, tentry->native_height);
 
-      auto& state = samplers[i];
+      auto state = samplers[i];
+      if (tentry->is_ps3_compass)
+      {
+        // Preserve the existing native/manual sampling LOD policy.
+        // Clamp to the replacement mip chain; mip 0 is an explicit diagnostic.
+        static const bool force_mip0 = PS3WorldCPT::detail::EnvEnabled("MOH_PS3_FORCE_MIP0", false);
+        state.tm1.max_lod = std::min<u32>(state.tm1.max_lod,
+                                        (tentry->texture->GetLevels() - 1) * 16);
+        state.tm1.min_lod = std::min<u32>(state.tm1.min_lod, state.tm1.max_lod);
+        if (force_mip0)
+        {
+          state.tm0.lod_bias = 0;
+          state.tm1.min_lod = 0;
+          state.tm1.max_lod = 0;
+        }
+      }
       g_gfx->SetSamplerState(i, state);
       pixel_shader_manager.SetSamplerState(i, state.tm0.hex, state.tm1.hex);
+      if (tentry->is_ps3_compass && !tentry->ps3_bind_reported &&
+          PS3WorldCPT::detail::TraceEnabled())
+      {
+        tentry->ps3_bind_reported = true;
+        std::fprintf(stderr,
+                     "[moh-ps3-sampler] BIND ACTIVE: stage=%u GC=%ux%u "
+                     "PS3=%ux%u mips=%u material_key=%016llX "
+                     "bias=%.3f min_lod=%.2f max_lod=%.2f\n",
+                     i, tentry->native_width, tentry->native_height,
+                     tentry->texture->GetWidth(), tentry->texture->GetHeight(),
+                     tentry->texture->GetLevels(),
+                     static_cast<unsigned long long>(tentry->ps3_material_key),
+                     static_cast<float>(state.tm0.lod_bias) / 256.f,
+                     static_cast<float>(state.tm1.min_lod) / 16.f,
+                     static_cast<float>(state.tm1.max_lod) / 16.f);
+      }
     }
   }
 
+  m_ps3_draw_texture_stages = used_textures;
   TMEM::FinalizeBinds(used_textures);
+}
+
+void TextureCacheBase::NotifyPS3DrawSubmitted(u32 num_indices)
+{
+  static const bool trace = PS3WorldCPT::detail::TraceEnabled();
+  // Shadow and utility passes do not prove use by the scene material.
+  if (!trace || num_indices == 0 ||
+      g_gfx->GetCurrentFramebuffer() != g_framebuffer_manager->GetEFBFramebuffer())
+    return;
+  for (u32 stage = 0; stage < m_bound_textures.size(); ++stage)
+  {
+    const auto& entry = m_bound_textures[stage];
+    if (!m_ps3_draw_texture_stages[stage] || !entry || !entry->is_ps3_compass ||
+        entry->ps3_draw_reported)
+      continue;
+    entry->ps3_draw_reported = true;
+    std::fprintf(stderr,
+                 "[moh-ps3-render] GPU ACTIVE: backend=Vulkan source=%s stage=%u "
+                 "GC=%08X hash=%016llX material_key=%016llX "
+                 "host=%ux%u mips=%u indices=%u\n",
+                 entry->is_ps3_world_texture ? "CPT-fingerprint-texture" : "PS3-texture",
+                 stage, entry->addr, static_cast<unsigned long long>(entry->hash),
+                 static_cast<unsigned long long>(entry->ps3_material_key),
+                 entry->texture->GetWidth(), entry->texture->GetHeight(),
+                 entry->texture->GetLevels(), num_indices);
+  }
+  m_ps3_draw_texture_stages = {};
 }
 
 class ArbitraryMipmapDetector
@@ -1269,11 +1329,15 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
   const TextureInfo ps3_draw_texture_info = TextureInfo::FromStage(stage);
   const u64 ps3_draw_fast_key =
       PS3Compass::CurrentDrawMaterialKey(ps3_draw_texture_info);
-  if (ps3_draw_fast_key != 0)
-    force_reload = true;
+  const u64 ps3_world_fast_key =
+      PS3WorldCPT::ReplacementKey(ps3_draw_texture_info);
+  const u64 ps3_expected_fast_key =
+      ps3_draw_fast_key != 0 ? ps3_draw_fast_key : ps3_world_fast_key;
 
-  // if this stage was not invalidated by changes to texture registers, keep the current texture
-  if (!force_reload && TMEM::IsValid(stage) && m_bound_textures[stage])
+  if (!force_reload && TMEM::IsValid(stage) && m_bound_textures[stage] &&
+      ((ps3_expected_fast_key == 0 && m_bound_textures[stage]->ps3_material_key == 0) ||
+       (ps3_expected_fast_key != 0 && m_bound_textures[stage]->is_ps3_compass &&
+        m_bound_textures[stage]->ps3_material_key == ps3_expected_fast_key)))
   {
     TCacheEntry* entry = m_bound_textures[stage].get();
     // If the TMEM configuration is such that this texture is more or less guaranteed to still
@@ -1334,6 +1398,9 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
 
   const u64 ps3_draw_material_key =
       PS3Compass::CurrentDrawMaterialKey(texture_info);
+  const u64 ps3_world_material_key = PS3WorldCPT::ReplacementKey(texture_info);
+  const u64 ps3_expected_material_key =
+      ps3_draw_material_key != 0 ? ps3_draw_material_key : ps3_world_material_key;
 
   // Hash assigned to texcache entry (also used to generate filenames used for texture dumping and
   // custom texture lookup)
@@ -1490,9 +1557,9 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
     {
       // For normal textures, all texture parameters need to match
       const bool ps3_material_context_matches =
-          ps3_draw_material_key != 0 ?
+          ps3_expected_material_key != 0 ?
               (entry->is_ps3_compass &&
-               entry->ps3_material_key == ps3_draw_material_key) :
+               entry->ps3_material_key == ps3_expected_material_key) :
               (entry->ps3_material_key == 0);
 
       if (!entry->IsEfbCopy() && ps3_material_context_matches &&
@@ -1559,7 +1626,7 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
   auto ps3_compass = ps3_draw_material ? ps3_draw_material.data :
                                        PS3Compass::Find(texture_info);
   const u64 ps3_material_key =
-      ps3_draw_material ? ps3_draw_material.key : 0;
+      ps3_draw_material ? ps3_draw_material.key : ps3_world_material_key;
 
   // Search the texture cache for normal textures by hash
   //
@@ -1657,8 +1724,13 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
   if (!entry) return entry;
   entry->is_ps3_compass = bool(ps3_compass);
   entry->ps3_material_key = ps3_material_key;
+  entry->is_ps3_world_texture = ps3_compass && ps3_world_material_key != 0 &&
+                                ps3_material_key == ps3_world_material_key;
   if (ps3_compass)
     PS3Compass::NotifyTextureUploaded(texture_info);
+  if (ps3_compass && ps3_world_material_key != 0 &&
+      ps3_material_key == ps3_world_material_key)
+    PS3WorldCPT::NotifyUploaded(texture_info);
   entry->hires_texture = std::move(hires_texture);
   entry->last_load_time = load_time;
   entry->texture_info_name = std::move(texture_name);

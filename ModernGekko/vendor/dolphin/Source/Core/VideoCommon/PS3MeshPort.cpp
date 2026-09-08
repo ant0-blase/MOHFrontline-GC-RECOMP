@@ -2181,6 +2181,28 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
 
   if (g_current_draw)
   {
+    // Thompson is authored as 15 parts, but only a subset of those display
+    // lists is observed by the current runtime replacement path.  Replacing
+    // the observed parts produced a PS3/GC hybrid with mismatched material
+    // order.  Keep the complete static Thompson on the GameCube path until
+    // all sibling DLs can be proven at runtime.
+    const std::string_view source =
+        g_current_draw.owner ? std::string_view(g_current_draw.owner->source_name) :
+                               std::string_view{};
+    if (source.find("thompson") != std::string_view::npos ||
+        source.find("Thompson") != std::string_view::npos)
+    {
+      static bool thompson_static_logged = false;
+      if (!thompson_static_logged)
+      {
+        thompson_static_logged = true;
+        std::fprintf(stderr,
+                     "[moh-ps3-msh] Thompson static replacement SAFE-FALLBACK: "
+                     "incomplete runtime DL coverage; keeping complete GC MSH\n");
+      }
+      return {};
+    }
+
     // Exact runtime address + display-list size + command-tail hash identifies
     // the authored GameCube MSH command stream. A per-batch bounds comparison
     // is invalid here because a GX batch is not the whole PS3 submesh.

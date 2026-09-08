@@ -30,6 +30,29 @@ std::string CanonicalTPKName(std::string_view input)
   return name;
 }
 
+bool IsUnsafeThompsonMaterial(std::string_view input)
+{
+  static const bool allow = [] {
+    const char* value = std::getenv("MOH_PS3_THOMPSON_TPK_UNSAFE");
+    return value && std::string_view(value) == "1";
+  }();
+  if (allow)
+    return false;
+
+  const std::string name = CanonicalTPKName(input);
+  const bool blocked = name == "tom_01wo256" || name == "tom_02met256";
+  if (blocked)
+  {
+    static std::once_flag log_once;
+    std::call_once(log_once, [] {
+      std::fprintf(stderr,
+                   "[moh-ps3-tpk] Thompson SAFE-FALLBACK: TOM_* PS3 material "
+                   "replacement disabled while skinned DMF replacement is unproven\n");
+    });
+  }
+  return blocked;
+}
+
 bool TraceEnabled()
 {
   static const bool enabled = [] { const auto* v = std::getenv("MOH_PS3_RSX_TRACE"); return v && std::string_view(v) == "1"; }();
@@ -151,11 +174,15 @@ Catalog& Get(std::string_view level)
 }
 bool HasTexture(std::string_view level, std::string_view name)
 {
+  if (IsUnsafeThompsonMaterial(name))
+    return false;
   std::scoped_lock lock(mutex);
   return Get(level).records.contains(CanonicalTPKName(name));
 }
 std::shared_ptr<const std::vector<PS3TextureDecoder::Level>> LoadTexture(std::string_view level, std::string_view name)
 {
+  if (IsUnsafeThompsonMaterial(name))
+    return {};
   std::scoped_lock lock(mutex);
   auto& c = Get(level);
   const std::string key = CanonicalTPKName(name);

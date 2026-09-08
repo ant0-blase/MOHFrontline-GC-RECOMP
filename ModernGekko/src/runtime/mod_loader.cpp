@@ -1405,9 +1405,37 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
 
     std::string exact_font;
 
+    // These hostcalls run from inside the CFont draw routines, after r3 has
+    // already been reused as FONT*/scratch state.  The non-stripped GC ELF
+    // keeps the owning CFont* in a callee-saved register: r30 for DrawText,
+    // r29 for DrawTextCentered and r31 for DrawTextCenteredF.  Prefer an
+    // object which was actually registered by the CFont constructor instead
+    // of assuming r3 still contains `this`.
+    std::uint32_t cfont_object = 0u;
+    static constexpr int cfont_registers[] = {30, 29, 31, 3};
+    for (const int reg : cfont_registers)
+    {
+      const std::uint32_t candidate = state->gpr[reg];
+      if (cfont_files.contains(candidate))
+      {
+        cfont_object = candidate;
+        break;
+      }
+    }
+
+    // FONT stores its owning CFont* at +0x70.  This covers interior draw
+    // sites where all three saved-register choices have already moved.
+    if (!cfont_object && IsMem1Address(state->gpr[3]) &&
+        state->gpr[3] <= 0x817FFF8Cu)
+    {
+      const std::uint32_t owner = ReadGuestU32(state, state->gpr[3] + 0x70u);
+      if (cfont_files.contains(owner))
+        cfont_object = owner;
+    }
+
     const auto font_it =
         cfont_files.find(
-            state->gpr[3]);
+            cfont_object);
 
     if (font_it !=
         cfont_files.end())
@@ -1529,7 +1557,6 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     float font_scale_x = 1.0f;
     float font_scale_y = 1.0f;
 
-    const std::uint32_t cfont_object = state->gpr[3];
     if (IsMem1Address(cfont_object) && cfont_object <= 0x817FFFDCu)
     {
       const std::uint32_t gc_font = ReadGuestU32(state, cfont_object + 0x20u);
@@ -1546,6 +1573,17 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
           font_scale_x = live_scale_x;
         if (std::isfinite(live_scale_y) && live_scale_y > 0.0f && live_scale_y <= 16.0f)
           font_scale_y = live_scale_y;
+
+        static unsigned owner_logs = 0;
+        if (owner_logs++ < 16)
+        {
+          std::fprintf(stderr,
+                       "[moh-ps3-font] CFont owner resolved: cfont=%08X FONT=%08X "
+                       "r30=%08X r29=%08X r31=%08X r3=%08X height=%.2f scale=(%.3f,%.3f)\n",
+                       cfont_object, gc_font, state->gpr[30], state->gpr[29],
+                       state->gpr[31], state->gpr[3], font_height,
+                       font_scale_x, font_scale_y);
+        }
       }
     }
 
