@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from gmfe69_particle_wpar_postgen import apply_gmfe69_particle_wpar_postgen
 
 # MOH_GMFE69_FINAL_DEFINITIVE_OPTIMIZATIONS
 
@@ -1019,6 +1020,11 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
 
     # Particle-specific PCs survive DolRecomp chunk-size changes.
     _patch_global_fctiwz_generated(generated)
+
+    # Keep RenderSystem FIFO traffic scalar and architecturally ordered, but
+    # skip GXRuntime's generic MEM1 address probe for ELF-verified WPAR stores.
+    # This retains the current GPFifo/CommandProcessor overflow backpressure.
+    apply_gmfe69_particle_wpar_postgen(generated)
 
     particle = _find_chunk_for_pc(chunks, 0x8007E198)
     if not particle:

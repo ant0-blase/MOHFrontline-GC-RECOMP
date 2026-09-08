@@ -200,6 +200,32 @@ std::unordered_map<DisplayListSignatureKey, std::vector<OriginalGCDMFDrawCandida
 // Exact first-eight-byte filter: rejects unrelated DLs without hashing their
 // entire contents. Passing this filter still requires the full signature.
 std::unordered_set<DisplayListSignatureKey, DisplayListSignatureKeyHash> g_dmf_prefixes;
+
+struct DMFTopologySignatureKey
+{
+  u32 size = 0;
+  u64 topology_hash = 0;
+  bool operator==(const DMFTopologySignatureKey&) const = default;
+};
+struct DMFTopologySignatureKeyHash
+{
+  std::size_t operator()(const DMFTopologySignatureKey& key) const noexcept
+  {
+    return std::hash<u64>{}(key.topology_hash ^ (u64(key.size) << 32) ^ key.size);
+  }
+};
+struct DMFTopologyLocator
+{
+  DisplayListSignatureKey exact_key;
+  std::string gc_name;
+  u32 material_index = 0;
+  u32 cluster_index = 0;
+};
+std::unordered_map<DMFTopologySignatureKey, std::vector<DMFTopologyLocator>,
+                   DMFTopologySignatureKeyHash>
+    g_dmf_player_topology_candidates;
+std::unordered_set<u32> g_dmf_player_topology_sizes;
+
 struct DMFAddressCacheEntry
 {
   u32 address = 0, size = 0;
@@ -245,6 +271,83 @@ std::string CanonicalDMFName(std::string_view path)
   if (name.ends_with(".dmt"))
     name.replace(name.size() - 4, 4, ".dmf");
   return name;
+}
+
+bool IsSupportedPlayerWeaponDMF(std::string_view name)
+{
+  return name == "th_weapondday.dmf" || name == "th_weapon.dmf" ||
+         name == "m1_weapondday.dmf" || name == "m1_weapon.dmf";
+}
+
+bool IsPlayerWeaponAtlasMaterial(std::string_view name)
+{
+  return name == "m1top_256" || name == "m1side_256" ||
+         name == "tom_01wo256" || name == "tom_02met256";
+}
+
+// Retail GC skinned DMF display lists use a seven-byte vertex reference:
+// matrix index + position/normal/UV indices. The game may copy/reindex those
+// references for animated first-person weapons, which destroys the byte hash
+// even though the authored primitive topology is unchanged. Hash only the GX
+// primitive opcode/count sequence; never the mutable vertex references.
+bool BuildPlayerWeaponDMFTopologySignature(std::span<const u8> commands, u64* out_hash)
+{
+  if (!out_hash || commands.size() < 3)
+    return false;
+
+  constexpr std::size_t vertex_reference_stride = 7;
+  constexpr u64 fnv_offset = 1469598103934665603ULL;
+  constexpr u64 fnv_prime = 1099511628211ULL;
+  u64 hash = fnv_offset;
+  u32 primitives = 0;
+  std::size_t offset = 0;
+
+  const auto mix = [&](u8 value) {
+    hash ^= value;
+    hash *= fnv_prime;
+  };
+
+  while (offset < commands.size())
+  {
+    const u8 opcode = commands[offset];
+    if (opcode == 0)
+    {
+      // DMF records are 32-byte aligned. Only zero padding is allowed after
+      // the final primitive so an unrelated command stream cannot match.
+      for (; offset < commands.size(); ++offset)
+        if (commands[offset] != 0)
+          return false;
+      break;
+    }
+
+    if (opcode < 0x80 || opcode > 0xBF || commands.size() - offset < 3)
+      return false;
+
+    const u16 count = static_cast<u16>((u16(commands[offset + 1]) << 8) |
+                                       u16(commands[offset + 2]));
+    if (!count)
+      return false;
+
+    const std::size_t remaining = commands.size() - offset - 3;
+    if (count > remaining / vertex_reference_stride)
+      return false;
+
+    mix(opcode);
+    mix(static_cast<u8>(count >> 8));
+    mix(static_cast<u8>(count));
+    offset += 3 + static_cast<std::size_t>(count) * vertex_reference_stride;
+    ++primitives;
+  }
+
+  if (!primitives)
+    return false;
+
+  mix(static_cast<u8>(primitives >> 24));
+  mix(static_cast<u8>(primitives >> 16));
+  mix(static_cast<u8>(primitives >> 8));
+  mix(static_cast<u8>(primitives));
+  *out_hash = hash;
+  return true;
 }
 
 std::string FixedString(const u8* p, std::size_t size)
@@ -691,26 +794,96 @@ void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
   else
   {
     ++g_dmf_misses;
+    bool topology_fallback = false;
+
+    // Normal path: byte-exact authored DL plus a live DMF header at
+    // runtime_address - dl_offset.
     u64 prefix;
     std::memcpy(&prefix, commands.data(), sizeof(prefix));
-    if (!g_dmf_prefixes.contains({command_size, prefix}))
-      return;
-    const DisplayListSignatureKey key{command_size,
-                                      Common::GetHash64(commands.data(), commands.size(), 0)};
-    const auto it = g_dmf_display_list_candidates.find(key);
-    if (it == g_dmf_display_list_candidates.end())
-      return;
-    for (const auto& candidate : it->second)
+    if (g_dmf_prefixes.contains({command_size, prefix}))
     {
-      if (!ValidateOriginalGCDMFCandidate(candidate, runtime_address))
-        continue;
-      if (resolved)
-        return;  // ambiguous identity always retains GC
-      resolved = &candidate;
+      const DisplayListSignatureKey key{
+          command_size, Common::GetHash64(commands.data(), commands.size(), 0)};
+      if (const auto it = g_dmf_display_list_candidates.find(key);
+          it != g_dmf_display_list_candidates.end())
+      {
+        for (const auto& candidate : it->second)
+        {
+          if (!ValidateOriginalGCDMFCandidate(candidate, runtime_address))
+            continue;
+          if (resolved)
+            return;  // ambiguous identity always retains GC
+          resolved = &candidate;
+        }
+      }
     }
+
+    // M1/Thompson first-person skinning can copy/reindex the authored GC DL
+    // away from the original DMF allocation. In that case the exact byte hash
+    // and header-backtracking test cannot succeed even though the primitive
+    // topology is still exactly the authored material draw. Only the four
+    // known remaster-atlas materials are indexed here, and a topology key must
+    // resolve to one unique original candidate before it is accepted.
+    if (!resolved && g_dmf_player_topology_sizes.contains(command_size))
+    {
+      u64 topology_hash = 0;
+      if (BuildPlayerWeaponDMFTopologySignature(commands, &topology_hash))
+      {
+        const DMFTopologySignatureKey topology_key{command_size, topology_hash};
+        if (const auto topology_it = g_dmf_player_topology_candidates.find(topology_key);
+            topology_it != g_dmf_player_topology_candidates.end() &&
+            topology_it->second.size() == 1)
+        {
+          const auto& locator = topology_it->second.front();
+          if (const auto exact_it = g_dmf_display_list_candidates.find(locator.exact_key);
+              exact_it != g_dmf_display_list_candidates.end())
+          {
+            for (const auto& candidate : exact_it->second)
+            {
+              if (candidate.gc_name != locator.gc_name ||
+                  candidate.material_index != locator.material_index ||
+                  candidate.cluster_index != locator.cluster_index ||
+                  !IsSupportedPlayerWeaponDMF(candidate.gc_name) ||
+                  !IsPlayerWeaponAtlasMaterial(candidate.gc_material_name))
+                continue;
+
+              if (resolved)
+              {
+                resolved = nullptr;
+                break;
+              }
+              resolved = &candidate;
+            }
+          }
+
+          if (resolved)
+            topology_fallback = true;
+        }
+      }
+    }
+
     if (!resolved)
       return;
-    cached = {runtime_address, command_size, resolved};
+
+    if (!topology_fallback)
+    {
+      cached = {runtime_address, command_size, resolved};
+    }
+    else
+    {
+      static unsigned topology_logs = 0;
+      if (topology_logs++ < 32)
+      {
+        std::fprintf(stderr,
+                     "[moh-ps3-dmf] PLAYER TOPOLOGY MATCH: gc=%s material=%s "
+                     "cluster=%u DL=%08x size=%u | copied/reindexed GC DL -> "
+                     "native PS3 UV0 candidate\n",
+                     resolved->gc_name.c_str(),
+                     resolved->gc_material_name.empty() ? "<unnamed>" :
+                                                          resolved->gc_material_name.c_str(),
+                     resolved->cluster_index, runtime_address, command_size);
+      }
+    }
   }
   if (!resolved->prepared)
     return;
@@ -1131,6 +1304,8 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
   g_dmf_pairs.clear();
   g_dmf_display_list_candidates.clear();
   g_dmf_prefixes.clear();
+  g_dmf_player_topology_candidates.clear();
+  g_dmf_player_topology_sizes.clear();
   if (level.empty())
     return;
 
@@ -1273,6 +1448,21 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
           u64 prefix;
           std::memcpy(&prefix, bytes + dl_offset, sizeof(prefix));
           g_dmf_prefixes.insert({dl_size, prefix});
+
+          if (IsSupportedPlayerWeaponDMF(filename) &&
+              IsPlayerWeaponAtlasMaterial(gc_material_name))
+          {
+            u64 topology_hash = 0;
+            const std::span<const u8> authored_dl(bytes + dl_offset, dl_size);
+            if (BuildPlayerWeaponDMFTopologySignature(authored_dl, &topology_hash))
+            {
+              const DMFTopologySignatureKey topology_key{dl_size, topology_hash};
+              g_dmf_player_topology_sizes.insert(dl_size);
+              g_dmf_player_topology_candidates[topology_key].push_back(
+                  {dl_key, filename, material, cluster});
+            }
+          }
+
           g_dmf_display_list_candidates[dl_key].push_back(std::move(candidate));
         }
       }
@@ -1292,9 +1482,9 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
   }
 
   std::fprintf(stderr,
-               "[moh-ps3-dmf] GC/PS3 exact pair index ready: level=%.*s gc_dmf=%zu paired=%zu missing_ps3=%zu rejected=%zu dl_signature_keys=%zu aliases=.dmf/.dmt | exact draw identity + skin groups ready; GC draw retained until animated palette skinning succeeds\n",
+               "[moh-ps3-dmf] GC/PS3 exact pair index ready: level=%.*s gc_dmf=%zu paired=%zu missing_ps3=%zu rejected=%zu dl_signature_keys=%zu player_topology_keys=%zu aliases=.dmf/.dmt | exact draw identity + skin groups ready; GC draw retained until animated palette skinning succeeds\n",
                static_cast<int>(level.size()), level.data(), gc_dmf, paired, missing, rejected,
-               g_dmf_display_list_candidates.size());
+               g_dmf_display_list_candidates.size(), g_dmf_player_topology_candidates.size());
 }
 }  // namespace
 
@@ -1314,6 +1504,8 @@ void ClearDMFCache()
   g_dmf_pairs.clear();
   g_dmf_display_list_candidates.clear();
   g_dmf_prefixes.clear();
+  g_dmf_player_topology_candidates.clear();
+  g_dmf_player_topology_sizes.clear();
   g_current_dmf_draw = {};
 }
 
@@ -1914,6 +2106,7 @@ SkinnedPaletteAnalysis AnalyzeSkinnedPaletteAtLoad(const SkinnedDrawMatch& draw)
       for (const auto& candidate : candidates)
       {
         if (candidate.gc_name != draw.gc_name ||
+            candidate.material_index != draw.material_index ||
             candidate.gc_material_name != draw.gc_material_name ||
             candidate.gc_palette_groups.empty())
           continue;
@@ -1937,94 +2130,194 @@ SkinnedPaletteAnalysis AnalyzeSkinnedPaletteAtLoad(const SkinnedDrawMatch& draw)
     return true;
   };
 
-  std::unordered_set<u64> selected_vertices;
-  const auto& decoded = *draw.owner->decoded;
-  for (std::size_t cluster_ordinal = 0; cluster_ordinal < decoded.clusters.size();
-       ++cluster_ordinal)
+  std::array<bool, 256> expected_groups{};
+  std::size_t expected_group_count = 0;
+  for (const u8 group : draw.gc_palette_groups)
   {
-    const DMFCluster& cluster = decoded.clusters[cluster_ordinal];
-    if (cluster.material_name != draw.gc_material_name)
-      continue;
-    ++analysis.ps3_material_clusters;
-
-    for (std::size_t tri = 0; tri + 2 < cluster.indices.size(); tri += 3)
-    {
-      ++analysis.total_triangles;
-      std::array<s16, 3> mapped_groups{-1, -1, -1};
-      std::array<u16, 3> vertex_indices{};
-      bool mapped = true;
-      for (std::size_t corner = 0; corner < 3; ++corner)
-      {
-        const u16 vertex = cluster.indices[tri + corner];
-        vertex_indices[corner] = vertex;
-        if (vertex >= cluster.vertex_palette_slots.size())
-        {
-          mapped = false;
-          break;
-        }
-        const u16 local_palette_slot = cluster.vertex_palette_slots[vertex];
-        if (local_palette_slot >= cluster.palette_groups.size())
-        {
-          mapped = false;
-          break;
-        }
-        const u16 ps3_group = cluster.palette_groups[local_palette_slot];
-        if (ps3_group >= draw.ps3_group_to_gc.size())
-        {
-          mapped = false;
-          break;
-        }
-        const s16 gc_group = draw.ps3_group_to_gc[ps3_group];
-        if (gc_group < 0 || gc_group > 255)
-        {
-          mapped = false;
-          break;
-        }
-        mapped_groups[corner] = gc_group;
-      }
-      if (!mapped)
-      {
-        ++analysis.unmapped_triangles;
-        continue;
-      }
-
-      std::size_t matching_palettes = 0;
-      const std::vector<u8>* unique_palette = nullptr;
-      for (const auto& palette : gc_palettes)
-      {
-        if (!palette_contains(palette, mapped_groups))
-          continue;
-        ++matching_palettes;
-        unique_palette = &palette;
-      }
-
-      if (matching_palettes == 0)
-      {
-        ++analysis.unmapped_triangles;
-        continue;
-      }
-      if (matching_palettes != 1)
-      {
-        ++analysis.ambiguous_triangles;
-        continue;
-      }
-      if (!std::ranges::equal(*unique_palette, draw.gc_palette_groups))
-        continue;
-
-      ++analysis.selected_triangles;
-      for (const u16 vertex : vertex_indices)
-      {
-        selected_vertices.insert((u64(cluster_ordinal) << 32) | u64(vertex));
-      }
-    }
+    if (expected_groups[group])
+      return analysis;
+    expected_groups[group] = true;
+    ++expected_group_count;
   }
 
-  analysis.selected_vertices = selected_vertices.size();
-  analysis.matrix_slots = draw.gc_palette_groups.size();
-  analysis.valid = analysis.ps3_material_clusters != 0 && analysis.selected_triangles != 0;
+  const auto& decoded = *draw.owner->decoded;
+  std::vector<u32> ps3_material_indices;
+  for (const DMFCluster& cluster : decoded.clusters)
+  {
+    if (cluster.material_name != draw.gc_material_name)
+      continue;
+    if (std::find(ps3_material_indices.begin(), ps3_material_indices.end(),
+                  cluster.material_index) == ps3_material_indices.end())
+      ps3_material_indices.push_back(cluster.material_index);
+  }
+  std::sort(ps3_material_indices.begin(), ps3_material_indices.end());
+  if (ps3_material_indices.empty())
+    return analysis;
+
+  struct MaterialProbe
+  {
+    SkinnedPaletteAnalysis analysis;
+    std::array<bool, 256> used_groups{};
+    std::size_t used_group_count = 0;
+    bool exact_palette_identity = false;
+  };
+
+  const auto probe_material = [&](u32 ps3_material_index) {
+    MaterialProbe probe;
+    probe.analysis.ps3_material_index = ps3_material_index;
+    probe.analysis.ps3_material_candidates = ps3_material_indices.size();
+
+    std::unordered_set<u64> selected_vertices;
+    for (std::size_t cluster_ordinal = 0; cluster_ordinal < decoded.clusters.size();
+         ++cluster_ordinal)
+    {
+      const DMFCluster& cluster = decoded.clusters[cluster_ordinal];
+      if (cluster.material_index != ps3_material_index ||
+          cluster.material_name != draw.gc_material_name)
+        continue;
+      ++probe.analysis.ps3_material_clusters;
+
+      for (std::size_t tri = 0; tri + 2 < cluster.indices.size(); tri += 3)
+      {
+        ++probe.analysis.total_triangles;
+        std::array<s16, 3> mapped_groups{-1, -1, -1};
+        std::array<u16, 3> vertex_indices{};
+        bool mapped = true;
+        for (std::size_t corner = 0; corner < 3; ++corner)
+        {
+          const u16 vertex = cluster.indices[tri + corner];
+          vertex_indices[corner] = vertex;
+          if (vertex >= cluster.vertex_palette_slots.size())
+          {
+            mapped = false;
+            break;
+          }
+          const u16 local_palette_slot = cluster.vertex_palette_slots[vertex];
+          if (local_palette_slot >= cluster.palette_groups.size())
+          {
+            mapped = false;
+            break;
+          }
+          const u16 ps3_group = cluster.palette_groups[local_palette_slot];
+          if (ps3_group >= draw.ps3_group_to_gc.size())
+          {
+            mapped = false;
+            break;
+          }
+          const s16 gc_group = draw.ps3_group_to_gc[ps3_group];
+          if (gc_group < 0 || gc_group > 255)
+          {
+            mapped = false;
+            break;
+          }
+          mapped_groups[corner] = gc_group;
+        }
+        if (!mapped)
+        {
+          ++probe.analysis.unmapped_triangles;
+          continue;
+        }
+
+        std::size_t matching_palettes = 0;
+        const std::vector<u8>* unique_palette = nullptr;
+        for (const auto& palette : gc_palettes)
+        {
+          if (!palette_contains(palette, mapped_groups))
+            continue;
+          ++matching_palettes;
+          unique_palette = &palette;
+        }
+
+        if (matching_palettes == 0)
+        {
+          ++probe.analysis.unmapped_triangles;
+          continue;
+        }
+        if (matching_palettes != 1)
+        {
+          ++probe.analysis.ambiguous_triangles;
+          continue;
+        }
+        if (!std::ranges::equal(*unique_palette, draw.gc_palette_groups))
+          continue;
+
+        ++probe.analysis.selected_triangles;
+        for (std::size_t corner = 0; corner < 3; ++corner)
+        {
+          const u16 vertex = vertex_indices[corner];
+          selected_vertices.insert((u64(cluster_ordinal) << 32) | u64(vertex));
+          const u16 local_palette_slot = cluster.vertex_palette_slots[vertex];
+          const u16 ps3_group = cluster.palette_groups[local_palette_slot];
+          const s16 gc_group = draw.ps3_group_to_gc[ps3_group];
+          if (!probe.used_groups[static_cast<u8>(gc_group)])
+          {
+            probe.used_groups[static_cast<u8>(gc_group)] = true;
+            ++probe.used_group_count;
+          }
+        }
+      }
+    }
+
+    probe.analysis.selected_vertices = selected_vertices.size();
+    probe.analysis.matrix_slots = draw.gc_palette_groups.size();
+    probe.analysis.valid =
+        probe.analysis.ps3_material_clusters != 0 && probe.analysis.selected_triangles != 0;
+
+    probe.exact_palette_identity =
+        probe.used_group_count == expected_group_count &&
+        std::equal(probe.used_groups.begin(), probe.used_groups.end(), expected_groups.begin());
+    return probe;
+  };
+
+  std::vector<MaterialProbe> probes;
+  probes.reserve(ps3_material_indices.size());
+  for (const u32 ps3_material_index : ps3_material_indices)
+    probes.push_back(probe_material(ps3_material_index));
+
+  const MaterialProbe* winner = nullptr;
+  std::size_t compatible = 0;
+  for (const MaterialProbe& probe : probes)
+  {
+    const auto& a = probe.analysis;
+    const bool fully_compatible =
+        probe.exact_palette_identity && a.valid && a.ps3_material_clusters == 1 &&
+        a.total_triangles != 0 && a.selected_triangles == a.total_triangles &&
+        a.ambiguous_triangles == 0 && a.unmapped_triangles == 0;
+    if (!fully_compatible)
+      continue;
+    ++compatible;
+    winner = &probe;
+  }
+
+  if (compatible == 1 && winner)
+  {
+    analysis = winner->analysis;
+    analysis.compatible_ps3_materials = 1;
+    return analysis;
+  }
+
+  // Keep the strongest probe for diagnostics, but never make an uncertain
+  // material-slot mapping renderable.  The strict path below requires exactly
+  // one compatible PS3 material.
+  const MaterialProbe* best = nullptr;
+  for (const MaterialProbe& probe : probes)
+  {
+    if (!best ||
+        probe.analysis.selected_triangles > best->analysis.selected_triangles ||
+        (probe.analysis.selected_triangles == best->analysis.selected_triangles &&
+         probe.analysis.unmapped_triangles + probe.analysis.ambiguous_triangles <
+             best->analysis.unmapped_triangles + best->analysis.ambiguous_triangles))
+      best = &probe;
+  }
+  if (best)
+    analysis = best->analysis;
+  analysis.valid = false;
+  analysis.ps3_material_candidates = ps3_material_indices.size();
+  analysis.compatible_ps3_materials = compatible;
+  if (compatible > 1)
+    ++analysis.ambiguous_triangles;
   return analysis;
 }
-
 void PrepareDMFDraws()
 {
   std::scoped_lock lock(g_dmf_cache_mutex);
@@ -2047,6 +2340,8 @@ void PrepareDMFDraws()
       SkinnedDrawMatch draw;
       draw.owner = candidate.ps3;
       draw.gc_name = prepared->gc_name;
+      draw.material_index = candidate.material_index;
+      draw.cluster_index = candidate.cluster_index;
       draw.gc_material_name = prepared->material_name;
       draw.gc_palette_groups = prepared->palette;
       draw.ps3_group_to_gc = prepared->group_map;
@@ -2081,25 +2376,12 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   // 0x0502 skin-group coefficients no longer make the decoder reject the file.
   static const bool replace = EnvSwitchLocal("MOH_PS3_DMF_REPLACE", true);
   const auto& draw = g_current_dmf_draw;
-  const bool supported_player_weapon =
-      draw.gc_name == "th_weapondday.dmf" ||
-      draw.gc_name == "th_weapon.dmf" ||
-      draw.gc_name == "m1_weapondday.dmf" ||
-      draw.gc_name == "m1_weapon.dmf";
   if (!replace || !draw.prepared || !draw.owner || !draw.owner->decoded ||
-      !supported_player_weapon)
+      !IsSupportedPlayerWeaponDMF(draw.gc_name))
     return {};
 
   const auto& ready = draw.prepared->readiness;
-  if (!ready.geometry_valid || !ready.bind_valid || !ready.skeleton_valid)
-    return {};
-
   const auto& analysis = draw.prepared->analysis;
-  if (!analysis.valid || analysis.ps3_material_clusters != 1 ||
-      analysis.total_triangles == 0 ||
-      analysis.selected_triangles != analysis.total_triangles ||
-      analysis.ambiguous_triangles != 0 || analysis.unmapped_triangles != 0)
-    return {};
 
   std::size_t gc_material_draws = 0;
   for (const auto& [signature, candidates] : g_dmf_display_list_candidates)
@@ -2107,21 +2389,80 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
     (void)signature;
     for (const auto& candidate : candidates)
       if (candidate.gc_name == draw.gc_name &&
+          candidate.material_index == draw.material_index &&
           candidate.gc_material_name == draw.gc_material_name)
         ++gc_material_draws;
   }
+
+  const DMFCluster* selected_cluster = nullptr;
+  std::size_t ps3_material_cluster_count = 0;
+  if (analysis.ps3_material_index != 0xffffffffu)
+  {
+    for (const auto& cluster : draw.owner->decoded->clusters)
+    {
+      if (cluster.material_index != analysis.ps3_material_index ||
+          cluster.material_name != draw.gc_material_name)
+        continue;
+      ++ps3_material_cluster_count;
+      if (!selected_cluster)
+        selected_cluster = &cluster;
+    }
+  }
+
+  // Diagnostic only: this block does not relax a single strict replacement
+  // condition.  It reports the complete proof state once per weapon material
+  // so M1/Thompson atlas failures can be fixed from one runtime capture.
+  static std::unordered_set<std::string> strict_diag_logged;
+  const std::string strict_diag_key =
+      std::string(draw.gc_name) + "|" + std::to_string(draw.material_index) + "|" +
+      std::string(draw.gc_material_name);
+  if (strict_diag_logged.insert(strict_diag_key).second)
+  {
+    const std::size_t cluster_positions = selected_cluster ? selected_cluster->positions.size() : 0;
+    const std::size_t cluster_normals = selected_cluster ? selected_cluster->normals.size() : 0;
+    const std::size_t cluster_uv0 = selected_cluster ? selected_cluster->uv0.size() : 0;
+    const std::size_t cluster_slots =
+        selected_cluster ? selected_cluster->vertex_palette_slots.size() : 0;
+    const std::size_t cluster_indices = selected_cluster ? selected_cluster->indices.size() : 0;
+    const std::size_t cluster_palette = selected_cluster ? selected_cluster->palette_groups.size() : 0;
+    std::fprintf(
+        stderr,
+        "[moh-ps3-dmf] STRICT DIAG: gc=%.*s gc_material_index=%u ps3_material_index=%u "
+        "material=%.*s ready[g=%d bind=%d skl=%d] "
+        "analysis[valid=%d candidates=%zu compatible=%zu clusters=%zu tris=%zu selected=%zu "
+        "ambiguous=%zu unmapped=%zu vertices=%zu matrix_slots=%zu] "
+        "gc_draws=%zu ps3_clusters=%zu "
+        "attrs[pos=%d nrm=%d uv0=%d] sizes[pos=%zu nrm=%zu uv0=%zu slots=%zu idx=%zu pal=%zu]\n",
+        static_cast<int>(draw.gc_name.size()), draw.gc_name.data(),
+        draw.material_index, analysis.ps3_material_index,
+        static_cast<int>(draw.gc_material_name.size()), draw.gc_material_name.data(),
+        ready.geometry_valid ? 1 : 0, ready.bind_valid ? 1 : 0, ready.skeleton_valid ? 1 : 0,
+        analysis.valid ? 1 : 0, analysis.ps3_material_candidates,
+        analysis.compatible_ps3_materials, analysis.ps3_material_clusters,
+        analysis.total_triangles, analysis.selected_triangles, analysis.ambiguous_triangles,
+        analysis.unmapped_triangles, analysis.selected_vertices, analysis.matrix_slots,
+        gc_material_draws,
+        ps3_material_cluster_count, selected_cluster && selected_cluster->has_position ? 1 : 0,
+        selected_cluster && selected_cluster->has_normal ? 1 : 0,
+        selected_cluster && selected_cluster->has_uv0 ? 1 : 0, cluster_positions,
+        cluster_normals, cluster_uv0, cluster_slots, cluster_indices, cluster_palette);
+  }
+
+  if (!ready.geometry_valid || !ready.bind_valid || !ready.skeleton_valid)
+    return {};
+
+  if (!analysis.valid || analysis.ps3_material_index == 0xffffffffu ||
+      analysis.compatible_ps3_materials != 1 || analysis.ps3_material_clusters != 1 ||
+      analysis.total_triangles == 0 ||
+      analysis.selected_triangles != analysis.total_triangles ||
+      analysis.ambiguous_triangles != 0 || analysis.unmapped_triangles != 0)
+    return {};
+
   if (gc_material_draws != 1)
     return {};
 
-  const DMFCluster* selected_cluster = nullptr;
-  for (const auto& cluster : draw.owner->decoded->clusters)
-  {
-    if (cluster.material_name != draw.gc_material_name)
-      continue;
-    if (selected_cluster)
-      return {};
-    selected_cluster = &cluster;
-  }
+  if (ps3_material_cluster_count != 1)
+    return {};
 
   if (!selected_cluster || !selected_cluster->has_position ||
       !selected_cluster->has_normal || !selected_cluster->has_uv0 ||
@@ -2131,46 +2472,70 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
       selected_cluster->positions.size() != selected_cluster->vertex_palette_slots.size())
     return {};
 
+  static std::unordered_set<std::string> matrix_reject_logged;
+  const auto matrix_reject = [&](std::string_view reason, std::size_t vertex, u32 local_slot,
+                                 u32 ps3_group, s32 gc_group) -> SkinnedDrawReplacement {
+    const std::string key = strict_diag_key + "|" + std::string(reason);
+    if (matrix_reject_logged.insert(key).second)
+    {
+      std::fprintf(stderr,
+                   "[moh-ps3-dmf] MATRIX REJECT: gc=%.*s gc_material_index=%u "
+                   "ps3_material_index=%u material=%.*s reason=%.*s "
+                   "vertex=%zu local_slot=%u ps3_group=%u gc_group=%d "
+                   "gc_palette=%zu ps3_palette=%zu group_map=%zu\n",
+                   static_cast<int>(draw.gc_name.size()), draw.gc_name.data(),
+                   draw.material_index, analysis.ps3_material_index,
+                   static_cast<int>(draw.gc_material_name.size()), draw.gc_material_name.data(),
+                   static_cast<int>(reason.size()), reason.data(), vertex, local_slot, ps3_group,
+                   gc_group, draw.gc_palette_groups.size(), selected_cluster->palette_groups.size(),
+                   draw.ps3_group_to_gc.size());
+    }
+    return {};
+  };
+
   std::vector<u8> matrix_indices(selected_cluster->positions.size());
   for (std::size_t vertex = 0; vertex < selected_cluster->positions.size(); ++vertex)
   {
     const u16 local_slot = selected_cluster->vertex_palette_slots[vertex];
     if (local_slot >= selected_cluster->palette_groups.size())
-      return {};
+      return matrix_reject("local-slot-out-of-range", vertex, local_slot, 0xffffu, -1);
     const u16 ps3_group = selected_cluster->palette_groups[local_slot];
     if (ps3_group >= draw.ps3_group_to_gc.size())
-      return {};
+      return matrix_reject("ps3-group-out-of-range", vertex, local_slot, ps3_group, -1);
     const s16 gc_group = draw.ps3_group_to_gc[ps3_group];
     if (gc_group < 0 || gc_group > 255)
-      return {};
+      return matrix_reject("ps3-group-unmapped", vertex, local_slot, ps3_group, gc_group);
 
     const auto first = std::find(draw.gc_palette_groups.begin(), draw.gc_palette_groups.end(),
                                  static_cast<u8>(gc_group));
     if (first == draw.gc_palette_groups.end())
-      return {};
+      return matrix_reject("gc-group-not-in-draw-palette", vertex, local_slot, ps3_group,
+                           gc_group);
     if (std::find(first + 1, draw.gc_palette_groups.end(), static_cast<u8>(gc_group)) !=
         draw.gc_palette_groups.end())
-      return {};
+      return matrix_reject("duplicate-gc-group", vertex, local_slot, ps3_group, gc_group);
 
     const std::size_t matrix_slot =
         static_cast<std::size_t>(std::distance(draw.gc_palette_groups.begin(), first));
     const std::size_t matrix_id = matrix_slot * 3u;
     if (matrix_id > 255u)
-      return {};
+      return matrix_reject("matrix-id-overflow", vertex, local_slot, ps3_group, gc_group);
     matrix_indices[vertex] = static_cast<u8>(matrix_id);
   }
 
   static std::unordered_set<std::string> logged_weapon_materials;
   const std::string log_key =
-      std::string(draw.gc_name) + "|" + std::string(draw.gc_material_name);
+      std::string(draw.gc_name) + "|" + std::to_string(draw.material_index) + "|" +
+      std::string(draw.gc_material_name);
   if (logged_weapon_materials.insert(log_key).second)
   {
     std::fprintf(stderr,
                  "[moh-ps3-dmf] Weapon STRICT replacement READY: "
-                 "gc=%.*s material=%s "
+                 "gc=%.*s gc_material_index=%u ps3_material_index=%u material=%s "
                  "verts=%zu tris=%zu palette=%zu groups=%zu/%zu\n",
                  static_cast<int>(draw.gc_name.size()), draw.gc_name.data(),
-                 draw.gc_material_name.data(), selected_cluster->positions.size(),
+                 draw.material_index, analysis.ps3_material_index, draw.gc_material_name.data(),
+                 selected_cluster->positions.size(),
                  selected_cluster->indices.size() / 3, draw.gc_palette_groups.size(),
                  std::count_if(draw.ps3_group_to_gc.begin(), draw.ps3_group_to_gc.end(),
                                [](s16 value) { return value >= 0; }),

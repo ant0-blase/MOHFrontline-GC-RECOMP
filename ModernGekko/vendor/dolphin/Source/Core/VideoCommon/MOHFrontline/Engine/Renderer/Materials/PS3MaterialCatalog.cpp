@@ -1,6 +1,7 @@
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.h"
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/TPK.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
+#include "VideoCommon/PS3MeshPort.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -40,17 +41,42 @@ bool IsUnsafeThompsonMaterial(std::string_view input)
     return false;
 
   const std::string name = CanonicalTPKName(input);
-  const bool blocked = name == "tom_01wo256" || name == "tom_02met256";
-  if (blocked)
+  const bool thompson_atlas = name == "tom_01wo256" || name == "tom_02met256";
+  if (!thompson_atlas)
+    return false;
+
+  // v6: the old TOM_* block pre-dated the native skinned-DMF bridge.  Keep the
+  // safety net for GC geometry, but lift it for the exact live Thompson draw
+  // once BuildCurrentSkinnedReplacement() proves that PS3 geometry + UV0 will
+  // be submitted together.  This prevents a 432x336 PS3 atlas from ever being
+  // painted onto the old 256x256 GC UV layout.
+  const auto skin = PS3MeshPort::CurrentSkinnedDraw();
+  const bool live_thompson =
+      skin &&
+      (skin.gc_name == "th_weapondday.dmf" || skin.gc_name == "th_weapon.dmf") &&
+      CanonicalTPKName(skin.gc_material_name) == name;
+  if (live_thompson)
   {
-    static std::once_flag log_once;
-    std::call_once(log_once, [] {
-      std::fprintf(stderr,
-                   "[moh-ps3-tpk] Thompson SAFE-FALLBACK: TOM_* PS3 material "
-                   "replacement disabled while skinned DMF replacement is unproven\n");
-    });
+    const auto native = PS3MeshPort::BuildCurrentSkinnedReplacement();
+    if (native && native.cluster && native.cluster->has_uv0)
+    {
+      static std::once_flag native_log_once;
+      std::call_once(native_log_once, [] {
+        std::fprintf(stderr,
+                     "[moh-ps3-tpk] Thompson NATIVE-UV ENABLED: TOM_* atlas "
+                     "follows the live PS3 DMF geometry/UV0\n");
+      });
+      return false;
+    }
   }
-  return blocked;
+
+  static std::once_flag guard_log_once;
+  std::call_once(guard_log_once, [] {
+    std::fprintf(stderr,
+                 "[moh-ps3-tpk] Thompson SAFE-FALLBACK: TOM_* PS3 material "
+                 "waiting for an exact live Thompson DMF + native UV0\n");
+  });
+  return true;
 }
 
 bool TraceEnabled()

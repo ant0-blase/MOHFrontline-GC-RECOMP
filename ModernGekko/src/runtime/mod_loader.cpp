@@ -279,6 +279,16 @@ void RegisterGuestTexturePack(CPUState* state, u32 file)
     if (texture > available - 4) continue;
     const u32 shape = ReadGuestU32(state, file + texture);
     if (shape > available - 24) continue;
+    // MOH_FONT_V8_POPUP_TPK_BLOCK
+    const std::string normalized_tpk_name =
+        NormalizePS3FontAssetName(name);
+
+    if (normalized_tpk_name.ends_with("popupback.gsh") ||
+        normalized_tpk_name.ends_with("popupsubtitleback.gsh"))
+    {
+      continue;
+    }
+
     const int id = PS3Compass::TPKIndex(name);
     if (id >= 0) RegisterGuestShape(state, file + shape, id);
   }
@@ -1392,6 +1402,58 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
   {
     std::string name;
     if (!ReadGuestCString(state, state->gpr[0], &name)) return true;
+
+    // MOH_FONT_V10_OBJECTIVE_REGISTRATION_BLOCK
+    std::string objective_resource_name =
+        name;
+
+    std::transform(
+        objective_resource_name.begin(),
+        objective_resource_name.end(),
+        objective_resource_name.begin(),
+        [](unsigned char c)
+        {
+          return static_cast<char>(
+              std::tolower(c));
+        });
+
+    objective_resource_name.erase(
+        std::remove_if(
+            objective_resource_name.begin(),
+            objective_resource_name.end(),
+            [](unsigned char c)
+            {
+              return
+                  c == '_' ||
+                  c == '-' ||
+                  c == '.' ||
+                  c == '/' ||
+                  c == '\\';
+            }),
+        objective_resource_name.end());
+
+    if (objective_resource_name.find("popupback") !=
+            std::string::npos ||
+        objective_resource_name.find("popupsubtitleback") !=
+            std::string::npos ||
+        objective_resource_name.find("objectiveback") !=
+            std::string::npos)
+    {
+      return true;
+    }
+
+    // MOH_FONT_V8_POPUP_NAMED_BLOCK
+    // popupBack/popupSubtitleBack are tiled GC UI quads. Registering a PS3
+    // replacement for them produces the full-height objective streaks.
+    const std::string normalized_ui_texture =
+        NormalizePS3FontAssetName(name);
+
+    if (normalized_ui_texture.ends_with("popupback.gsh") ||
+        normalized_ui_texture.ends_with("popupsubtitleback.gsh"))
+    {
+      return true;
+    }
+
     const int index = PS3Compass::NameIndex(name);
     RegisterGuestShape(state, state->gpr[3], index,
                        !PS3NamedSky::RelativePath(name).empty());
@@ -1401,140 +1463,81 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
   if (address == MOH_HOSTCALL_PS3_FONT_DRAW ||
       address == MOH_HOSTCALL_PS3_FONT_CENTERED)
   {
+    // MOH_FONT_V67_RESET_HOSTCALL
+    // v6.7 gameplay-only CFont bridge.
     state->gpr[0] = 0u;
 
-    std::string exact_font;
+    // MOH_FONT_V67_OBJECTIVE_EXCLUDE
+    // Keep the known-good v6.7 HUD bridge, but let the ORIGINAL GameCube
+    // objective font render itself. The objective CFont is registered as
+    // objfont.sfn. Do not classify by coordinates and do not touch subtitlefont:
+    // the weapon title has been observed using subtitlefont.sfn too.
+    std::uint32_t objective_cfont_object = 0u;
 
-    // These hostcalls run from inside the CFont draw routines, after r3 has
-    // already been reused as FONT*/scratch state.  The non-stripped GC ELF
-    // keeps the owning CFont* in a callee-saved register: r30 for DrawText,
-    // r29 for DrawTextCentered and r31 for DrawTextCenteredF.  Prefer an
-    // object which was actually registered by the CFont constructor instead
-    // of assuming r3 still contains `this`.
-    std::uint32_t cfont_object = 0u;
-    static constexpr int cfont_registers[] = {30, 29, 31, 3};
-    for (const int reg : cfont_registers)
+    static constexpr int objective_cfont_registers[] = {
+        30, 29, 31, 3
+    };
+
+    for (const int reg :
+         objective_cfont_registers)
     {
-      const std::uint32_t candidate = state->gpr[reg];
+      const std::uint32_t candidate =
+          state->gpr[reg];
+
       if (cfont_files.contains(candidate))
       {
-        cfont_object = candidate;
+        objective_cfont_object =
+            candidate;
         break;
       }
     }
 
-    // FONT stores its owning CFont* at +0x70.  This covers interior draw
-    // sites where all three saved-register choices have already moved.
-    if (!cfont_object && IsMem1Address(state->gpr[3]) &&
+    // Same owner recovery used by the verified multi-font bridge:
+    // FONT keeps owning CFont* at +0x70.
+    if (!objective_cfont_object &&
+        IsMem1Address(state->gpr[3]) &&
         state->gpr[3] <= 0x817FFF8Cu)
     {
-      const std::uint32_t owner = ReadGuestU32(state, state->gpr[3] + 0x70u);
+      const std::uint32_t owner =
+          ReadGuestU32(
+              state,
+              state->gpr[3] + 0x70u);
+
       if (cfont_files.contains(owner))
-        cfont_object = owner;
+      {
+        objective_cfont_object =
+            owner;
+      }
     }
 
-    const auto font_it =
+    const auto objective_font_it =
         cfont_files.find(
-            cfont_object);
+            objective_cfont_object);
 
-    if (font_it !=
-        cfont_files.end())
+    if (objective_font_it !=
+            cfont_files.end() &&
+        objective_font_it->second ==
+            "objfont.sfn")
     {
-      exact_font =
-          font_it->second;
-    }
+      static bool objective_gc_logged = false;
 
-    if (exact_font.empty())
-    {
-      std::uint32_t pc =
-          state->lr;
-
-      std::uint32_t sp =
-          state->gpr[1];
-
-      for (unsigned depth = 0;
-           depth < 12;
-           ++depth)
+      if (!objective_gc_logged)
       {
-        if ((pc >= 0x800BCE58u &&
-             pc < 0x800BD590u) ||
-            (pc >= 0x800BD590u &&
-             pc < 0x800BD864u))
-        {
-          exact_font =
-              "mohgamefont_72.sfn";
-          break;
-        }
+        objective_gc_logged = true;
 
-        if (!IsMem1Address(sp) ||
-            (sp & 3u) ||
-            sp > 0x817FFFF7u)
-        {
-          break;
-        }
-
-        const std::uint32_t parent =
-            ReadGuestU32(
-                state,
-                sp);
-
-        if (parent <= sp ||
-            !IsMem1Address(parent) ||
-            parent > 0x817FFFF7u)
-        {
-          break;
-        }
-
-        sp =
-            parent;
-
-        pc =
-            ReadGuestU32(
-                state,
-                sp + 4u);
+        std::fprintf(
+            stderr,
+            "[moh-ps3-font] v6.7 objective exclusion ACTIVE: "
+            "objfont.sfn stays GameCube\n");
       }
-    }
 
-    // The gameplay HUD and the top-screen objective banner are meant to use
-    // the same high-resolution PS3 gameplay face. Keep the original CFont
-    // object (and therefore its live color/height/X/Y scale), but select the
-    // mohgamefont atlas for both HUD variants and objFont while gameplay is
-    // active. Frontend/mission-log uses of objFont remain untouched.
-    if (MohPcLayer::IsGameplayActive())
-    {
-      const std::string gameplay_font =
-          NormalizePS3FontAssetName(
-              exact_font);
-
-      if (gameplay_font == "objfont.sfn" ||
-          (gameplay_font.starts_with("mohgamefont_") &&
-           gameplay_font.ends_with(".sfn")))
-      {
-        exact_font =
-            "mohgamefont_72.sfn";
-      }
-    }
-
-    // Force the original clean gameplay font path again: when gameplay is
-    // active, never keep role-specific bridged fonts such as objfont,
-    // popupdisplay, subtitlefont or comicfont.  Always draw through
-    // mohgamefont_72.sfn exactly like the first clean implementation.
-    // This covers the in-game HUD, the objective banner at the top and the
-    // pause overlay opened during gameplay.
-    if (MohPcLayer::IsGameplayActive())
-    {
-      exact_font =
-          "mohgamefont_72.sfn";
-    }
-
-    if (exact_font.empty())
-    {
+      // r0 is still zero -> guest CFont draw is NOT suppressed.
       return true;
     }
 
-    if (!MohPcLayer::
-            IsPS3FontBridgeReady(
-                exact_font.c_str()))
+
+    if (!MohPcLayer::IsGameplayActive() ||
+        !MohPcLayer::IsPS3FontBridgeReady())
     {
       return true;
     }
@@ -1570,88 +1573,37 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
     const float draw_x =
         centered ?
             320.0f :
-            static_cast<float>(
-                f1);
+            static_cast<float>(f1);
 
     const float draw_y =
         centered ?
-            static_cast<float>(
-                f1) :
-            static_cast<float>(
-                f2);
-
-    // Moh2RelGC.elf is non-stripped: CFont owns FONT* at +0x20. The live
-    // FONT draw state is color +0x20, height +0x24 and X/Y scale +0x38/+0x3c.
-    // Feed that state into the EBOOT-compatible host quad builder instead of
-    // inventing one logical font height for every CFont role.
-    std::uint32_t rgba = 0xFFFFFFFFu;
-    float font_height = 0.0f;
-    float font_scale_x = 1.0f;
-    float font_scale_y = 1.0f;
-
-    if (IsMem1Address(cfont_object) && cfont_object <= 0x817FFFDCu)
-    {
-      const std::uint32_t gc_font = ReadGuestU32(state, cfont_object + 0x20u);
-      if (IsMem1Address(gc_font) && gc_font <= 0x817FFFC0u)
-      {
-        rgba = ReadGuestU32(state, gc_font + 0x20u);
-        const float live_height = ReadGuestF32(state, gc_font + 0x24u);
-        const float live_scale_x = ReadGuestF32(state, gc_font + 0x38u);
-        const float live_scale_y = ReadGuestF32(state, gc_font + 0x3Cu);
-
-        if (std::isfinite(live_height) && live_height > 0.0f && live_height <= 512.0f)
-          font_height = live_height;
-        if (std::isfinite(live_scale_x) && live_scale_x > 0.0f && live_scale_x <= 16.0f)
-          font_scale_x = live_scale_x;
-        if (std::isfinite(live_scale_y) && live_scale_y > 0.0f && live_scale_y <= 16.0f)
-          font_scale_y = live_scale_y;
-
-        static unsigned owner_logs = 0;
-        if (owner_logs++ < 16)
-        {
-          std::fprintf(stderr,
-                       "[moh-ps3-font] CFont owner resolved: cfont=%08X FONT=%08X "
-                       "r30=%08X r29=%08X r31=%08X r3=%08X height=%.2f scale=(%.3f,%.3f)\n",
-                       cfont_object, gc_font, state->gpr[30], state->gpr[29],
-                       state->gpr[31], state->gpr[3], font_height,
-                       font_scale_x, font_scale_y);
-        }
-      }
-    }
+            static_cast<float>(f1) :
+            static_cast<float>(f2);
 
     static unsigned log_count = 0;
 
-    if (log_count < 48)
+    if (log_count < 24)
     {
       ++log_count;
 
       std::fprintf(
           stderr,
-          "[moh-ps3-font] verified capture "
-          "font=%s r%d=%08X x=%.2f y=%.2f centered=%d "
-          "height=%.2f scale=(%.3f,%.3f) rgba=%08X text=\"%s\"\n",
-          exact_font.c_str(),
+          "[moh-ps3-font] v6.7 CFont capture "
+          "r%d=%08X x=%.2f y=%.2f centered=%d text=\"%s\"\n",
           source_reg,
           state->gpr[source_reg],
           draw_x,
           draw_y,
           centered ? 1 : 0,
-          font_height, font_scale_x, font_scale_y, rgba,
           text_value.c_str());
     }
 
     const bool accepted =
-        MohPcLayer::
-            QueuePS3FontDraw(
-                text_value.c_str(),
-                draw_x,
-                draw_y,
-                centered,
-                exact_font.c_str(),
-                rgba,
-                font_scale_x,
-                font_scale_y,
-                font_height);
+        MohPcLayer::QueuePS3FontDraw(
+            text_value.c_str(),
+            draw_x,
+            draw_y,
+            centered);
 
     state->gpr[0] =
         accepted ?
@@ -1660,7 +1612,6 @@ HandleMohPcLayerHostCall(CPUState *state, std::uint32_t address, void *user_data
 
     return true;
   }
-
   if (address == MOH_HOSTCALL_VP6_MOVIE_ON || address == MOH_HOSTCALL_VP6_MOVIE_OFF) {
     MohPcLayer::SetMovieActive(address == MOH_HOSTCALL_VP6_MOVIE_ON);
     return true;

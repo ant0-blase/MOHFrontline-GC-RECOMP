@@ -133,6 +133,8 @@ std::string StemKey(
   return key;
 }
 
+
+
 std::string CanonicalPS3Filename(std::string_view guest_name)
 {
   std::string filename = Filename(guest_name);
@@ -316,12 +318,50 @@ std::size_t LocaleAwareScore(
 
 const PS3RemasterAssets::AssetInfo* FindBestAsset(std::string_view guest_name)
 {
+
   if (!PS3RemasterAssets::IsReady())
     return nullptr;
 
   // v14.7 FIXED2: exact named GameCube sky -> exact PS3 sky.
   // No fingerprint/fuzzy matching for named sky faces.
   const std::string guest_file = Filename(guest_name);
+
+  // MOH_FONT_V67_OBJECTIVE_BACKING_EXCLUDE
+  // The objective/popup backdrop is tiled by the original GC UI path.
+  // Keep these tiny backing textures GameCube-native; PS3 replacements on
+  // this geometry are what produced the full-height vertical streaks.
+  const std::string objective_backing_stem =
+      StemKey(
+          guest_file);
+
+  if (objective_backing_stem == "popupback" ||
+      objective_backing_stem == "popupsubtitleback" ||
+      objective_backing_stem == "objectiveback" ||
+      objective_backing_stem == "objectivebackground")
+  {
+    return nullptr;
+  }
+
+
+
+
+  // These 32x32 popup backings are tiled by the GameCube UI path.  Their PS3
+  // replacements currently produce the full-height bright streaks behind
+  // objective text, so retain the GC textures and their native alpha.
+  if (guest_file == "popupback.gsh" ||
+      guest_file == "popupsubtitleback.gsh")
+  {
+    static bool popup_backing_fallback_logged = false;
+    if (!popup_backing_fallback_logged)
+    {
+      popup_backing_fallback_logged = true;
+      std::fprintf(
+          stderr,
+          "[moh-ps3-texture] popup backing SAFE-FALLBACK: "
+          "GC texture + native alpha retained\n");
+    }
+    return nullptr;
+  }
 
   static constexpr std::array<std::string_view, 6> sky_suffixes = {
       "_fr.gsh", "_lf.gsh", "_bk.gsh",
@@ -3409,25 +3449,17 @@ bool NeedsNativeMSHUV(
   if (!ps3.width || !ps3.height)
     return false;
 
-  // Remaster weapon sheets are real authored atlases, not ordinary hi-res
-  // versions of the GC texture. M1, Thompson, shotgun, G43, M40, etc. use
-  // this exact 256x256 -> 432x336 transition, so protect it by default.
-  const bool remaster_weapon_atlas =
-      gc_width == 256 && gc_height == 256 &&
-      ps3.width == 432 && ps3.height == 336;
-
-  // Explicit env value still overrides the default. Setting the guard to 1
-  // makes the rule cover every substantial aspect change; setting it to 0
-  // restores the old unsafe behaviour for experiments.
-  bool guard_enabled = remaster_weapon_atlas;
-  if (const char* guard_value = std::getenv("MOH_PS3_TPK_UV_GUARD");
-      guard_value && *guard_value)
-  {
-    const std::string guard = Lower(std::string(guard_value));
-    guard_enabled =
-        guard == "1" || guard == "true" || guard == "on" || guard == "yes";
-  }
-  if (!guard_enabled)
+  // Keep the PS3 payload visible by default.  The weapon-atlas guard is a
+  // diagnostic/safety mode only: current first-person M1/Thompson display
+  // lists are not yet guaranteed to resolve to a live DMF draw, so making the
+  // guard automatic would silently replace their PS3 atlas with the GC one.
+  //
+  // MOH_PS3_TPK_UV_GUARD=1 can still be used while debugging native DMF UVs.
+  const char* guard_value = std::getenv("MOH_PS3_TPK_UV_GUARD");
+  if (!guard_value || !*guard_value)
+    return false;
+  const std::string guard = Lower(std::string(guard_value));
+  if (guard != "1" && guard != "true" && guard != "on" && guard != "yes")
     return false;
 
   const u64 lhs =
@@ -4809,6 +4841,8 @@ DrawMaterialReplacement FindDrawMaterial(const TextureInfo& info)
 
 int NameIndex(std::string_view name)
 {
+
+
   UpdateLevelScopeFromGuestName(name);
 
   const std::string sky_path = PS3NamedSky::RelativePath(name);
@@ -4971,6 +5005,8 @@ int MaterialIndex(std::string key, std::shared_ptr<VideoCommon::CustomTextureDat
 
 int TPKIndex(std::string_view name)
 {
+
+
   if (!PS3AssetPort::IsTPKRSXEnabled()) return -1;
   const auto level = MOHFrontline::NativeAssets::GetCurrentLevel();
   if (level.empty()) return -1;

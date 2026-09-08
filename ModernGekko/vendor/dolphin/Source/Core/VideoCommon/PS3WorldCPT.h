@@ -282,18 +282,24 @@ inline bool EnvEnabled(const char* name, bool fallback)
 
 inline bool Enabled()
 {
-  return EnvEnabled("MOH_PS3_WORLD_CPT", true);
+  // Environment is process-start configuration. getenv() used to run for
+  // every texture lookup and showed up directly in perf.
+  static const bool enabled = EnvEnabled("MOH_PS3_WORLD_CPT", true);
+  return enabled;
 }
 
 inline bool AllowAll()
 {
-  return EnvEnabled("MOH_PS3_WORLD_CPT_ALL", false);
+  static const bool enabled = EnvEnabled("MOH_PS3_WORLD_CPT_ALL", false);
+  return enabled;
 }
 
 inline bool TraceEnabled()
 {
-  return EnvEnabled("MOH_PS3_RSX_TRACE", false) ||
-         EnvEnabled("MOH_PS3_WORLD_CPT_TRACE", false);
+  static const bool enabled =
+      EnvEnabled("MOH_PS3_RSX_TRACE", false) ||
+      EnvEnabled("MOH_PS3_WORLD_CPT_TRACE", false);
+  return enabled;
 }
 
 inline bool IsLevel11()
@@ -301,16 +307,98 @@ inline bool IsLevel11()
   return MOHFrontline::NativeAssets::GetCurrentLevel() == "1_1";
 }
 
+struct LookupCacheLine
+{
+  const u8* data = nullptr;
+  u32 address = 0;
+  u32 size = 0;
+  u32 width = 0;
+  u32 height = 0;
+  u32 format = 0;
+  u64 sample = 0;
+  u64 hash = 0;
+  const Entry* entry = nullptr;
+  bool valid = false;
+};
+
+// Video-thread-local and allocation-free. Positive and negative lookups are
+// cached because both are hot in TextureCacheBase::LoadImpl().
+inline thread_local std::array<LookupCacheLine, 512> lookup_cache{};
+
+inline u64 SampleSignature(const u8* data, std::size_t size)
+{
+  // Guest/TMEM storage may reuse the same pointer/address for another texture.
+  // Sample four regions (up to 64 bytes total) before trusting a cached full
+  // hash. A changed sample falls through to the exact whole-payload FNV1a64.
+  u64 hash = 0x9E3779B97F4A7C15ULL ^ static_cast<u64>(size);
+  if (!data || !size)
+    return hash;
+
+  const std::size_t third = size / 3;
+  const std::array<std::size_t, 4> offsets = {
+      0,
+      third,
+      third * 2,
+      size > 16 ? size - 16 : 0,
+  };
+
+  for (const std::size_t offset : offsets)
+  {
+    const std::size_t count = std::min<std::size_t>(16, size - offset);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      hash ^= data[offset + i];
+      hash *= 0x100000001b3ULL;
+    }
+  }
+
+  return hash;
+}
+
+inline std::size_t LookupCacheIndex(const TextureInfo& info, const u8* data, u32 size)
+{
+  u64 key =
+      (static_cast<u64>(info.GetRawAddress()) << 32) ^
+      static_cast<u64>(reinterpret_cast<std::uintptr_t>(data) >> 4) ^
+      (static_cast<u64>(size) * 0x9E3779B185EBCA87ULL);
+  key ^= key >> 33;
+  key *= 0xC2B2AE3D27D4EB4FULL;
+  key ^= key >> 29;
+  return static_cast<std::size_t>(key) & (lookup_cache.size() - 1u);
+}
+
+inline const Entry* FindEntry(u64 hash, u32 width, u32 height, u32 format)
+{
+  // kLevel11 is generated in ascending gc_fnv1a order.
+  const auto it = std::lower_bound(
+      kLevel11.begin(), kLevel11.end(), hash,
+      [](const Entry& entry, u64 wanted) { return entry.gc_fnv1a < wanted; });
+
+  if (it != kLevel11.end() &&
+      it->gc_fnv1a == hash &&
+      it->gc_width == width &&
+      it->gc_height == height &&
+      it->gc_format == format)
+  {
+    return &*it;
+  }
+
+  return nullptr;
+}
+
 inline const Entry* Lookup(const TextureInfo& info, u64* out_hash = nullptr)
 {
-  if (!Enabled() || !IsLevel11() ||
-      info.GetTextureFormat() != TextureFormat::CMPR ||
-      !info.GetData() || !info.GetTextureSize())
+  // Cheap rejects first: don't touch level/env state for textures that cannot
+  // be CPT world identities.
+  if (info.GetTextureFormat() != TextureFormat::CMPR ||
+      !info.GetData() || !info.GetTextureSize() ||
+      !Enabled() || !IsLevel11())
   {
     return nullptr;
   }
 
-  if (TraceEnabled())
+  const bool trace = TraceEnabled();
+  if (trace)
   {
     static bool active_logged = false;
     if (!active_logged)
@@ -318,30 +406,54 @@ inline const Entry* Lookup(const TextureInfo& info, u64* out_hash = nullptr)
       active_logged = true;
       std::fprintf(stderr,
                    "[moh-ps3-world] CPT matcher ACTIVE: level=1_1 "
-                   "TMEM textures accepted\n");
+                   "TMEM textures accepted; lookup cache ON\n");
     }
   }
 
-  const u64 hash = FNV1a64(info.GetData(), info.GetTextureSize());
-  if (out_hash)
-    *out_hash = hash;
-
+  const u8* const data = info.GetData();
+  const u32 size = info.GetTextureSize();
   const u32 width = info.GetRawWidth();
   const u32 height = info.GetRawHeight();
   const u32 format = static_cast<u32>(info.GetTextureFormat());
+  const u32 address = info.GetRawAddress();
 
-  for (const auto& entry : kLevel11)
+  const u64 sample = SampleSignature(data, size);
+  LookupCacheLine& line = lookup_cache[LookupCacheIndex(info, data, size)];
+
+  if (line.valid &&
+      line.data == data &&
+      line.address == address &&
+      line.size == size &&
+      line.width == width &&
+      line.height == height &&
+      line.format == format &&
+      line.sample == sample)
   {
-    if (entry.gc_fnv1a == hash &&
-        entry.gc_width == width &&
-        entry.gc_height == height &&
-        entry.gc_format == format)
-    {
-      return &entry;
-    }
+    if (out_hash)
+      *out_hash = line.hash;
+    return line.entry;
   }
 
-  if (TraceEnabled())
+  // The expensive exact full-payload hash now only runs on a cache miss or
+  // when the sampled payload indicates that reused guest storage changed.
+  const u64 hash = FNV1a64(data, size);
+  const Entry* const entry = FindEntry(hash, width, height, format);
+
+  line.data = data;
+  line.address = address;
+  line.size = size;
+  line.width = width;
+  line.height = height;
+  line.format = format;
+  line.sample = sample;
+  line.hash = hash;
+  line.entry = entry;
+  line.valid = true;
+
+  if (out_hash)
+    *out_hash = hash;
+
+  if (!entry && trace)
   {
     static unsigned miss_logs = 0;
     if (miss_logs++ < 96)
@@ -352,14 +464,14 @@ inline const Entry* Lookup(const TextureInfo& info, u64* out_hash = nullptr)
           "GC=%ux%u fmt=%u size=%u hash=%016llX\n",
           info.IsFromTmem() ? 1 : 0,
           info.GetStage(),
-          info.GetRawAddress(),
+          address,
           width, height, format,
-          info.GetTextureSize(),
+          size,
           static_cast<unsigned long long>(hash));
     }
   }
 
-  return nullptr;
+  return entry;
 }
 
 inline void WriteBE32(std::vector<u8>* out, std::size_t offset, u32 value)

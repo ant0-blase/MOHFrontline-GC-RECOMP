@@ -100,6 +100,12 @@ struct EMTResource
 struct SkinnedPaletteAnalysis
 {
   bool valid = false;
+  // GC and PS3 DMF material-table indices are platform-local.  The strict
+  // bridge resolves a PS3 material slot by exact skin-palette identity and
+  // records the winning PS3 index here; 0xffffffff means unresolved.
+  u32 ps3_material_index = 0xffffffffu;
+  std::size_t ps3_material_candidates = 0;
+  std::size_t compatible_ps3_materials = 0;
   std::size_t ps3_material_clusters = 0;
   std::size_t total_triangles = 0;
   std::size_t selected_triangles = 0;

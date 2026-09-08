@@ -193,8 +193,22 @@ public:
           const auto skin = PS3MeshPort::CurrentSkinnedDraw();
           // Dormant DMF analysis needs no batch boundary. Only validated draw
           // replacement (or explicit geometry-bootstrap diagnostics) does.
+          //
+          // M1/Thompson need one extra lifetime rule: an exact DMF match must
+          // survive until RenderDrawCall() even while its prepared readiness is
+          // still being proved. Without this boundary, Run() appends the
+          // weapon vertices to the current batch, then SetDisplayListContext(0)
+          // clears g_current_dmf_draw before VertexManagerBase can run the
+          // strict PS3 replacement/diagnostic path. Keep the ordinary strict
+          // checks in BuildCurrentSkinnedReplacement(); only preserve/isolate
+          // these exact first-person weapon display lists here.
+          const bool player_weapon_skin =
+              skin.prepared &&
+              (skin.gc_name == "m1_weapon.dmf" || skin.gc_name == "m1_weapondday.dmf" ||
+               skin.gc_name == "th_weapon.dmf" || skin.gc_name == "th_weapondday.dmf");
           const bool isolate = mesh || PS3MeshPort::IsStaticBootstrapEnabled() ||
-                               (skin.prepared && skin.prepared->readiness.Ready());
+                               (skin.prepared && skin.prepared->readiness.Ready()) ||
+                               player_weapon_skin;
           PS3MeshPort::SetDisplayListContext(0, {});
           if (isolate)
             g_vertex_manager->Flush();

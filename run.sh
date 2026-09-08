@@ -226,6 +226,19 @@ mkdir -p "$ROOT/HD/PS3_FILES"
 export MOH_PC_SETTINGS_PATH="$USER_DIR/moh_pc_settings.ini"
 export MOH_PC_INPUT="$PC_INPUT"
 
+# MOH_FONT_V67_RESET_DEFAULTS
+# Original v6.7 gameplay font bridge + only one extra: mild AA.
+export MOH_PS3_FONTS="${MOH_PS3_FONTS:-1}"
+export MOH_PS3_FONT_RENDER="${MOH_PS3_FONT_RENDER:-1}"
+export MOH_PS3_FONT_AA="${MOH_PS3_FONT_AA:-1}"
+
+# MOH_FONT_V8_DEFAULTS
+# Native PS3 font bridge defaults. User-exported values still override them.
+# MOH_FONT_V9_PERSISTENT_DEFAULTS
+# Font enable/AA/opacity/menu scale are persistent settings in
+# user/moh_pc_settings.ini.  Do not synthesize them into the environment here,
+# otherwise SyncFromEnvironment() would overwrite the saved UI values.
+
 # MOH Frontline PS3 host CSM is intentionally disabled.
 # Keep this hard-off even if the parent shell exported old CSM diagnostics.
 # This does NOT disable the PS3 asset/material/lighting/font/mesh renderer.

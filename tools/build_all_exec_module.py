@@ -1151,6 +1151,8 @@ def main() -> int:
     export_source = write_export(work, images, canonical, variants)
     if args.game_id == "GMFE69":
         apply_gmfe69_export_postgen(export_source)
+        from gmfe69_prevchunk_postgen import apply_gmfe69_prevchunk_postgen
+        apply_gmfe69_prevchunk_postgen(export_source)
 
     manifest = work / "multi_manifest.cmake"
     chunk_inputs = [p for image in images for p in sorted((image.generated / "chunks").glob("*.c"))]
