@@ -59,14 +59,6 @@ float BEFloat(const u8* p)
   return value;
 }
 
-float LEFloat(const u8* p)
-{
-  const u32 bits = LE32(p);
-  float value = 0.0f;
-  std::memcpy(&value, &bits, sizeof(value));
-  return value;
-}
-
 float HalfFloat(u16 h)
 {
   const int exponent = (h >> 10) & 31;
@@ -220,11 +212,6 @@ struct ExactDMFPair
   std::vector<GCSkinGroupRecord> gc_skin_groups;
   bool gc_bone_order_proven = false;
 
-  // v12.7:
-  // Keep the retail GC inverse bind completely separate from the PS3 bind.
-  std::vector<std::array<float, 16>> gc_inverse_bind_by_ref;
-  bool gc_bind_tables_valid = false;
-
   std::size_t mapped_skin_groups = 0;
   std::string skeleton_name;
   std::size_t skeleton_name_matches = 0;
@@ -295,12 +282,6 @@ std::unordered_map<std::string, SkinnedPaletteAnalysis>
     g_dmf_palette_flow_analyses;
 std::unordered_set<std::string> g_dmf_palette_flow_material_attempts;
 
-// v12.4:
-// Palette-flow proves triangle ownership, not animated bind equivalence.
-// A model that required same-bones / different-q association is therefore
-// quarantined from PS3 mohf_body rendering until its exact GC bind convention
-// is independently proven.
-std::unordered_set<std::string> g_dmf_nonexact_skin_group_models;
 
 struct DMFAddressCacheEntry
 {
@@ -387,6 +368,20 @@ bool IsPlayerWeaponAtlasMaterial(std::string_view name)
 {
   return name == "m1top_256" || name == "m1side_256" ||
          name == "tom_01wo256" || name == "tom_02met256";
+}
+
+// v12.9 release policy.
+//
+// PS3 mohf_body uses a body bind convention that has not been proven
+// compatible with the live retail GameCube XF palette.  Previous
+// experimental paths produced stretched/exploded characters.
+//
+// This is deliberately NOT controlled by an environment variable.
+// Weapons and every other independently validated DMF material remain
+// eligible for PS3 replacement.
+bool IsHardDisabledPS3DMFMaterial(std::string_view name)
+{
+  return name == "mohf_body";
 }
 
 // Retail GC skinned DMF display lists use a seven-byte vertex reference:
@@ -579,66 +574,10 @@ void EnsureDMFPaletteFlowPartition(const SkinnedDrawMatch& draw)
 {
   if (!draw || !draw.owner || !draw.owner->decoded ||
       draw.gc_material_name.empty() || draw.gc_palette_groups.empty() ||
-      draw.ps3_group_to_gc.empty() || IsSupportedPlayerWeaponDMF(draw.gc_name))
+      draw.ps3_group_to_gc.empty() || IsSupportedPlayerWeaponDMF(draw.gc_name) ||
+      IsHardDisabledPS3DMFMaterial(draw.gc_material_name))
   {
     return;
-  }
-
-  // v12.3 proved several BM character resources only after associating the
-  // same bone pair with a different authored 4.12 coefficient.
-  //
-  // That association is sufficient to understand topology/palette identity,
-  // but it is NOT sufficient to prove that a PS3 model-bind vertex can be
-  // driven by that retail GC XF group. Allowing it caused the characteristic
-  // stretched triangles / trapezoid soldiers.
-  //
-  // Keep PS3 rendering for bodies whose COMPLETE group mapping is exact.
-  // v12.5:
-  //
-  // Palette-flow proves triangle ownership.  v12.4.1 then proved that the
-  // remaining visual corruption is specifically in the body bind-space
-  // conversion.
-  //
-  // Test model-space body skinning ONLY for resources whose PS3->GC group
-  // mapping did not need a q approximation.  Any model in
-  // g_dmf_nonexact_skin_group_models remains on the retail GC body path.
-  static const bool body_model_space = [] {
-    const char* value =
-        std::getenv("MOH_PS3_DMF_BODY_MODEL_SPACE");
-
-    return value != nullptr &&
-           value[0] != '\0' &&
-           value[0] != '0';
-  }();
-
-  if (draw.gc_material_name == "mohf_body")
-  {
-    const bool nonexact_groups =
-        g_dmf_nonexact_skin_group_models.contains(
-            std::string(draw.gc_name));
-
-    if (!body_model_space || nonexact_groups)
-    {
-      static unsigned body_skin_fallback_logs = 0;
-
-      if (body_skin_fallback_logs++ < 64)
-      {
-        std::fprintf(
-            stderr,
-            "[moh-ps3-dmf] BODY SKIN SAFE-FALLBACK: "
-            "gc=%.*s material=%.*s reason=%s -> GC body; "
-            "other exact PS3 DMF materials remain enabled\n",
-            static_cast<int>(draw.gc_name.size()),
-            draw.gc_name.data(),
-            static_cast<int>(draw.gc_material_name.size()),
-            draw.gc_material_name.data(),
-            nonexact_groups ?
-                "nonexact-skin-group-q" :
-                "body-model-space-disabled");
-      }
-
-      return;
-    }
   }
 
   const std::string material_key =
@@ -650,7 +589,7 @@ void EnsureDMFPaletteFlowPartition(const SkinnedDrawMatch& draw)
 
   static unsigned reject_logs = 0;
   const auto reject = [&](const char* reason) {
-    if (reject_logs++ < 96)
+    if (PS3RuntimeDebugEnabled() && reject_logs++ < 96)
     {
       std::fprintf(
           stderr,
@@ -2059,7 +1998,7 @@ void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
     else
     {
       static unsigned topology_logs = 0;
-      if (topology_logs++ < 32)
+      if (PS3RuntimeDebugEnabled() && topology_logs++ < 32)
       {
         std::fprintf(stderr,
                      "[moh-ps3-dmf] PLAYER TOPOLOGY MATCH: gc=%s material=%s "
@@ -2241,7 +2180,7 @@ void IndexOriginalGCLevelMSHSignatures(std::string_view level)
 
       ++mapped_nodes;
       ++model_mapped;
-      if (ready_logs++ < 64)
+      if (PS3RuntimeDebugEnabled() && ready_logs++ < 64)
       {
         std::fprintf(stderr,
                      "[moh-ps3-msh] GC SIGNATURE READY: gc=%s node=%zu/%zu ps3=%s submesh=%d/%zu DLoff=%08x DLsize=%u hash=%016llX\n",
@@ -2323,252 +2262,12 @@ std::string SkinGroupKey(std::string_view a, std::string_view b, int blend_q)
 }
 
 
-bool DecodeGCInverseBindTables(
-    std::span<const u8> bytes,
-    ExactDMFPair* pair)
-{
-  if (!pair)
-    return false;
-
-  pair->gc_inverse_bind_by_ref.clear();
-  pair->gc_bind_tables_valid = false;
-
-  if (bytes.size() < 0x54)
-    return false;
-
-  const u32 bone_count =
-      BE32(bytes.data() + 0x48);
-
-  const u32 bone_offset =
-      BE32(bytes.data() + 0x4c);
-
-  const u32 bind_angle_offset =
-      BE32(bytes.data() + 0x50);
-
-  if (!bone_count ||
-      bone_count > 4096 ||
-      bone_offset > bytes.size() ||
-      static_cast<std::size_t>(bone_count) * 16 >
-          bytes.size() - bone_offset ||
-      bind_angle_offset > bytes.size())
-  {
-    return false;
-  }
-
-  const std::size_t angle_bytes =
-      static_cast<std::size_t>(
-          bone_count) * 6;
-
-  if (angle_bytes >
-      bytes.size() - bind_angle_offset)
-  {
-    return false;
-  }
-
-  const std::size_t matrix_offset =
-      (static_cast<std::size_t>(
-           bind_angle_offset) +
-       angle_bytes + 15u) &
-      ~std::size_t(15u);
-
-  const std::size_t matrix_bytes =
-      static_cast<std::size_t>(
-          bone_count) * 64;
-
-  if (matrix_offset > bytes.size() ||
-      matrix_bytes >
-          bytes.size() - matrix_offset)
-  {
-    return false;
-  }
-
-  const auto decode_candidate =
-      [&](bool transposed,
-          std::vector<
-              std::array<float, 16>>* out)
-      {
-        if (!out)
-          return false;
-
-        out->clear();
-        out->resize(bone_count);
-
-        for (u32 ref = 0;
-             ref < bone_count;
-             ++ref)
-        {
-          auto& matrix = (*out)[ref];
-
-          for (std::size_t row = 0;
-               row < 4;
-               ++row)
-          {
-            for (std::size_t column = 0;
-                 column < 4;
-                 ++column)
-            {
-              const std::size_t element =
-                  transposed ?
-                      column * 4 + row :
-                      row * 4 + column;
-
-              const float value =
-                  BEFloat(
-                      bytes.data() +
-                      matrix_offset +
-                      static_cast<std::size_t>(
-                          ref) *
-                          64 +
-                      element * 4);
-
-              if (!std::isfinite(value) ||
-                  std::abs(value) >
-                      1000000.0f)
-              {
-                return false;
-              }
-
-              matrix[
-                  row * 4 + column] =
-                  value;
-            }
-          }
-
-          // Must be a real affine row-major matrix.
-          if (std::abs(matrix[12]) >
-                  1.0e-3f ||
-              std::abs(matrix[13]) >
-                  1.0e-3f ||
-              std::abs(matrix[14]) >
-                  1.0e-3f ||
-              std::abs(
-                  matrix[15] - 1.0f) >
-                  1.0e-3f)
-          {
-            return false;
-          }
-
-          const double det =
-              static_cast<double>(
-                  matrix[0]) *
-                  (static_cast<double>(
-                       matrix[5]) *
-                       matrix[10] -
-                   static_cast<double>(
-                       matrix[6]) *
-                       matrix[9]) -
-              static_cast<double>(
-                  matrix[1]) *
-                  (static_cast<double>(
-                       matrix[4]) *
-                       matrix[10] -
-                   static_cast<double>(
-                       matrix[6]) *
-                       matrix[8]) +
-              static_cast<double>(
-                  matrix[2]) *
-                  (static_cast<double>(
-                       matrix[4]) *
-                       matrix[9] -
-                   static_cast<double>(
-                       matrix[5]) *
-                       matrix[8]);
-
-          if (!std::isfinite(det) ||
-              std::abs(det) < 1.0e-8)
-          {
-            return false;
-          }
-        }
-
-        return true;
-      };
-
-  std::vector<std::array<float, 16>>
-      transposed;
-
-  std::vector<std::array<float, 16>>
-      direct;
-
-  const bool transposed_valid =
-      decode_candidate(
-          true, &transposed);
-
-  const bool direct_valid =
-      decode_candidate(
-          false, &direct);
-
-  // Never guess matrix orientation.
-  if (transposed_valid ==
-      direct_valid)
-  {
-    static unsigned logs = 0;
-
-    if (logs++ < 32)
-    {
-      std::fprintf(
-          stderr,
-          "[moh-ps3-dmf] "
-          "GC BIND TABLE REJECT: "
-          "ps3=%s refs=%u offset=%zu "
-          "transposed=%d direct=%d | "
-          "ambiguous/invalid GC bind layout\n",
-          pair->ps3 ?
-              pair->ps3->
-                  source_name.c_str() :
-              "<unpaired>",
-          bone_count,
-          matrix_offset,
-          transposed_valid ? 1 : 0,
-          direct_valid ? 1 : 0);
-    }
-
-    return false;
-  }
-
-  pair->gc_inverse_bind_by_ref =
-      transposed_valid ?
-          std::move(transposed) :
-          std::move(direct);
-
-  pair->gc_bind_tables_valid = true;
-
-  static unsigned logs = 0;
-
-  if (logs++ < 32)
-  {
-    std::fprintf(
-        stderr,
-        "[moh-ps3-dmf] "
-        "GC BIND TABLE READY: "
-        "ps3=%s refs=%u offset=%zu "
-        "storage=%s | "
-        "authored retail GC inverse bind retained\n",
-        pair->ps3 ?
-            pair->ps3->
-                source_name.c_str() :
-            "<unpaired>",
-        bone_count,
-        matrix_offset,
-        transposed_valid ?
-            "transposed" :
-            "direct");
-  }
-
-  return true;
-}
 
 void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
 {
   if (!pair || !pair->ps3 || !pair->ps3->decoded || !pair->ps3->decoded->valid ||
       gc_bytes.size() < 0x50)
     return;
-
-  // v12.7:
-  // Decode GC bind now. Failure is safe: body rendering
-  // stays on the original GameCube path.
-  DecodeGCInverseBindTables(
-      gc_bytes, pair);
 
   const u32 gc_group_count = BE32(gc_bytes.data() + 0x20);
   const u32 gc_group_offset = BE32(gc_bytes.data() + 0x24);
@@ -2851,12 +2550,6 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
 
         ++pair->mapped_skin_groups;
 
-        // Do NOT confuse structural group association with transform
-        // equivalence. qPS3 != qGC means this character body still needs a
-        // real cross-platform bind proof before using the GC XF group.
-        g_dmf_nonexact_skin_group_models.insert(
-            CanonicalDMFName(pair->ps3->source_name));
-
         static unsigned logs = 0;
 
         if (logs++ < 64)
@@ -2956,7 +2649,7 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
             std::max(maximum_requantized_delta, best_delta);
 
         static unsigned requantized_logs = 0;
-        if (requantized_logs++ < 64)
+        if (PS3RuntimeDebugEnabled() && requantized_logs++ < 64)
         {
           std::fprintf(
               stderr,
@@ -2978,7 +2671,7 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
       else if (best_gc_group >= 0)
       {
         static unsigned nearest_reject_logs = 0;
-        if (nearest_reject_logs++ < 64)
+        if (PS3RuntimeDebugEnabled() && nearest_reject_logs++ < 64)
         {
           std::fprintf(
               stderr,
@@ -3025,7 +2718,7 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
       requantized_groups != 0)
   {
     static unsigned structural_map_logs = 0;
-    if (structural_map_logs++ < 64)
+    if (PS3RuntimeDebugEnabled() && structural_map_logs++ < 64)
     {
       std::fprintf(
           stderr,
@@ -3048,7 +2741,7 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
   if (pair->mapped_skin_groups != decoded.skin_groups.size())
   {
     static unsigned group_gap_logs = 0;
-    if (group_gap_logs++ < 64)
+    if (PS3RuntimeDebugEnabled() && group_gap_logs++ < 64)
     {
       std::fprintf(
           stderr,
@@ -3251,7 +2944,6 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
   g_dmf_palette_flow_clusters.clear();
   g_dmf_palette_flow_analyses.clear();
   g_dmf_palette_flow_material_attempts.clear();
-  g_dmf_nonexact_skin_group_models.clear();
   if (level.empty())
     return;
 
@@ -3362,6 +3054,11 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
           gc_material_name = Lower(FixedString(
               bytes + gc_texture_table + static_cast<std::size_t>(gc_texture_index) * 16, 16));
         }
+        // v12.9: large PS3 character bodies are intentionally kept GC.
+        // Skip them before parsing/hashing/indexing any authored DL.
+        if (IsHardDisabledPS3DMFMaterial(gc_material_name))
+          continue;
+
         const u32 draw_count = BE32(mat + 44);
         const u32 draw_table = BE32(mat + 48);
         if (draw_count > 8192 || draw_table > packed_size ||
@@ -3419,7 +3116,7 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
 
     g_dmf_pairs[filename] = pair;
     ++paired;
-    if (pair_logs++ < 32)
+    if (PS3RuntimeDebugEnabled() && pair_logs++ < 32)
     {
       std::fprintf(stderr,
                    "[moh-ps3-dmf] GC/PS3 EXACT PAIR: gc=%s gc_size=%u gc_ver=%08X ps3=%s ps3_ver=0x%X skin_groups=%zu mapped_groups=%zu clusters=%zu bones=%u\n",
@@ -3555,7 +3252,7 @@ void PreloadCurrentLevelMSH(std::string_view level)
       ++rejected;
 
       static unsigned msh_decode_reject_logs = 0;
-      if (msh_decode_reject_logs++ < 64)
+      if (PS3RuntimeDebugEnabled() && msh_decode_reject_logs++ < 64)
       {
         std::fprintf(
             stderr,
@@ -4447,7 +4144,7 @@ void PreloadCurrentLevelEMT(std::string_view level)
     {
       ++rejected;
       static unsigned emt_reject_logs = 0;
-      if (emt_reject_logs++ < 8)
+      if (PS3RuntimeDebugEnabled() && emt_reject_logs++ < 8)
       {
         char head[3 * 32 + 1]{};
         std::size_t w = 0;
@@ -4672,7 +4369,7 @@ void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const
   if (registered)
   {
     static unsigned register_logs = 0;
-    if (register_logs++ < 32)
+    if (PS3RuntimeDebugEnabled() && register_logs++ < 32)
       std::fprintf(stderr,
                    "[moh-ps3-msh] LIVE EXACT MESH RESOURCE: level=%s gc=%s ps3=%s nodes=%zu submeshes=%zu registered=%zu base=%08x\n",
                    level.c_str(), filename.c_str(), mesh->source_name.c_str(), nodes.size(),
@@ -4733,7 +4430,7 @@ StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands)
       if (resolved)
       {
         static unsigned ambiguous_logs = 0;
-        if (ambiguous_logs++ < 32)
+        if (PS3RuntimeDebugEnabled() && ambiguous_logs++ < 32)
           std::fprintf(stderr,
                        "[moh-ps3-msh] GC SIGNATURE COLLISION unresolved: DL=%08x size=%u hash=%016llX candidates=%zu -> keep GC\n",
                        runtime_address, size, static_cast<unsigned long long>(command_hash),
@@ -4758,7 +4455,7 @@ StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands)
   ++g_matches;
 
   static unsigned signature_logs = 0;
-  if (signature_logs++ < 128)
+  if (PS3RuntimeDebugEnabled() && signature_logs++ < 128)
   {
     std::fprintf(stderr,
                  "[moh-ps3-msh] LIVE EXACT GC MSH: gc=%s node=%u/%u ps3=%s submesh=%zu/%zu DL=%08x size=%u hash=%016llX candidates=%zu\n",
@@ -5355,7 +5052,8 @@ void PrepareDMFDraws()
       ++draws;
     }
   }
-  std::fprintf(stderr, "[moh-ps3-dmf] PRECOMPUTED: draws=%zu; bind validation pending, GC preserved\n", draws);
+  if (PS3RuntimeDebugEnabled())
+    std::fprintf(stderr, "[moh-ps3-dmf] PRECOMPUTED: draws=%zu; bind validation pending, GC preserved\n", draws);
 }
 }  // namespace
 
@@ -5377,26 +5075,10 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   static const bool blended_groups = EnvSwitchLocal("MOH_PS3_DMF_BLEND_GROUPS", true);
   const auto& draw = g_current_dmf_draw;
   if (!replace || !draw.prepared || !draw.owner || !draw.owner->decoded ||
+      IsHardDisabledPS3DMFMaterial(draw.gc_material_name) ||
       (!generic_exact && !IsSupportedPlayerWeaponDMF(draw.gc_name)))
     return {};
 
-
-  static const bool body_model_space = [] {
-    const char* value =
-        std::getenv("MOH_PS3_DMF_BODY_MODEL_SPACE");
-
-    return value != nullptr &&
-           value[0] != '\0' &&
-           value[0] != '0';
-  }();
-
-  if (draw.gc_material_name == "mohf_body" &&
-      (!body_model_space ||
-       g_dmf_nonexact_skin_group_models.contains(
-           std::string(draw.gc_name))))
-  {
-    return {};
-  }
 
   const auto& ready = draw.prepared->readiness;
   const auto& analysis = draw.prepared->analysis;
@@ -5581,13 +5263,19 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   // DMF by ref index; do not require a sibling SKL and never estimate offsets.
   const auto& decoded = *draw.owner->decoded;
 
+  // v12.9.1:
+  // mohf_body remains permanently disabled, but generic validated DMFs
+  // still need the lightweight paired-GC skin-group metadata in order
+  // to recover the authored GC bone pair/q associated with the live XF.
+  //
+  // This does NOT restore the experimental GC inverse-bind body path.
   const ExactDMFPair* exact_pair = nullptr;
 
-  if (const auto it =
+  if (const auto pair_it =
           g_dmf_pairs.find(std::string(draw.gc_name));
-      it != g_dmf_pairs.end())
+      pair_it != g_dmf_pairs.end())
   {
-    exact_pair = &it->second;
+    exact_pair = &pair_it->second;
   }
 
   if (!decoded.bind_tables_valid ||
@@ -5680,308 +5368,6 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
           *reason =
               "ps3-skin-group-out-of-range";
           return false;
-        }
-
-        if (draw.gc_material_name == "mohf_body")
-        {
-          // v12.7:
-          //
-          // The live XF palette comes from the retail GameCube
-          // animation system. Therefore the local-space conversion
-          // must use the retail GC authored bind as its counterpart.
-          //
-          // PS3 model-bind vertex
-          //   -> authored GC group-local
-          //   -> unchanged live GC XF.
-          //
-          // NO offset, scale, AABB recentering or visual heuristic.
-
-          if (!exact_pair ||
-              !exact_pair->gc_bone_order_proven ||
-              !exact_pair->gc_bind_tables_valid ||
-              exact_pair->
-                  gc_inverse_bind_by_ref.empty() ||
-              gc_group < 0 ||
-              static_cast<std::size_t>(
-                  gc_group) >=
-                  exact_pair->
-                      gc_skin_groups.size())
-          {
-            *reason =
-                "body-gc-authored-bind-unavailable";
-
-            return false;
-          }
-
-          const auto& gc =
-              exact_pair->gc_skin_groups[
-                  static_cast<std::size_t>(
-                      gc_group)];
-
-          const auto load_gc_inverse =
-              [&](u32 ref,
-                  std::array<float, 12>* out)
-              {
-                if (!out ||
-                    ref >=
-                        exact_pair->
-                            gc_inverse_bind_by_ref
-                                .size())
-                {
-                  return false;
-                }
-
-                const auto& source =
-                    exact_pair->
-                        gc_inverse_bind_by_ref[
-                            ref];
-
-                for (std::size_t row = 0;
-                     row < 3;
-                     ++row)
-                {
-                  for (std::size_t column = 0;
-                       column < 4;
-                       ++column)
-                  {
-                    const float value =
-                        source[
-                            row * 4 +
-                            column];
-
-                    if (!std::isfinite(value) ||
-                        std::abs(value) >
-                            1000000.0f)
-                    {
-                      return false;
-                    }
-
-                    (*out)[
-                        row * 4 +
-                        column] =
-                        value;
-                  }
-                }
-
-                return true;
-              };
-
-          int rigid_ref = -1;
-
-          if (gc.blend_q == 4096)
-          {
-            rigid_ref =
-                static_cast<int>(
-                    gc.bone_a);
-          }
-          else if (gc.blend_q == 0)
-          {
-            rigid_ref =
-                static_cast<int>(
-                    gc.bone_b);
-          }
-          else if (gc.bone_a ==
-                   gc.bone_b)
-          {
-            rigid_ref =
-                static_cast<int>(
-                    gc.bone_a);
-          }
-
-          if (rigid_ref >= 0)
-          {
-            if (!load_gc_inverse(
-                    static_cast<u32>(
-                        rigid_ref),
-                    position_transform))
-            {
-              *reason =
-                  "body-gc-rigid-inverse-bind-invalid";
-
-              return false;
-            }
-
-            for (std::size_t row = 0;
-                 row < 3;
-                 ++row)
-            {
-              for (std::size_t column = 0;
-                   column < 3;
-                   ++column)
-              {
-                (*normal_transform)[
-                    row * 3 +
-                    column] =
-                    (*position_transform)[
-                        row * 4 +
-                        column];
-              }
-            }
-
-            *blended = false;
-          }
-          else
-          {
-            if (!blended_groups)
-            {
-              *reason =
-                  "body-gc-blended-bind-disabled";
-
-              return false;
-            }
-
-            // Do not clamp or extrapolate legacy values.
-            if (gc.blend_q > 4096)
-            {
-              *reason =
-                  "body-gc-blend-q-unproven";
-
-              return false;
-            }
-
-            std::array<float, 12>
-                inverse_a{},
-                inverse_b{},
-                world_a{},
-                world_b{};
-
-            if (!load_gc_inverse(
-                    gc.bone_a,
-                    &inverse_a) ||
-                !load_gc_inverse(
-                    gc.bone_b,
-                    &inverse_b) ||
-                !invert_affine(
-                    inverse_a,
-                    &world_a) ||
-                !invert_affine(
-                    inverse_b,
-                    &world_b))
-            {
-              *reason =
-                  "body-gc-bone-bind-noninvertible";
-
-              return false;
-            }
-
-            const float weight_a =
-                static_cast<float>(
-                    gc.blend_q) /
-                4096.0f;
-
-            const float weight_b =
-                1.0f - weight_a;
-
-            std::array<float, 12>
-                group_world{};
-
-            for (std::size_t i = 0;
-                 i < group_world.size();
-                 ++i)
-            {
-              group_world[i] =
-                  world_a[i] *
-                      weight_a +
-                  world_b[i] *
-                      weight_b;
-
-              if (!std::isfinite(
-                      group_world[i]))
-              {
-                *reason =
-                    "body-gc-group-bind-nonfinite";
-
-                return false;
-              }
-            }
-
-            if (!invert_affine(
-                    group_world,
-                    position_transform))
-            {
-              *reason =
-                  "body-gc-group-bind-noninvertible";
-
-              return false;
-            }
-
-            // Normal(model -> local):
-            // inverse-transpose(model_to_local)
-            // = transpose(group_world).
-            for (std::size_t row = 0;
-                 row < 3;
-                 ++row)
-            {
-              for (std::size_t column = 0;
-                   column < 3;
-                   ++column)
-              {
-                const float value =
-                    group_world[
-                        column * 4 +
-                        row];
-
-                if (!std::isfinite(value))
-                {
-                  *reason =
-                      "body-gc-normal-bind-nonfinite";
-
-                  return false;
-                }
-
-                (*normal_transform)[
-                    row * 3 +
-                    column] =
-                    value;
-              }
-            }
-
-            *blended = true;
-          }
-
-          *reason = {};
-
-          if (replacement_debug)
-          {
-            static std::unordered_set<
-                std::string>
-                body_gc_bind_logged;
-
-            const std::string log_key =
-                std::string(draw.gc_name) +
-                "|" +
-                std::to_string(gc_group);
-
-            if (body_gc_bind_logged
-                    .insert(log_key)
-                    .second &&
-                body_gc_bind_logged.size() <=
-                    160)
-            {
-              std::fprintf(
-                  stderr,
-                "[moh-ps3-skin] "
-                "BODY GC-BIND READY: "
-                "gc=%.*s gc_group=%d "
-                "ps3_group=%u "
-                "bones=%u/%u "
-                "q=%u/4096 rigid=%d | "
-                "PS3 model-bind -> "
-                "authored retail GC group-local "
-                "-> live XF\n",
-                static_cast<int>(
-                    draw.gc_name.size()),
-                draw.gc_name.data(),
-                gc_group,
-                ps3_group,
-                gc.bone_a,
-                gc.bone_b,
-                  gc.blend_q,
-                  rigid_ref >= 0 ? 1 : 0);
-            }
-          }
-
-          return true;
         }
 
         const auto& ps3 =
@@ -6880,7 +6266,7 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
         g_world_direct_rejected.insert(direct_key);
       }
       static thread_local unsigned reject_logs = 0;
-      if (reject_logs++ < 128)
+      if (PS3RuntimeDebugEnabled() && reject_logs++ < 128)
       {
         const u32 best_triangles = best_owner && !best_owner->submeshes.empty() ?
             static_cast<u32>(best_owner->submeshes[0].indices.size() / 3) : 0;
@@ -6946,7 +6332,7 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     ++g_matches;
 
     static thread_local unsigned match_logs = 0;
-    if (match_logs++ < 192)
+    if (PS3RuntimeDebugEnabled() && match_logs++ < 192)
     {
       const auto& sub = selected_owner->submeshes[0];
       if (selected_dynamic_range)
@@ -7064,7 +6450,7 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
       (std::isfinite(second_score) && second_score - best_score < effective_minimum_margin))
   {
     static thread_local unsigned bootstrap_miss_logs = 0;
-    if (bootstrap_miss_logs++ < 24)
+    if (PS3RuntimeDebugEnabled() && bootstrap_miss_logs++ < 24)
     {
       const u32 best_ps3_vertices =
           best_owner && !best_owner->submeshes.empty() ? best_owner->submeshes[0].vertex_count : 0;
