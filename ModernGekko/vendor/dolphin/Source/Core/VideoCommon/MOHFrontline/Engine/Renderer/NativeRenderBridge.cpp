@@ -34,7 +34,13 @@ bool BuildStatic(DrawPacket* out)
   if (sub.position_uv.size() != sub.vertex_count || sub.indices.empty())
     return false;
 
-  DrawPacket packet;
+  DrawPacket& packet = *out;
+  packet.vertices.clear();
+  packet.indices.clear();
+  packet.model_to_gc_local.clear();
+  packet.material_name.clear();
+  packet.has_texture = true;
+  packet.use_vertex_color = false;
   packet.skinned = false;
   packet.source_name =
       current.mesh && !current.mesh->source_name.empty() ? current.mesh->source_name : "PS3-MSH";
@@ -59,7 +65,6 @@ bool BuildStatic(DrawPacket* out)
     packet.indices.push_back(index);
   }
 
-  *out = std::move(packet);
   return true;
 }
 
@@ -78,7 +83,13 @@ bool BuildSkinned(DrawPacket* out)
       replacement.position_matrix_indices.size() != cluster.positions.size())
     return false;
 
-  DrawPacket packet;
+  DrawPacket& packet = *out;
+  packet.vertices.clear();
+  packet.indices.clear();
+  packet.model_to_gc_local.clear();
+  packet.material_name.clear();
+  packet.has_texture = true;
+  packet.use_vertex_color = false;
   packet.skinned = true;
   packet.source_name =
       replacement.owner ? replacement.owner->source_name : std::string("PS3-DMF");
@@ -104,7 +115,6 @@ bool BuildSkinned(DrawPacket* out)
     packet.indices.push_back(index);
   }
 
-  *out = std::move(packet);
   return true;
 }
 }  // namespace
@@ -236,7 +246,8 @@ bool TrySubmitCurrentDraw()
     return false;
   }
 
-  DrawPacket packet;
+  // Submission is synchronous; reuse capacity across draws on the render thread.
+  thread_local DrawPacket packet;
   if (!BuildCurrentDraw(&packet))
     return false;
 

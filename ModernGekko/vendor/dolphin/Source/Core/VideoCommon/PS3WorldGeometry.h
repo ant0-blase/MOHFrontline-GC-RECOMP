@@ -18,16 +18,17 @@
 #include <utility>
 #include <vector>
 
+#include "VideoCommon/MOHFrontline/Assets/Formats/WorldFormats.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Meshes/StaticMesh.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 
 // Runtime PS3 CPT/RSX world-geometry probe/bridge.
 //
 // Frontline's PS3 *_ART_cN.cpt files are treated as metadata containers.  The
-// actual RSX payload may be inline or referenced from the level rsx.viv.  This
-// decoder deliberately does not assume one fixed CPT struct: it searches for
-// the same compact RSX vertex declaration shape already used by PS3 MSH v8,
-// validates every candidate against the referenced vertex/index ranges, and
+// actual RSX payload may be inline or referenced from the level rsx.viv. This
+// decoder follows the version-9 CPT chunk/node/material pointer graph to the
+// compact RSX vertex declarations also used by PS3 MSH,
+// validates each declaration against the referenced vertex/index ranges, and
 // exports only host-renderable one-submesh StaticMesh objects.  Those objects
 // are then consumed by the existing PS3MeshPort renderer/matcher.
 namespace PS3WorldGeometry
@@ -80,16 +81,6 @@ inline bool TraceEnabled()
 inline bool MaterialTraceEnabled()
 {
   static const bool enabled = EnvSwitch("MOH_PS3_WORLD_MATERIAL_TRACE", false);
-  return enabled;
-}
-
-inline bool NodeTransformEnabled()
-{
-  // v9.9: TABLE3/NODE70 begins with an exact rigid 3x4 affine matrix.  The
-  // v9.8 probe showed orthonormal rows and determinant +1 for every dumped
-  // NODE70, so authored CPT vertices can finally be moved from node-local to
-  // level/world space before bounds matching and host submission.
-  static const bool enabled = EnvSwitch("MOH_PS3_CPT_NODE_TRANSFORM", true);
   return enabled;
 }
 
@@ -454,183 +445,26 @@ inline bool ResolveCPTDescriptorLink(std::span<const u8> bytes, std::size_t desc
   if (!out || descriptor_offset > std::numeric_limits<u32>::max())
     return false;
 
-  const auto tables = DescribeCPTHeaderTables(bytes);
-  const auto& links = tables[2];
-  const auto& nodes = tables[3];
-  if (!links.valid || !links.offset || !links.count || !nodes.valid || !nodes.offset ||
-      !nodes.count)
+  // One authoritative parser for CPT table bounds/pointer ownership.  The old
+  // local implementation inferred table spans from neighbouring offsets, which
+  // is fragile when retail chunks contain alignment padding after TABLE2.
+  const auto parsed = MOHFrontline::WorldFormats::PS3CPT::Parse(bytes);
+  if (!parsed)
+    return false;
+  const auto link = parsed->ResolveDescriptor(static_cast<u32>(descriptor_offset));
+  if (!link)
     return false;
 
-  // v9.7 proved TABLE2 is a fixed 0x14-byte pointer record table.  The
-  // apparent 0x18/0x1c sizes in one-record chunks are only inter-table padding.
-  constexpr std::size_t LINK_RECORD_SIZE = 0x14;
-  constexpr std::size_t MATERIAL_RECORD_SIZE = 0x94;
-  constexpr std::size_t NODE_RECORD_SIZE = 0x70;
-  if (std::size_t(links.count) > (bytes.size() - links.offset) / LINK_RECORD_SIZE)
-    return false;
-
-  const auto exact_record = [&](const CPTHeaderTable& table, u32 offset,
-                                std::size_t stride, std::size_t* record) {
-    if (!table.valid || !table.offset || !table.count || offset < table.offset)
-      return false;
-    const std::size_t delta = std::size_t(offset) - table.offset;
-    if ((delta % stride) != 0)
-      return false;
-    const std::size_t index = delta / stride;
-    if (index >= table.count || std::size_t(offset) > bytes.size() ||
-        stride > bytes.size() - std::size_t(offset))
-      return false;
-    if (record)
-      *record = index;
-    return true;
-  };
-
-  for (std::size_t record = 0; record < links.count; ++record)
-  {
-    const std::size_t off = std::size_t(links.offset) + record * LINK_RECORD_SIZE;
-    if (off > bytes.size() || LINK_RECORD_SIZE > bytes.size() - off)
-      break;
-    const u32 w0 = BE32(bytes.data() + off);
-    const u32 w1 = BE32(bytes.data() + off + 4);
-    const u32 w2 = BE32(bytes.data() + off + 8);
-    const u32 w3 = BE32(bytes.data() + off + 12);
-    const u32 w4 = BE32(bytes.data() + off + 16);
-    if (w3 != static_cast<u32>(descriptor_offset))
-      continue;
-
-    std::size_t node_record = 0;
-    if (!exact_record(nodes, w0, NODE_RECORD_SIZE, &node_record))
-      continue;
-
-    std::size_t material_table = 0;
-    std::size_t material_record = 0;
-    bool material_ok = false;
-    for (std::size_t table_index = 0; table_index < 2; ++table_index)
-    {
-      if (exact_record(tables[table_index], w2, MATERIAL_RECORD_SIZE, &material_record))
-      {
-        material_table = table_index;
-        material_ok = true;
-        break;
-      }
-    }
-    if (!material_ok)
-      continue;
-
-    out->valid = true;
-    out->link_record = record;
-    out->node_record = node_record;
-    out->material_table = material_table;
-    out->material_record = material_record;
-    out->node_offset = w0;
-    out->material_offset = w2;
-    out->descriptor_offset = w3;
-    out->word1 = w1;
-    out->word4 = w4;
-    return true;
-  }
-  return false;
-}
-
-struct CPTNodeAffine
-{
-  bool valid = false;
-  std::array<float, 12> matrix{};
-  float determinant = 0.0f;
-  float orthogonality_error = std::numeric_limits<float>::infinity();
-};
-
-inline bool DecodeCPTNodeAffine(std::span<const u8> bytes, const CPTDescriptorLink& link,
-                                CPTNodeAffine* out)
-{
-  if (!out || !link.valid || !link.node_offset ||
-      std::size_t(link.node_offset) > bytes.size() ||
-      0x30 > bytes.size() - std::size_t(link.node_offset))
-    return false;
-
-  CPTNodeAffine affine;
-  for (std::size_t i = 0; i < affine.matrix.size(); ++i)
-  {
-    affine.matrix[i] = BEFloat(bytes.data() + std::size_t(link.node_offset) + i * 4);
-    if (!std::isfinite(affine.matrix[i]) || std::fabs(affine.matrix[i]) > 1000000.0f)
-      return false;
-  }
-
-  const auto dot3 = [&](std::size_t a, std::size_t b) {
-    return affine.matrix[a + 0] * affine.matrix[b + 0] +
-           affine.matrix[a + 1] * affine.matrix[b + 1] +
-           affine.matrix[a + 2] * affine.matrix[b + 2];
-  };
-  const float n0 = dot3(0, 0);
-  const float n1 = dot3(4, 4);
-  const float n2 = dot3(8, 8);
-  const float d01 = dot3(0, 4);
-  const float d02 = dot3(0, 8);
-  const float d12 = dot3(4, 8);
-  affine.orthogonality_error = std::max(
-      {std::fabs(n0 - 1.0f), std::fabs(n1 - 1.0f), std::fabs(n2 - 1.0f),
-       std::fabs(d01), std::fabs(d02), std::fabs(d12)});
-
-  const float a00 = affine.matrix[0], a01 = affine.matrix[1], a02 = affine.matrix[2];
-  const float a10 = affine.matrix[4], a11 = affine.matrix[5], a12 = affine.matrix[6];
-  const float a20 = affine.matrix[8], a21 = affine.matrix[9], a22 = affine.matrix[10];
-  affine.determinant =
-      a00 * (a11 * a22 - a12 * a21) -
-      a01 * (a10 * a22 - a12 * a20) +
-      a02 * (a10 * a21 - a11 * a20);
-
-  // Keep this deliberately strict.  A malformed pointer must never turn into
-  // a giant world-space warp.  Retail NODE70 matrices measured by v9.8 were
-  // within ~1e-7 of orthonormal and det +1.
-  if (affine.orthogonality_error > 0.02f ||
-      affine.determinant < 0.95f || affine.determinant > 1.05f)
-    return false;
-
-  affine.valid = true;
-  *out = affine;
-  return true;
-}
-
-inline bool ApplyCPTNodeAffine(Submesh* submesh, const CPTNodeAffine& affine)
-{
-  if (!submesh || !affine.valid || submesh->position_uv.size() != submesh->vertex_count)
-    return false;
-
-  std::vector<PositionUVVertex> transformed = submesh->position_uv;
-  for (auto& vertex : transformed)
-  {
-    const auto p = vertex.position;
-    vertex.position = {
-        affine.matrix[0] * p[0] + affine.matrix[1] * p[1] + affine.matrix[2] * p[2] +
-            affine.matrix[3],
-        affine.matrix[4] * p[0] + affine.matrix[5] * p[1] + affine.matrix[6] * p[2] +
-            affine.matrix[7],
-        affine.matrix[8] * p[0] + affine.matrix[9] * p[1] + affine.matrix[10] * p[2] +
-            affine.matrix[11],
-    };
-    if (!std::isfinite(vertex.position[0]) || !std::isfinite(vertex.position[1]) ||
-        !std::isfinite(vertex.position[2]) || std::fabs(vertex.position[0]) > 1000000.0f ||
-        std::fabs(vertex.position[1]) > 1000000.0f || std::fabs(vertex.position[2]) > 1000000.0f)
-      return false;
-
-    if (submesh->has_normal)
-    {
-      const auto n = vertex.normal;
-      std::array<float, 3> rotated{
-          affine.matrix[0] * n[0] + affine.matrix[1] * n[1] + affine.matrix[2] * n[2],
-          affine.matrix[4] * n[0] + affine.matrix[5] * n[1] + affine.matrix[6] * n[2],
-          affine.matrix[8] * n[0] + affine.matrix[9] * n[1] + affine.matrix[10] * n[2],
-      };
-      const float length = std::sqrt(rotated[0] * rotated[0] + rotated[1] * rotated[1] +
-                                     rotated[2] * rotated[2]);
-      if (!std::isfinite(length) || length < 1.0e-8f)
-        return false;
-      for (std::size_t axis = 0; axis < 3; ++axis)
-        vertex.normal[axis] = rotated[axis] / length;
-    }
-  }
-
-  submesh->position_uv = std::move(transformed);
+  out->valid = true;
+  out->link_record = link->record;
+  out->node_record = link->node_index;
+  out->material_table = link->material_table;
+  out->material_record = link->material_index;
+  out->node_offset = link->node_offset;
+  out->material_offset = link->material_offset;
+  out->descriptor_offset = link->descriptor_offset;
+  out->word1 = link->word1;
+  out->word4 = link->word4;
   return true;
 }
 
@@ -718,9 +552,8 @@ inline void AttachCPTMaterialTextures(Submesh* submesh,
 }
 
 inline void TraceCPTResolvedState(const AssetInfo& cpt, const CPTDescriptorLink& link,
-                                  const CPTNodeAffine& affine,
-                                  const std::array<CPTMaterialTextureRef, 2>& textures,
-                                  bool transform_applied)
+                                  const MOHFrontline::WorldFormats::Bounds3& bounds,
+                                  const std::array<CPTMaterialTextureRef, 2>& textures)
 {
   if (!MaterialTraceEnabled() || !link.valid)
     return;
@@ -728,14 +561,15 @@ inline void TraceCPTResolvedState(const AssetInfo& cpt, const CPTDescriptorLink&
   static std::unordered_set<std::string> dumped_nodes;
   static std::unordered_set<std::string> dumped_textures;
   const std::string node_key = cpt.relative_path + "#node:" + std::to_string(link.node_offset);
-  if (affine.valid && dumped_nodes.insert(node_key).second)
+  if (bounds.valid && dumped_nodes.insert(node_key).second)
   {
+    const auto center = bounds.Center();
+    const auto extent = bounds.Extent();
     std::fprintf(stderr,
-                 "[moh-ps3-world-mat] NODE AFFINE: source=%s node=%zu off=0x%08X det=%.8f orth=%.8g t=(%.6f %.6f %.6f) applied=%d\n",
+                 "[moh-ps3-world-mat] NODE BOUNDS: source=%s node=%zu off=0x%08X "
+                 "center=(%.6f %.6f %.6f) extent=(%.6f %.6f %.6f)\n",
                  cpt.relative_path.c_str(), link.node_record, link.node_offset,
-                 affine.determinant, affine.orthogonality_error,
-                 affine.matrix[3], affine.matrix[7], affine.matrix[11],
-                 transform_applied ? 1 : 0);
+                 center[0], center[1], center[2], extent[0], extent[1], extent[2]);
   }
 
   for (const auto& texture : textures)
@@ -760,6 +594,7 @@ inline void AttachCPTDescriptorLink(Submesh* submesh, const CPTDescriptorLink& l
 {
   if (!submesh || !link.valid)
     return;
+  submesh->cpt_material_offset = link.material_offset;
   submesh->material_hints.clear();
   submesh->material_hints.push_back(
       "@cpt-link=" + std::to_string(link.link_record) +
@@ -1035,14 +870,22 @@ inline std::vector<std::shared_ptr<StaticMesh>> Decode(const AssetInfo& cpt, Dec
 
   DecodeStats local;
   std::unordered_set<u64> accepted_keys;
-  constexpr std::size_t MAX_DESCRIPTORS = 256;
-  constexpr std::size_t MAX_MESHES = 64;
+  const auto graph = MOHFrontline::WorldFormats::PS3CPT::Parse(bytes);
+  if (!graph)
+    return meshes;
 
-  for (std::size_t p = 0; p + 16 <= bytes.size() &&
-                          local.descriptor_candidates < MAX_DESCRIPTORS &&
-                          meshes.size() < MAX_MESHES;
-       p += 4)
+  // Walk authored chunk records, not arbitrary payload words. Retail sectors
+  // contain far more than 64 meshes, and a descriptor may have several node
+  // instances. Keep each link so those instances retain their own transform.
+  for (u32 record = 0; record < graph->tables[2].count; ++record)
   {
+    const auto link = graph->ResolveLink(record);
+    if (!link)
+    {
+      ++local.rejected;
+      continue;
+    }
+    const std::size_t p = link->descriptor_offset;
     Descriptor d;
     if (!ParseDescriptor(bytes, p, &d))
       continue;
@@ -1134,22 +977,24 @@ inline std::vector<std::shared_ptr<StaticMesh>> Decode(const AssetInfo& cpt, Dec
     }
 
     CPTDescriptorLink descriptor_link;
-    if (ResolveCPTDescriptorLink(bytes, d.source_offset, &descriptor_link))
+    descriptor_link.valid = true;
+    descriptor_link.link_record = link->record;
+    descriptor_link.node_record = link->node_index;
+    descriptor_link.material_table = link->material_table;
+    descriptor_link.material_record = link->material_index;
+    descriptor_link.node_offset = link->node_offset;
+    descriptor_link.material_offset = link->material_offset;
+    descriptor_link.descriptor_offset = link->descriptor_offset;
+    descriptor_link.word1 = link->word1;
+    descriptor_link.word4 = link->word4;
     {
       Submesh& linked_submesh = decoded->submeshes.front();
       AttachCPTDescriptorLink(&linked_submesh, descriptor_link);
 
-      CPTNodeAffine node_affine;
-      const bool affine_valid = DecodeCPTNodeAffine(bytes, descriptor_link, &node_affine);
-      const bool transform_applied =
-          affine_valid && NodeTransformEnabled() && ApplyCPTNodeAffine(&linked_submesh, node_affine);
-      if (affine_valid)
-      {
-        linked_submesh.material_hints.push_back(
-            "@cpt-node=record:" + std::to_string(descriptor_link.node_record) +
-            ";offset:" + std::to_string(descriptor_link.node_offset) +
-            ";applied:" + std::to_string(transform_applied ? 1 : 0));
-      }
+      const auto bounds = graph->NodeBounds(*link);
+      linked_submesh.material_hints.push_back(
+          "@cpt-node=record:" + std::to_string(link->node_index) +
+          ";offset:" + std::to_string(link->node_offset) + ";applied:0");
 
       std::array<CPTMaterialTextureRef, 2> material_textures{};
       const std::uint64_t rsx_size = rsx ? static_cast<std::uint64_t>(rsx->size) : 0;
@@ -1157,27 +1002,18 @@ inline std::vector<std::shared_ptr<StaticMesh>> Decode(const AssetInfo& cpt, Dec
         DecodeCPTMaterialTextureRef(bytes, descriptor_link, slot, rsx_size,
                                     &material_textures[slot]);
       AttachCPTMaterialTextures(&linked_submesh, material_textures);
-      TraceCPTResolvedState(cpt, descriptor_link, node_affine, material_textures,
-                            transform_applied);
+      TraceCPTResolvedState(cpt, descriptor_link,
+                            bounds.value_or(MOHFrontline::WorldFormats::Bounds3{}),
+                            material_textures);
       TraceExactCPTDescriptorLink(bytes, cpt, d, descriptor_link);
     }
-    else
-    {
-      // Keep the old diagnostic fallback only for descriptors that are not
-      // present in the exact TABLE2 pointer graph.
-      decoded->submeshes.front().material_hints = ProbeMaterialHints(bytes, d);
-      TraceMaterialProbe(bytes, d, *decoded);
-    }
-
     const Submesh& sub = decoded->submeshes.front();
     u64 key = FNV1a(sub.vertices);
     key = FNV1a(std::span<const u8>(reinterpret_cast<const u8*>(sub.indices.data()),
                                    sub.indices.size() * sizeof(u16)), key);
     key ^= u64(sub.vertex_count) << 32;
     key ^= sub.index_count;
-    // Local vertex/index bytes can be identical for authored instances placed
-    // by different NODE70 transforms or materials.  Keep those instances
-    // distinct after v9.9 starts applying the exact node affine.
+    // Preserve distinct authored links/materials even when their mesh bytes match.
     if (descriptor_link.valid)
     {
       key ^= u64(descriptor_link.node_offset) * 0x9E3779B185EBCA87ULL;

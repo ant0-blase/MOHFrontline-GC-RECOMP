@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "VideoCommon/Assets/CustomTextureData.h"
+#include "VideoCommon/MOHFrontline/Assets/Formats/WorldFormats.h"
 #include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCViv.h"
 #include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCCompartment.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
@@ -519,42 +520,59 @@ inline std::vector<PS3Record> ParsePS3CPT(std::span<const u8> cpt, std::uintmax_
   std::vector<PS3Record> out;
   std::unordered_set<u64> seen;
 
-  // PS3 CPT metadata uses the same 48-byte RSX resource-record shape as the
-  // current TPK parser: size@+4, rsx offset@+8, 24-byte texture descriptor@+16.
-  // Scan rather than depending on a platform-specific CPT header/pointer table.
-  for (std::size_t pos = 0; pos + 40 <= cpt.size(); pos += 4)
-  {
-    const u32 size = BE32(cpt.data() + pos + 4);
-    const u32 raw_offset = BE32(cpt.data() + pos + 8);
-
-    // CPT RSX references carry a low-bit flag in the address. The actual RSX
-    // payload is 0x80-aligned; treating raw_offset as a byte address shifts BC
-    // blocks by one byte (the v7 logs showed ...01 / ...81) and corrupts both
-    // the runtime texture and its fingerprint.
-    if (!size || !raw_offset)
-      continue;
-    if ((raw_offset & 0x7Fu) > 1u)
-      continue;
+  const auto append_record = [&](u32 size, u32 raw_offset,
+                                 const std::array<u8, 24>& descriptor,
+                                 std::size_t metadata_offset) {
+    if (!size || !raw_offset || (raw_offset & 0x7fu) > 1u)
+      return;
     const u32 offset = raw_offset & ~1u;
-    if (!offset || (offset & 0x7Fu) != 0 || offset > rsx_size ||
-        size > rsx_size - offset)
-      continue;
-
-    std::array<u8, 24> descriptor{};
-    std::copy_n(cpt.data() + pos + 16, descriptor.size(), descriptor.begin());
-    if (!PlausiblePS3Descriptor(descriptor))
-      continue;
-
+    if (!offset || (offset & 0x7fu) != 0 || offset > rsx_size ||
+        size > rsx_size - offset || !PlausiblePS3Descriptor(descriptor))
+      return;
     const u64 identity = (u64(offset) << 32) | size;
     if (!seen.insert(identity).second)
-      continue;
-
+      return;
     PS3Record record;
     record.offset = offset;
     record.size = size;
     record.descriptor = descriptor;
-    record.metadata_offset = pos;
+    record.metadata_offset = metadata_offset;
     out.push_back(record);
+  };
+
+  // Prefer the exact PS3 CPT pointer graph added to WorldFormats. TABLE2 links
+  // every geometry descriptor to one MAT94 record; MAT94 slot 0/1 then point
+  // directly at the authored rsx.viv texture resources. This removes the old
+  // dependency on a blind 4-byte scan for the normal retail path.
+  if (const auto parsed = MOHFrontline::WorldFormats::PS3CPT::Parse(cpt))
+  {
+    for (u32 link_index = 0; link_index < parsed->tables[2].count; ++link_index)
+    {
+      const auto link = parsed->ResolveLink(link_index);
+      if (!link)
+        continue;
+      for (unsigned slot = 0; slot < 2; ++slot)
+      {
+        const auto texture = parsed->MaterialTexture(*link, slot);
+        if (!texture)
+          continue;
+        std::array<u8, 24> descriptor{};
+        std::copy(texture->descriptor.begin(), texture->descriptor.end(), descriptor.begin());
+        append_record(texture->size, texture->offset, descriptor,
+                      link->material_offset + (slot == 0 ? 0x18u : 0x40u));
+      }
+    }
+  }
+
+  // Keep the validated scan as a compatibility fallback for still-unmapped
+  // CPT metadata variants. Exact MAT94 records above win through deduplication.
+  for (std::size_t pos = 0; pos + 40 <= cpt.size(); pos += 4)
+  {
+    const u32 size = BE32(cpt.data() + pos + 4);
+    const u32 raw_offset = BE32(cpt.data() + pos + 8);
+    std::array<u8, 24> descriptor{};
+    std::copy_n(cpt.data() + pos + 16, descriptor.size(), descriptor.begin());
+    append_record(size, raw_offset, descriptor, pos);
   }
 
   std::sort(out.begin(), out.end(),

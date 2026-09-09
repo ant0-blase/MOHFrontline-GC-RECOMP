@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <optional>
 #include <vector>
 namespace MOHFrontline::Meshes
 {
@@ -37,6 +38,8 @@ struct Submesh
   // table has exactly the same record count as the geometry section table.
   // The renderer must still validate/use these names before native submission.
   std::vector<std::string> material_hints;
+  // File-relative CPT material identity, used to keep draw batches homogeneous.
+  std::optional<std::uint32_t> cpt_material_offset;
 };
 struct StaticMesh
 {

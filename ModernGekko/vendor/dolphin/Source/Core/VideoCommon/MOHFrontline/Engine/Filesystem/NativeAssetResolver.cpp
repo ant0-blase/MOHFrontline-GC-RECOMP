@@ -138,7 +138,7 @@ Domain Classify(std::string_view path)
   if (e == ".dmf") return Domain::SkinnedMesh;
   if (e == ".skl") return Domain::Skeleton;
   if (e == ".mvd" || e == ".emt" || e == ".aem" || e == ".aemx") return Domain::Animation;
-  if (e == ".xpd" || e == ".bpd" || e == ".cpt" || e == ".cdb" || e == ".lit" || e == ".som") return Domain::World;
+  if (e == ".xpd" || e == ".bpd" || e == ".psp" || e == ".cpt" || e == ".cdb" || e == ".lit" || e == ".som") return Domain::World;
   if (e == ".lfc" || e == ".scr" || e == ".sin" || e == ".cls" || e == ".dat") return Domain::Script;
   if (e == ".viv" || e == ".big" || e == ".tpk") return Domain::Container;
   return Domain::Unknown;

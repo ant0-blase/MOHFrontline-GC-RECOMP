@@ -1,9 +1,11 @@
 #include "VideoCommon/PS3MeshPort.h"
+#include "VideoCommon/MOHFrontline/Engine/Renderer/Meshes/WorldMeshBatch.h"
 #include "VideoCommon/Fifo.h"
 #include "Common/Hash.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
+#include "VideoCommon/MOHFrontline/Engine/World/WorldLevelRuntime.h"
 #include <atomic>
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/MSH.h"
@@ -1391,85 +1393,7 @@ bool IsWorldCPTMesh(const StaticMesh& mesh)
 // SAME *_ART_cN.cpt.  The aggregate is never copied into guest memory; it only
 // lets the existing strict bounds/topology matcher compare one GC batch with a
 // small authored PS3 descriptor run.
-std::shared_ptr<StaticMesh> BuildWorldCPTPack(
-    const std::vector<std::shared_ptr<StaticMesh>>& meshes, std::size_t first,
-    std::size_t count)
-{
-  if (count < 2 || first >= meshes.size() || count > meshes.size() - first)
-    return {};
-
-  auto pack = std::make_shared<StaticMesh>();
-  Submesh merged;
-  merged.has_uv0 = true;
-  merged.has_uv1 = true;
-  merged.has_normal = true;
-  merged.vertex_stride = 32;
-
-  std::size_t vertex_base = 0;
-  std::size_t total_indices = 0;
-  for (std::size_t member = 0; member < count; ++member)
-  {
-    const auto& mesh = meshes[first + member];
-    if (!mesh || mesh->submeshes.size() != 1)
-      return {};
-    const auto& sub = mesh->submeshes[0];
-    if (!sub.vertex_count || sub.position_uv.size() != sub.vertex_count ||
-        sub.indices.empty() || (sub.indices.size() % 3) != 0)
-      return {};
-    if (vertex_base + sub.vertex_count > 65535u ||
-        total_indices + sub.indices.size() > 300000u)
-      return {};
-
-    if (member == 0)
-      merged.attributes = sub.attributes;
-
-    // v9.8: preserve the exact CPT pointer graph for every descriptor inside
-    // an aggregate.  The current renderer still submits one merged draw, but
-    // these span records retain the future split point needed for true
-    // per-descriptor PS3 materials without re-decoding the CPT.
-    const std::size_t member_first_index = total_indices;
-    merged.material_hints.push_back(
-        "@cpt-pack-span=member:" + std::to_string(member) +
-        ";first-index:" + std::to_string(member_first_index) +
-        ";index-count:" + std::to_string(sub.indices.size()) +
-        ";first-vertex:" + std::to_string(vertex_base) +
-        ";vertex-count:" + std::to_string(sub.vertex_count));
-    for (const std::string& hint : sub.material_hints)
-    {
-      if (hint.rfind("@cpt-", 0) == 0)
-        merged.material_hints.push_back("@cpt-pack-member=" + std::to_string(member) + ";" + hint);
-    }
-
-    merged.has_uv0 = merged.has_uv0 && sub.has_uv0;
-    merged.has_uv1 = merged.has_uv1 && sub.has_uv1;
-    merged.has_normal = merged.has_normal && sub.has_normal;
-    merged.position_uv.insert(merged.position_uv.end(), sub.position_uv.begin(),
-                              sub.position_uv.end());
-    for (u16 index : sub.indices)
-    {
-      const std::size_t shifted = vertex_base + index;
-      if (shifted > 65535u)
-        return {};
-      merged.indices.push_back(static_cast<u16>(shifted));
-    }
-    vertex_base += sub.vertex_count;
-    total_indices += sub.indices.size();
-  }
-
-  if (merged.position_uv.empty() || merged.indices.empty())
-    return {};
-  merged.vertex_count = static_cast<u32>(merged.position_uv.size());
-  merged.index_count = static_cast<u32>(merged.indices.size());
-
-  const std::string& first_name = meshes[first]->source_name;
-  const std::size_t marker = first_name.find(".cpt#");
-  if (marker == std::string::npos)
-    return {};
-  pack->source_name = first_name.substr(0, marker + 4) + "#cpt-pack-" +
-                      std::to_string(first) + "x" + std::to_string(count);
-  pack->submeshes.push_back(std::move(merged));
-  return pack;
-}
+using MOHFrontline::Meshes::BuildWorldCPTPack;
 
 // v9.5: retain the original descriptor order per CPT chunk. Fixed 2/4/8/16
 // packs are only probes; the exact GC batch boundary can fall anywhere inside
@@ -3531,6 +3455,7 @@ void ClearMSHCache()
   g_current_draw = {};
   g_current_draw_transient_world = false;
   g_current_world_direct_key = 0;
+  MOHFrontline::WorldLevelRuntime::Clear();
 }
 
 void ClearDMFCache()
@@ -3565,6 +3490,8 @@ void PreloadCurrentLevelMSH(std::string_view level)
 {
   if (!PS3AssetPort::IsMSHEnabled() || !PS3RemasterAssets::IsReady() || level.empty())
     return;
+
+  MOHFrontline::WorldLevelRuntime::Rebuild(level);
 
   std::unordered_map<std::string, std::shared_ptr<StaticMesh>> next;
   std::size_t candidates = 0;
@@ -3684,6 +3611,7 @@ void PreloadCurrentLevelMSH(std::string_view level)
         continue;
       ++world_cpt_chunks;
       auto converted = PS3WorldGeometry::Decode(asset, &world_geo_stats);
+      MOHFrontline::WorldLevelRuntime::AnchorCPTChunk(asset, &converted);
       std::vector<std::shared_ptr<StaticMesh>> chunk_meshes;
       chunk_meshes.reserve(converted.size());
       for (auto& mesh : converted)
@@ -3702,6 +3630,10 @@ void PreloadCurrentLevelMSH(std::string_view level)
 
       if (build_packs && chunk_meshes.size() >= 2)
       {
+        std::vector<std::size_t> triangle_prefix(chunk_meshes.size() + 1);
+        for (std::size_t i = 0; i < chunk_meshes.size(); ++i)
+          triangle_prefix[i + 1] = triangle_prefix[i] +
+              chunk_meshes[i]->submeshes[0].indices.size() / 3;
         for (std::size_t width : pack_widths)
         {
           if (width > chunk_meshes.size())
@@ -3711,6 +3643,9 @@ void PreloadCurrentLevelMSH(std::string_view level)
           const std::size_t step = std::max<std::size_t>(1, width / 2);
           for (std::size_t first = 0; first + width <= chunk_meshes.size(); first += step)
           {
+            const auto candidate_triangles = triangle_prefix[first + width] - triangle_prefix[first];
+            if (candidate_triangles < 48 || candidate_triangles > 2048)
+              continue;
             auto pack = BuildWorldCPTPack(chunk_meshes, first, width);
             if (!pack || pack->submeshes.empty())
               continue;
@@ -4629,14 +4564,9 @@ bool IsFullCPTLevelRenderEnabled()
     return false;
   }
 
-  // v10.3 safety gate: v10.1/v10.2 proved that a raw aggregate of every CPT
-  // descriptor is not yet a valid world replacement. NODE70 gives each
-  // descriptor's local rigid transform, but successful direct/range matches
-  // still require an additional GC-world translation which differs between
-  // descriptor groups. Submitting the raw aggregate on an arbitrary GX world
-  // batch therefore duplicates the GC world and makes props/sections appear to
-  // float. Keep aggregate construction available for diagnostics, but require
-  // an explicit second opt-in before it can ever replace a draw.
+  // A raw full-level aggregate does not preserve per-material draws or the
+  // original visibility selection. Keep it behind an explicit diagnostic flag.
+  // NODE70 holds visibility bounds; CPT positions are already world-space.
   static const bool unsafe_raw_overlay =
       EnvSwitchLocal("MOH_PS3_CPT_FULL_LEVEL_UNSAFE", false);
   if (!unsafe_raw_overlay)

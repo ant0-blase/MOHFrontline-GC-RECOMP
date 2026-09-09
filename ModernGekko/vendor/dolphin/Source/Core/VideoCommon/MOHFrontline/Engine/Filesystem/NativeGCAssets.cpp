@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCFont.h"
+#include "VideoCommon/MOHFrontline/Assets/Formats/WorldFormats.h"
 #include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCCompartment.h"
 #include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCViv.h"
 #include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
@@ -74,8 +75,8 @@ const char* Kind(std::string_view ext)
   if (ext == ".gsh") return "GSH/SHPG-texture";
   if (ext == ".gfn") return "GFN/FNTG-font";
   if (ext == ".tpk") return "TPK-texture-pack";
-  if (ext == ".psp") return "PSP-particle";
-  if (ext == ".bpd") return "BPD-particle";
+  if (ext == ".psp") return "PSP-property-BSP";
+  if (ext == ".bpd") return "BPD-level-properties";
   if (ext == ".scr") return "SCR-shell-script";
   if (ext == ".cbs") return "CBS-behaviour";
   if (ext == ".sin") return "SIN-instance";
@@ -219,7 +220,8 @@ void InspectFont(const std::filesystem::path& container, const Entry& entry)
 
 void InspectCompartment(const std::filesystem::path& container, const Entry& entry)
 {
-  if (entry.extension != ".cpt" && entry.extension != ".cdb")
+  if (entry.extension != ".cpt" && entry.extension != ".cdb" &&
+      entry.extension != ".bpd" && entry.extension != ".psp")
     return;
   std::vector<unsigned char> bytes;
   bool valid = ReadFileRange(container, entry.offset, entry.size, &bytes);
@@ -245,7 +247,7 @@ void InspectCompartment(const std::filesystem::path& container, const Entry& ent
       }
     }
   }
-  else if (valid)
+  else if (valid && entry.extension == ".cdb")
   {
     const auto cdb = GCCompartment::CDB::Parse(bytes);
     valid = cdb.has_value();
@@ -259,11 +261,27 @@ void InspectCompartment(const std::filesystem::path& container, const Entry& ent
       }
     }
   }
+  else if (valid && entry.extension == ".bpd")
+  {
+    const auto bpd = WorldFormats::BPD::ParseWithEndian(bytes, true);
+    valid = bpd.has_value();
+    if (bpd)
+      decoded = bpd->properties.size();
+  }
+  else if (valid)
+  {
+    const auto psp = WorldFormats::PSP::Parse(bytes, true);
+    valid = psp.has_value();
+    if (psp)
+      decoded = psp->nodes.size() + psp->leaves.size();
+  }
+  const char* units = entry.extension == ".cpt" ? "strip vertices" :
+                      entry.extension == ".cdb" ? "collision triangles" :
+                      entry.extension == ".bpd" ? "properties" : "BSP nodes/leaves";
   const std::string detail = valid ?
-      "host file decoder validated " + std::to_string(decoded) +
-          (entry.extension == ".cpt" ? " strip vertices; live draw=static-recomp/GX" :
-                                      " collision triangles; collision execution=static-recomp") :
-      "host CPT/CDB decoder rejected file layout; semantic handling=static-recomp";
+      "host file decoder validated " + std::to_string(decoded) + " " + units +
+          "; live execution=static-recomp/GX" :
+      "host world decoder rejected file layout; semantic handling=static-recomp";
   if (valid)
     NativePCStatus::Native(NativePCStatus::Domain::AssetCPU, entry.name, detail);
   else

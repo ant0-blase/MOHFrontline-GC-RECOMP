@@ -1,3 +1,4 @@
+#include "VideoCommon/MOHFrontline/Engine/Renderer/NativeDrawBatching.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/NativeHostRenderer.h"
 
 #include <algorithm>
@@ -368,7 +369,8 @@ Style GetStyle()
   static const Style cached = [] {
     const char* value = std::getenv("MOH_NATIVE_RENDER_STYLE");
     if (!value || !*value)
-      return Style::Wireframe;
+      return NativeRender::GetMode() == NativeRender::Mode::PreferNative ?
+          Style::Textured : Style::Wireframe;
 
     const std::string v = Lower(value);
     if (v == "solid" || v == "flat" || v == "fill")
@@ -701,7 +703,9 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
 {
   static const bool overlay = EnvSwitch("MOH_NATIVE_RENDER_OVERLAY", true);
   if (!overlay || packet.vertices.empty() ||
-      packet.indices.size() < 3 || packet.vertices.size() > 65535)
+      packet.indices.size() < 3 || packet.indices.size() % 3 != 0 ||
+      packet.vertices.size() > 65535 ||
+      packet.vertices.size() * sizeof(OverlayVertex) > VertexManagerBase::MAXVBUFFERSIZE)
   {
     return false;
   }
@@ -818,8 +822,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
 
   state.triangle_indices.clear();
   state.line_indices.clear();
-  const std::size_t triangle_count =
-      std::min(packet.indices.size() / 3u, MaxTrianglesPerDraw());
+  const std::size_t triangle_count = packet.indices.size() / 3u;
   if (WantsSolid(style))
     state.triangle_indices.reserve(triangle_count * 3u);
   if (WantsWire(style))
@@ -884,17 +887,32 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
     }
   }
 
+  // A replacement must cover the complete original batch. Never accept a
+  // partially valid packet and suppress the remaining GX triangles.
+  if (NativeRender::GetMode() == NativeRender::Mode::PreferNative &&
+      accepted_triangles != triangle_count)
+    return false;
+
   g_gfx->BeginUtilityDrawing();
+
+  const auto draw_indices = [&](const std::vector<u16>& indices, std::size_t per_triangle,
+                                const AbstractPipeline* pipeline) {
+    NativeRender::ForEachTriangleBatch(indices.size() / per_triangle, MaxTrianglesPerDraw(),
+        [&](std::size_t first_triangle, std::size_t triangles) {
+      const std::size_t first = first_triangle * per_triangle;
+      const u32 count = static_cast<u32>(triangles * per_triangle);
+      u32 base_vertex = 0;
+      u32 base_index = 0;
+      g_vertex_manager->UploadUtilityVertices(
+          state.vertices.data(), sizeof(OverlayVertex), static_cast<u32>(state.vertices.size()),
+          indices.data() + first, count, &base_vertex, &base_index);
+      g_gfx->SetPipeline(pipeline);
+      g_gfx->DrawIndexed(base_index, count, base_vertex);
+    });
+  };
 
   if (WantsSolid(style))
   {
-    u32 base_vertex = 0;
-    u32 base_index = 0;
-    g_vertex_manager->UploadUtilityVertices(
-        state.vertices.data(), sizeof(OverlayVertex), static_cast<u32>(state.vertices.size()),
-        state.triangle_indices.data(), static_cast<u32>(state.triangle_indices.size()), &base_vertex,
-        &base_index);
-
     if (use_texture)
     {
       // TextureCacheBase already bound the current GX stage-0 texture before
@@ -902,13 +920,9 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
       // stage, this samples the already-resolved PS3 texture without feeding a
       // PS3 binary texture through a GameCube decoder.
       g_gfx->SetSamplerState(0, RenderState::GetLinearSamplerState());
-      g_gfx->SetPipeline(state.textured_pipeline.get());
     }
-    else
-    {
-      g_gfx->SetPipeline(state.solid_pipeline.get());
-    }
-    g_gfx->DrawIndexed(base_index, static_cast<u32>(state.triangle_indices.size()), base_vertex);
+    draw_indices(state.triangle_indices, 3,
+                 use_texture ? state.textured_pipeline.get() : state.solid_pipeline.get());
   }
 
   if (WantsWire(style))
@@ -922,14 +936,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
         state.vertices[i].color = wire_color;
     }
 
-    u32 base_vertex = 0;
-    u32 base_index = 0;
-    g_vertex_manager->UploadUtilityVertices(
-        state.vertices.data(), sizeof(OverlayVertex), static_cast<u32>(state.vertices.size()),
-        state.line_indices.data(), static_cast<u32>(state.line_indices.size()), &base_vertex,
-        &base_index);
-    g_gfx->SetPipeline(state.line_pipeline.get());
-    g_gfx->DrawIndexed(base_index, static_cast<u32>(state.line_indices.size()), base_vertex);
+    draw_indices(state.line_indices, 6, state.line_pipeline.get());
   }
 
   g_gfx->EndUtilityDrawing();

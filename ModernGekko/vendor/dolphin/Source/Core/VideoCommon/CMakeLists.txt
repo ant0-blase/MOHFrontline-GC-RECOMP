@@ -139,6 +139,8 @@ add_library(videocommon
   MOHFrontline/Engine/Filesystem/NativeVFS.h
   MOHFrontline/Engine/Filesystem/NativeGCAssets.cpp
   MOHFrontline/Engine/Filesystem/NativeGCAssets.h
+  MOHFrontline/Assets/Formats/WorldFormats.h
+  MOHFrontline/Engine/World/WorldLevelRuntime.h
   MOHFrontline/Assets/GC/Formats/GCCompartment.h
   MOHFrontline/Assets/GC/Formats/GCViv.h
   MOHFrontline/Assets/GC/Formats/GCTexture.cpp
@@ -154,6 +156,8 @@ add_library(videocommon
   MOHFrontline/Engine/Renderer/NativeRenderBridge.h
   MOHFrontline/Engine/Renderer/NativeHostRenderer.cpp
   MOHFrontline/Engine/Renderer/NativeHostRenderer.h
+  MOHFrontline/Engine/Renderer/NativeDrawBatching.h
+  MOHFrontline/Engine/Renderer/Meshes/WorldMeshBatch.h
   PS3Compass.cpp
   PS3Compass.h
   PS3TextureDecoder.cpp
