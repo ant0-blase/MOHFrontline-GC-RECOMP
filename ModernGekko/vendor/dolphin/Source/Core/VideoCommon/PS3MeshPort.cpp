@@ -168,6 +168,20 @@ struct ActiveDisplayListContext
   explicit operator bool() const { return address != 0 && size > 52; }
 };
 thread_local ActiveDisplayListContext g_active_display_list;
+
+// PERF v21: FindDisplayList() and SetDisplayListContext() run back-to-back for
+// the same GX display list. Reuse the authoritative tail hash instead of
+// hashing commands[52..] twice on the Video thread.
+struct PendingDisplayListHash
+{
+  u32 address = 0;
+  u32 size = 0;
+  const u8* data = nullptr;
+  u64 hash = 0;
+  bool valid = false;
+};
+thread_local PendingDisplayListHash g_pending_display_list_hash;
+
 std::unordered_map<u64, StaticDrawMatch> g_world_direct_matches;
 std::unordered_set<u64> g_world_direct_rejected;
 // v9.7: claim authored CPT descriptor MEMBERS, not only an exact range name.
@@ -4605,8 +4619,12 @@ std::size_t CachedEMTCount()
 
 bool IsFullCPTLevelRenderEnabled()
 {
-  if (!PS3WorldGeometry::Enabled() ||
-      !EnvSwitchLocal("MOH_PS3_CPT_FULL_LEVEL", false))
+  // Launch-time diagnostic setting: this function is queried from the draw
+  // path, so never call getenv() for every primitive batch.
+  static const bool full_level_enabled =
+      EnvSwitchLocal("MOH_PS3_CPT_FULL_LEVEL", false);
+
+  if (!PS3WorldGeometry::Enabled() || !full_level_enabled)
   {
     return false;
   }
@@ -4619,7 +4637,7 @@ bool IsFullCPTLevelRenderEnabled()
   // batch therefore duplicates the GC world and makes props/sections appear to
   // float. Keep aggregate construction available for diagnostics, but require
   // an explicit second opt-in before it can ever replace a draw.
-  const bool unsafe_raw_overlay =
+  static const bool unsafe_raw_overlay =
       EnvSwitchLocal("MOH_PS3_CPT_FULL_LEVEL_UNSAFE", false);
   if (!unsafe_raw_overlay)
   {
@@ -4734,6 +4752,11 @@ void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const
 
 StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands)
 {
+  // A pending hash belongs only to this FindDisplayList -> SetDisplayListContext
+  // sequence. The intermediate SetDisplayListContext(0,{}) intentionally does
+  // not consume it.
+  g_pending_display_list_hash.valid = false;
+
   ResolveDMFDisplayList(address, commands);
   if (!IsStaticDrawReplacementEnabled() || commands.size() <= 52)
     return {};
@@ -4742,6 +4765,9 @@ StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands)
   const u32 size = static_cast<u32>(commands.size());
   const u64 command_hash =
       Common::GetHash64(commands.data() + 52, commands.size() - 52, 0);
+
+  g_pending_display_list_hash =
+      {runtime_address, size, commands.data(), command_hash, true};
 
   {
     std::scoped_lock lock(g_msh_cache_mutex);
@@ -4832,10 +4858,27 @@ void SetDisplayListContext(u32 address, std::span<const u8> commands)
   // Always remember that we are inside GXCallDisplayList, even when geometry
   // bootstrap is disabled. Direct CPT world matching must run only for
   // primitive batches that are NOT part of a display list.
-  g_active_display_list.address = address & 0x1fffffff;
-  g_active_display_list.size = static_cast<u32>(commands.size());
-  g_active_display_list.command_hash =
-      Common::GetHash64(commands.data() + 52, commands.size() - 52, 0);
+  const u32 runtime_address = address & 0x1fffffff;
+  const u32 command_size = static_cast<u32>(commands.size());
+
+  u64 command_hash = 0;
+  if (g_pending_display_list_hash.valid &&
+      g_pending_display_list_hash.address == runtime_address &&
+      g_pending_display_list_hash.size == command_size &&
+      g_pending_display_list_hash.data == commands.data())
+  {
+    command_hash = g_pending_display_list_hash.hash;
+  }
+  else
+  {
+    command_hash =
+        Common::GetHash64(commands.data() + 52, commands.size() - 52, 0);
+  }
+
+  g_pending_display_list_hash.valid = false;
+  g_active_display_list.address = runtime_address;
+  g_active_display_list.size = command_size;
+  g_active_display_list.command_hash = command_hash;
 }
 
 void SetDisplayListMatch(StaticDrawMatch match)
@@ -6349,7 +6392,7 @@ StaticDrawMatch AcquireFullCPTLevelDraw(u32 gc_triangle_count)
   if (!IsFullCPTLevelRenderEnabled() || g_current_dmf_draw || g_active_display_list)
     return {};
 
-  const u32 minimum_triangles = static_cast<u32>(
+  static const u32 minimum_triangles = static_cast<u32>(
       EnvFloatLocal("MOH_PS3_CPT_FULL_LEVEL_TRIGGER_TRIS", 96.0f, 1.0f, 100000.0f));
   if (gc_triangle_count < minimum_triangles)
     return {};

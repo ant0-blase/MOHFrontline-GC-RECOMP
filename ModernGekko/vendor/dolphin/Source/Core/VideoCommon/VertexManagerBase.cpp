@@ -1404,6 +1404,11 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
                                              const AbstractPipeline* current_pipeline,
                                              bool ps3_static_replacement)
 {
+  // Host CSM is deliberately disabled for MOH. Bail out before reading any
+  // of the old diagnostic environment switches on every draw.
+  if (!MohCSMEnabled())
+    return;
+
   const bool camera_projection_test = MohEnvSwitch("MOH_PS3_CSM_CAMERA_TEST", false);
   // v2.7: WORLD_PROBE is intentionally independent from CAMERA_TEST.
   // This lets us replay the exact same world-only draw set through either:
@@ -1428,7 +1433,7 @@ void VertexManagerBase::RenderMOHCSMCasters(VertexShaderManager& vertex_shader_m
   // that MOH's world batches are not passing that tag even though they are real
   // 3D scene geometry.  In CAMERA_TEST we deliberately replay every triangle
   // batch with its exact guest projection so we can prove/disprove that filter.
-  if (!MohCSMEnabled() || !current_pipeline || !triangle_primitive || num_indices == 0 ||
+  if (!current_pipeline || !triangle_primitive || num_indices == 0 ||
       (!camera_projection_test && xfmem.projection.type != ProjectionType::Perspective) ||
       (world_probe && (xfmem.projection.type != ProjectionType::Perspective ||
                        num_indices < world_probe_min_indices || !world_signature)))

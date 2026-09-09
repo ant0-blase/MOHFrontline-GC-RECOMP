@@ -174,10 +174,29 @@ MaterialProfile GetMaterialProfile(const NativeRender::DrawPacket& packet)
     profile.shininess = 10.0f;
   }
 
-  profile.ambient = EnvFloat("MOH_NATIVE_RENDER_AMBIENT", profile.ambient, 0.0f, 2.0f);
-  profile.diffuse = EnvFloat("MOH_NATIVE_RENDER_DIFFUSE", profile.diffuse, 0.0f, 2.0f);
-  profile.specular = EnvFloat("MOH_NATIVE_RENDER_SPECULAR", profile.specular, 0.0f, 2.0f);
-  profile.shininess = EnvFloat("MOH_NATIVE_RENDER_SHININESS", profile.shininess, 1.0f, 256.0f);
+  // PERF v21: these overrides are process-launch settings. Previously this
+  // called getenv()/strtof four times for every native draw.
+  static const float ambient_override =
+      EnvFloat("MOH_NATIVE_RENDER_AMBIENT",
+               std::numeric_limits<float>::quiet_NaN(), 0.0f, 2.0f);
+  static const float diffuse_override =
+      EnvFloat("MOH_NATIVE_RENDER_DIFFUSE",
+               std::numeric_limits<float>::quiet_NaN(), 0.0f, 2.0f);
+  static const float specular_override =
+      EnvFloat("MOH_NATIVE_RENDER_SPECULAR",
+               std::numeric_limits<float>::quiet_NaN(), 0.0f, 2.0f);
+  static const float shininess_override =
+      EnvFloat("MOH_NATIVE_RENDER_SHININESS",
+               std::numeric_limits<float>::quiet_NaN(), 1.0f, 256.0f);
+
+  if (std::isfinite(ambient_override))
+    profile.ambient = ambient_override;
+  if (std::isfinite(diffuse_override))
+    profile.diffuse = diffuse_override;
+  if (std::isfinite(specular_override))
+    profile.specular = specular_override;
+  if (std::isfinite(shininess_override))
+    profile.shininess = shininess_override;
   return profile;
 }
 

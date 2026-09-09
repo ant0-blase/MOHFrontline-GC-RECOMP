@@ -12,6 +12,9 @@ struct PresentFrame
   const AbstractTexture* texture = nullptr;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  // Display aspect ratio (DAR), after codec/container sample-aspect correction.
+  // 0 means "stretch to the current target rectangle".
+  float display_aspect = 0.0f;
 
   explicit operator bool() const { return texture != nullptr && width != 0 && height != 0; }
 };

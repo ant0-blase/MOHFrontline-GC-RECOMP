@@ -93,27 +93,51 @@ bool LooksLikeMovie(std::string_view guest_name)
   return file.starts_with("brief") && file.ends_with(".asf");
 }
 
+// Do not infer PS3 names from the GameCube filename. Frontline's remaster renamed
+// several media files. Unknown movies deliberately stay on the original GC path.
 std::vector<std::string> PS3MovieNames(std::string_view guest_name)
 {
   const std::string file = Filename(guest_name);
-  const std::string stem = Stem(file);
-  std::vector<std::string> names;
 
   if (file == "ealogo.mpc" || file == "ea_logo.mpc")
-  {
-    names.emplace_back("moh_ea_logo.bik");
-    names.emplace_back("ealogo.mpcx");
-    names.emplace_back("ealogo.bik");
-  }
-  else
-  {
-    if (file.ends_with(".mpc") || file.ends_with(".asf"))
-      names.emplace_back(stem + ".mpcx");
-    names.emplace_back(stem + ".bik");
-    names.emplace_back(file);
-  }
+    return {"moh_ea_logo.bik"};
+  if (file == "intro.mpc")
+    return {"intro.mpcx"};
+  if (file == "brief11.asf")
+    return {"brief11.mpcx"};
+  if (file == "brief21.asf")
+    return {"brief21.mpcx"};
+  if (file == "brief31.asf")
+    return {"brief31.mpcx"};
+  if (file == "brief41.asf")
+    return {"brief41.mpcx"};
+  if (file == "brief51.asf")
+    return {"brief51.mpcx"};
 
-  return names;
+  if (file.ends_with(".mpcx") || file.ends_with(".bik"))
+    return {file};
+
+  return {};
+}
+
+std::string PreferredPS3MovieLocale()
+{
+  if (const char* value = std::getenv("MOH_NATIVE_VIDEO_LOCALE"); value && *value)
+    return Lower(value);
+
+  if (const char* lang = std::getenv("LANG"); lang && *lang)
+  {
+    const std::string v = Lower(lang);
+    if (v.starts_with("fr"))
+      return "french";
+    if (v.starts_with("de"))
+      return "german";
+    if (v.starts_with("it"))
+      return "italian";
+    if (v.starts_with("es"))
+      return "spanish";
+  }
+  return "usa";
 }
 
 const PS3RemasterAssets::AssetInfo* FindPS3Movie(std::string_view guest_name)
@@ -122,7 +146,10 @@ const PS3RemasterAssets::AssetInfo* FindPS3Movie(std::string_view guest_name)
     return nullptr;
 
   const std::vector<std::string> names = PS3MovieNames(guest_name);
-  const std::string level = Lower(PS3AssetPort::GetCurrentLevel());
+  if (names.empty())
+    return nullptr;
+
+  const std::string locale = PreferredPS3MovieLocale();
   const PS3RemasterAssets::AssetInfo* best = nullptr;
   int best_score = -1;
 
@@ -136,10 +163,12 @@ const PS3RemasterAssets::AssetInfo* FindPS3Movie(std::string_view guest_name)
 
       const std::string path = Lower(asset.relative_path);
       int score = 1000 - static_cast<int>(rank) * 100;
-      if (!level.empty() && path.find("/" + level + "/") != std::string::npos)
-        score += 300;
+      if (!locale.empty() && path.find("/_" + locale + "/") != std::string::npos)
+        score += 500;
       if (path.find("movie") != std::string::npos)
         score += 100;
+      if (path.find("/_usa/") != std::string::npos && locale != "usa")
+        score += 10;
       if (!asset.embedded)
         score += 1;
 
@@ -149,6 +178,14 @@ const PS3RemasterAssets::AssetInfo* FindPS3Movie(std::string_view guest_name)
         best = &asset;
       }
     }
+  }
+
+  static unsigned mappings_logged = 0;
+  if (best && mappings_logged++ < 16)
+  {
+    std::fprintf(stderr, "[moh-native-video] semantic map guest=%.*s -> PS3=%s locale=%s\n",
+                 static_cast<int>(guest_name.size()), guest_name.data(),
+                 best->relative_path.c_str(), locale.c_str());
   }
   return best;
 }
@@ -218,6 +255,46 @@ std::optional<EncodedMovie> ReadPS3(std::string_view guest_name)
 std::mutex s_request_mutex;
 std::string s_pending_guest;
 
+std::optional<double> RequestedDisplayAspect()
+{
+  const char* value = std::getenv("MOH_NATIVE_VIDEO_ASPECT");
+  if (!value || !*value)
+    return std::nullopt;
+
+  const std::string v = Lower(value);
+  if (v == "auto" || v == "source")
+    return std::nullopt;
+  if (v == "stretch" || v == "fill" || v == "window")
+    return 0.0;
+  if (v == "4:3" || v == "4/3")
+    return 4.0 / 3.0;
+  if (v == "16:9" || v == "16/9")
+    return 16.0 / 9.0;
+
+  if (const std::size_t colon = v.find(':'); colon != std::string::npos)
+  {
+    const std::string lhs = v.substr(0, colon);
+    const std::string rhs = v.substr(colon + 1);
+    char* end_num = nullptr;
+    char* end_den = nullptr;
+    const double num = std::strtod(lhs.c_str(), &end_num);
+    const double den = std::strtod(rhs.c_str(), &end_den);
+    if (end_num != lhs.c_str() && end_den != rhs.c_str() && end_num && end_den &&
+        *end_num == '\0' && *end_den == '\0' && std::isfinite(num) &&
+        std::isfinite(den) && num > 0.0 && den > 0.0)
+    {
+      return std::clamp(num / den, 0.5, 3.0);
+    }
+  }
+
+  char* end = nullptr;
+  const double parsed = std::strtod(value, &end);
+  if (end != value && end && *end == '\0' && std::isfinite(parsed) && parsed > 0.0)
+    return std::clamp(parsed, 0.5, 3.0);
+
+  return std::nullopt;
+}
+
 #if defined(MOH_NATIVE_VIDEO_FFMPEG)
 struct MemoryReader
 {
@@ -241,6 +318,7 @@ struct Decoder
   int video_stream = -1;
   AVRational time_base{1, 1};
   double fps = 30.0;
+  double display_aspect = 4.0 / 3.0;
   double first_pts = 0.0;
   bool have_first_pts = false;
   double current_pts = 0.0;
@@ -314,6 +392,56 @@ void CloseDecoder()
   s_decoder.reset();
 }
 
+double ResolveDisplayAspect(Decoder& decoder)
+{
+  if (const auto requested = RequestedDisplayAspect())
+    return *requested;
+
+  if (!decoder.frame || decoder.frame->width <= 0 || decoder.frame->height <= 0)
+    return 4.0 / 3.0;
+
+  AVStream* stream = nullptr;
+  if (decoder.format && decoder.video_stream >= 0 &&
+      decoder.video_stream < static_cast<int>(decoder.format->nb_streams))
+  {
+    stream = decoder.format->streams[decoder.video_stream];
+  }
+
+  AVRational sar{0, 1};
+  if (stream)
+    sar = av_guess_sample_aspect_ratio(decoder.format, stream, decoder.frame);
+  if (sar.num <= 0 || sar.den <= 0)
+    sar = decoder.frame->sample_aspect_ratio;
+  if ((sar.num <= 0 || sar.den <= 0) && decoder.codec)
+    sar = decoder.codec->sample_aspect_ratio;
+  if (sar.num <= 0 || sar.den <= 0)
+    sar = AVRational{1, 1};
+
+  const double coded_aspect =
+      static_cast<double>(decoder.frame->width) / static_cast<double>(decoder.frame->height);
+  const double pixel_aspect = av_q2d(sar);
+  double display_aspect = coded_aspect * pixel_aspect;
+
+  // Frontline stores movie surfaces in console-oriented sizes.  In particular
+  // the PS3 remaster can expose a 512x512 MPEG2 surface even though the movie
+  // is authored for a 4:3 display.  The GC 640x448 surface is likewise not
+  // intended to be shown with square pixels.
+  const std::string file = Filename(decoder.guest_name);
+  const bool frontline_movie =
+      file.ends_with(".mpc") || file.ends_with(".mpcx") || file.ends_with(".asf");
+  const bool legacy_surface =
+      (decoder.frame->width == 640 && decoder.frame->height == 448) ||
+      (decoder.frame->width == 512 && decoder.frame->height == 512);
+  const bool square_sar = std::abs(pixel_aspect - 1.0) < 0.001;
+  if (frontline_movie && legacy_surface && square_sar &&
+      !EnvSwitch("MOH_NATIVE_VIDEO_SQUARE_PIXELS", false))
+    display_aspect = 4.0 / 3.0;
+
+  if (!std::isfinite(display_aspect) || display_aspect < 0.5 || display_aspect > 3.0)
+    display_aspect = 4.0 / 3.0;
+  return display_aspect;
+}
+
 bool ConvertFrame(Decoder& decoder)
 {
   if (!decoder.frame || decoder.frame->width <= 0 || decoder.frame->height <= 0)
@@ -330,21 +458,18 @@ bool ConvertFrame(Decoder& decoder)
 
   decoder.width = width;
   decoder.height = height;
+  decoder.display_aspect = ResolveDisplayAspect(decoder);
   decoder.rgba.resize(static_cast<std::size_t>(width) * height * 4u);
   u8* dst[4] = {decoder.rgba.data(), nullptr, nullptr, nullptr};
   int dst_stride[4] = {static_cast<int>(width * 4u), 0, 0, 0};
   sws_scale(decoder.sws, decoder.frame->data, decoder.frame->linesize, 0,
             decoder.frame->height, dst, dst_stride);
 
-  double raw_pts = static_cast<double>(decoder.decoded_frames) / decoder.fps;
-  if (decoder.frame->best_effort_timestamp != AV_NOPTS_VALUE)
-    raw_pts = decoder.frame->best_effort_timestamp * av_q2d(decoder.time_base);
-  if (!decoder.have_first_pts)
-  {
-    decoder.first_pts = raw_pts;
-    decoder.have_first_pts = true;
-  }
-  decoder.current_pts = std::max(0.0, raw_pts - decoder.first_pts);
+  // The GC MPC and PS3 MPCX streams can expose discontinuous MPEG timestamps.
+  // Frontline's movies are constant-rate, so use decoded-frame cadence as the
+  // playback clock. Otherwise the first frame can remain on screen indefinitely.
+  decoder.current_pts =
+      static_cast<double>(decoder.decoded_frames) / std::max(decoder.fps, 1.0);
   ++decoder.decoded_frames;
   decoder.rgba_dirty = true;
   return true;
@@ -455,7 +580,6 @@ bool OpenEncoded(std::string_view guest_name, EncodedMovie movie)
   const AVRational guessed = av_guess_frame_rate(decoder->format, stream, nullptr);
   if (guessed.num > 0 && guessed.den > 0)
     decoder->fps = std::clamp(av_q2d(guessed), 1.0, 240.0);
-  decoder->started = Clock::now();
 
   s_decoder = std::move(decoder);
   if (!DecodeNextFrame(*s_decoder))
@@ -463,11 +587,15 @@ bool OpenEncoded(std::string_view guest_name, EncodedMovie movie)
     CloseDecoder();
     return false;
   }
+  // Probing/codec startup can be noticeable for large MPCX/Bink files.  Do not
+  // count that time as playback time or the first Present will skip frames.
+  s_decoder->started = Clock::now();
 
   std::fprintf(stderr,
-               "[moh-native-video] START guest=%s source=%s codec=%s %ux%u fps=%.3f bytes=%zu\n",
+               "[moh-native-video] START guest=%s source=%s codec=%s %ux%u fps=%.3f dar=%.4f bytes=%zu\n",
                s_decoder->guest_name.c_str(), s_decoder->source_description.c_str(), codec->name,
-               s_decoder->width, s_decoder->height, s_decoder->fps, s_decoder->encoded.size());
+               s_decoder->width, s_decoder->height, s_decoder->fps, s_decoder->display_aspect,
+               s_decoder->encoded.size());
   return true;
 }
 
@@ -570,12 +698,31 @@ void PrepareFrame()
     return;
 
   const double elapsed = std::chrono::duration<double>(Clock::now() - s_decoder->started).count();
-  const double frame_duration = 1.0 / std::max(s_decoder->fps, 1.0);
+  const double fps = std::max(s_decoder->fps, 1.0);
+  const std::uint64_t wanted_frame =
+      static_cast<std::uint64_t>(std::max(0.0, std::floor(elapsed * fps)));
   unsigned catches = 0;
-  while (s_decoder->current_pts + frame_duration < elapsed && catches++ < 8)
+  while (s_decoder->decoded_frames <= wanted_frame && catches++ < 12)
   {
     if (!DecodeNextFrame(*s_decoder))
       break;
+  }
+
+  static std::string progress_guest;
+  static std::uint64_t last_logged_frame = 0;
+  if (progress_guest != s_decoder->guest_name)
+  {
+    progress_guest = s_decoder->guest_name;
+    last_logged_frame = 0;
+  }
+  if (s_decoder->decoded_frames >= last_logged_frame + 120)
+  {
+    last_logged_frame = s_decoder->decoded_frames;
+    std::fprintf(stderr,
+                 "[moh-native-video] PLAY guest=%s frame=%llu t=%.2f source=%s\n",
+                 s_decoder->guest_name.c_str(),
+                 static_cast<unsigned long long>(s_decoder->decoded_frames), elapsed,
+                 s_decoder->source_ps3 ? "PS3" : "GC");
   }
 
   if (!s_decoder->rgba_dirty || !g_gfx || s_decoder->width == 0 || s_decoder->height == 0)
@@ -603,7 +750,8 @@ PresentFrame GetPresentFrame()
 {
 #if defined(MOH_NATIVE_VIDEO_FFMPEG)
   if (s_decoder && MohPcLayer::IsMovieActive() && s_decoder->texture)
-    return {s_decoder->texture.get(), s_decoder->width, s_decoder->height};
+    return {s_decoder->texture.get(), s_decoder->width, s_decoder->height,
+            static_cast<float>(s_decoder->display_aspect)};
 #endif
   return {};
 }

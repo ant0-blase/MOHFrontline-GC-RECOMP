@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/Present.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include "VideoCommon/PS3AssetPort.h"
@@ -958,9 +960,14 @@ void Presenter::Present(PresentInfo* present_info)
   g_gfx->BeginUtilityDrawing();
   const bool backbuffer_bound = g_gfx->BindBackbuffer({{0.0f, 0.0f, 0.0f, 1.0f}});
 
+  const auto native_movie =
+      backbuffer_bound ? MOHFrontline::NativeVideo::GetPresentFrame() :
+                         MOHFrontline::NativeVideo::PresentFrame{};
+
   // Render the guest XFB first. It remains the guaranteed fallback for any
-  // movie/container that the native host decoder cannot consume.
-  if (backbuffer_bound && m_xfb_entry)
+  // movie/container that the native host decoder cannot consume.  Once a host
+  // frame is ready, do not keep a separately-timed guest movie underneath it.
+  if (backbuffer_bound && m_xfb_entry && !native_movie)
   {
     // Adjust the source rectangle instead of using an oversized viewport to render the XFB.
     MathUtil::Rectangle<int> render_target_rc = GetTargetRectangle();
@@ -971,18 +978,44 @@ void Presenter::Present(PresentInfo* present_info)
   }
 
   // v9 native movie plane. Decode/upload is host-side and source-neutral:
-  // PS3 remaster media and original GameCube media are both candidates. The
-  // original guest VP6/XFB is left underneath as a safe fallback.
-  if (backbuffer_bound)
+  // PS3 remaster media and original GameCube media are both candidates.
+  if (backbuffer_bound && native_movie)
   {
-    const auto native_movie = MOHFrontline::NativeVideo::GetPresentFrame();
-    if (native_movie)
+    const MathUtil::Rectangle<int> movie_source_rc(
+        0, 0, static_cast<int>(native_movie.width), static_cast<int>(native_movie.height));
+    MathUtil::Rectangle<int> movie_target_rc = GetTargetRectangle();
+
+    // Fit the decoded image using its display aspect ratio instead of blindly
+    // stretching coded surfaces such as the PS3 512x512 MPCX to the window.
+    const int target_width = movie_target_rc.GetWidth();
+    const int target_height = movie_target_rc.GetHeight();
+    if (native_movie.display_aspect > 0.01f && target_width > 0 && target_height > 0)
     {
-      const MathUtil::Rectangle<int> movie_source_rc(
-          0, 0, static_cast<int>(native_movie.width), static_cast<int>(native_movie.height));
-      m_post_processor->BlitFromTexture(GetTargetRectangle(), movie_source_rc,
-                                        native_movie.texture);
+      const double target_aspect =
+          static_cast<double>(target_width) / static_cast<double>(target_height);
+      const double movie_aspect = static_cast<double>(native_movie.display_aspect);
+
+      if (target_aspect > movie_aspect)
+      {
+        const int fitted_width =
+            std::clamp(static_cast<int>(std::lround(target_height * movie_aspect)),
+                       1, target_width);
+        const int left = movie_target_rc.left + (target_width - fitted_width) / 2;
+        movie_target_rc.left = left;
+        movie_target_rc.right = left + fitted_width;
+      }
+      else if (target_aspect < movie_aspect)
+      {
+        const int fitted_height =
+            std::clamp(static_cast<int>(std::lround(target_width / movie_aspect)),
+                       1, target_height);
+        const int top = movie_target_rc.top + (target_height - fitted_height) / 2;
+        movie_target_rc.top = top;
+        movie_target_rc.bottom = top + fitted_height;
+      }
     }
+
+    m_post_processor->BlitFromTexture(movie_target_rc, movie_source_rc, native_movie.texture);
   }
 
   if (m_onscreen_ui)
