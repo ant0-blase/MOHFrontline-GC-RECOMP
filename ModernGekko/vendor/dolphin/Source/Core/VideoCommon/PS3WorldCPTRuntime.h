@@ -135,13 +135,16 @@ inline bool EnvEnabled(const char* name, bool fallback)
 
 inline bool Enabled()
 {
-  static const bool enabled = EnvEnabled("MOH_PS3_WORLD_CPT", true);
+  static const bool enabled =
+      EnvEnabled("MOH_PS3_WORLD_DEBUG", false) ||
+      EnvEnabled("MOH_PS3_WORLD_CPT", false);
   return enabled;
 }
 
 inline bool TraceEnabled()
 {
-  static const bool enabled = EnvEnabled("MOH_PS3_WORLD_CPT_TRACE", false) ||
+  static const bool enabled = EnvEnabled("MOH_PS3_WORLD_DEBUG", false) ||
+                              EnvEnabled("MOH_PS3_WORLD_CPT_TRACE", false) ||
                               EnvEnabled("MOH_PS3_RSX_TRACE", false);
   return enabled;
 }

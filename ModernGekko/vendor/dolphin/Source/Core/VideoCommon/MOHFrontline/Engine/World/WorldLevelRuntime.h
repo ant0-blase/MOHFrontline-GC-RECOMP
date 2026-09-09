@@ -87,6 +87,14 @@ inline bool EnvEnabled(const char* name, bool fallback)
   return fallback;
 }
 
+inline bool Enabled()
+{
+  static const bool enabled =
+      EnvEnabled("MOH_PS3_WORLD_DEBUG", false) ||
+      EnvEnabled("MOH_PS3_WORLD_FORMAT_TRACE", false);
+  return enabled;
+}
+
 inline std::string Lower(std::string value)
 {
   std::transform(value.begin(), value.end(), value.begin(),
@@ -157,6 +165,12 @@ inline float Diagonal(const Bounds3& bounds)
 
 inline void Rebuild(std::string_view level)
 {
+  if (!Enabled())
+  {
+    g_summary = {};
+    return;
+  }
+
   Summary next;
   next.generation = PS3RemasterAssets::GetIndexGeneration();
   next.level = Lower(std::string(level));

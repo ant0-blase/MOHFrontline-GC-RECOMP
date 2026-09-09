@@ -68,19 +68,23 @@ inline bool EnvSwitch(const char* name, bool fallback)
 
 inline bool Enabled()
 {
-  static const bool enabled = EnvSwitch("MOH_PS3_WORLD_GEOMETRY", true);
+  static const bool enabled =
+      EnvSwitch("MOH_PS3_WORLD_DEBUG", false) ||
+      EnvSwitch("MOH_PS3_WORLD_GEOMETRY", false);
   return enabled;
 }
 
 inline bool TraceEnabled()
 {
-  static const bool enabled = EnvSwitch("MOH_PS3_WORLD_GEOMETRY_TRACE", false);
+  static const bool enabled = EnvSwitch("MOH_PS3_WORLD_DEBUG", false) ||
+                              EnvSwitch("MOH_PS3_WORLD_GEOMETRY_TRACE", false);
   return enabled;
 }
 
 inline bool MaterialTraceEnabled()
 {
-  static const bool enabled = EnvSwitch("MOH_PS3_WORLD_MATERIAL_TRACE", false);
+  static const bool enabled = EnvSwitch("MOH_PS3_WORLD_DEBUG", false) ||
+                              EnvSwitch("MOH_PS3_WORLD_MATERIAL_TRACE", false);
   return enabled;
 }
 
