@@ -141,6 +141,8 @@ add_library(videocommon
   MOHFrontline/Engine/Audio/NativeAudio.h
   MOHFrontline/Engine/Renderer/NativeRenderBridge.cpp
   MOHFrontline/Engine/Renderer/NativeRenderBridge.h
+  MOHFrontline/Engine/Renderer/NativeHostRenderer.cpp
+  MOHFrontline/Engine/Renderer/NativeHostRenderer.h
   PS3Compass.cpp
   PS3Compass.h
   PS3TextureDecoder.cpp

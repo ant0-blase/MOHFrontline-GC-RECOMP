@@ -8,8 +8,11 @@
 #include <fstream>
 #include <mutex>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 
+#include "Core/HW/DVD/MOHNativeVFSBridge.h"
+#include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 
 namespace MOHFrontline::NativeVFS
@@ -20,6 +23,12 @@ std::mutex s_mutex;
 bool s_initialized = false;
 std::filesystem::path s_explicit_gc_root;
 std::vector<std::filesystem::path> s_gc_roots;
+struct GCCacheEntry
+{
+  std::filesystem::path path;
+  std::uint64_t size = 0;
+};
+std::unordered_map<std::string, GCCacheEntry> s_gc_path_cache;
 
 std::string Lower(std::string value)
 {
@@ -201,6 +210,19 @@ File ResolveGC(std::string_view guest_path, PS3AssetPort::Class wanted)
   std::vector<std::filesystem::path> roots;
   {
     std::scoped_lock lock(s_mutex);
+    if (const auto cached = s_gc_path_cache.find(normalized);
+        cached != s_gc_path_cache.end())
+    {
+      File out;
+      out.source = Source::GameCubeHost;
+      out.asset_class =
+          wanted == PS3AssetPort::Class::Unknown ? PS3AssetPort::Classify(guest_path) : wanted;
+      out.host_path = cached->second.path;
+      out.guest_path = std::string(guest_path);
+      out.resolved_path = cached->second.path.generic_string();
+      out.size = cached->second.size;
+      return out;
+    }
     roots = s_gc_roots;
   }
 
@@ -223,10 +245,49 @@ File ResolveGC(std::string_view guest_path, PS3AssetPort::Class wanted)
     out.guest_path = std::string(guest_path);
     out.resolved_path = path.generic_string();
     out.size = static_cast<std::uint64_t>(file_size);
+    {
+      std::scoped_lock lock(s_mutex);
+      s_gc_path_cache[normalized] = {path, out.size};
+    }
     return out;
   }
 
   return {};
+}
+
+bool DiscReadCallback(std::string_view guest_path, u64 file_offset, std::span<u8> destination)
+{
+  // The guest must keep receiving GameCube-compatible bytes. PS3 resources
+  // are consumed by semantic native loaders (textures/audio/meshes), never
+  // injected raw into the original GC loader.
+  NativeAudio::NotifyGuestRead(guest_path, file_offset);
+
+  if (const char* value = std::getenv("MOH_NATIVE_VFS_DISC"); value && *value)
+  {
+    const std::string enabled = Lower(value);
+    if (enabled == "0" || enabled == "false" || enabled == "off" || enabled == "no")
+      return false;
+  }
+
+  const File file = ResolveGC(guest_path, PS3AssetPort::Class::Unknown);
+  if (!file || !file.IsGC())
+    return false;
+
+  if (!ReadRange(file, file_offset, destination))
+    return false;
+
+  static std::uint64_t hits = 0;
+  const std::uint64_t hit = ++hits;
+  if (hit <= 256 || (hit % 1024) == 0)
+  {
+    std::fprintf(stderr,
+                 "[moh-native-vfs] DVD HOST hit=%llu guest=%.*s off=0x%llx bytes=%zu -> %s\n",
+                 static_cast<unsigned long long>(hit),
+                 static_cast<int>(guest_path.size()), guest_path.data(),
+                 static_cast<unsigned long long>(file_offset), destination.size(),
+                 file.resolved_path.c_str());
+  }
+  return true;
 }
 }  // namespace
 
@@ -237,9 +298,11 @@ void Initialize()
     return;
 
   s_gc_roots = BuildRoots();
+  s_gc_path_cache.clear();
   s_initialized = true;
+  DVD::SetMOHNativeVFSReadCallback(&DiscReadCallback);
 
-  std::fprintf(stderr, "[moh-native-vfs] policy=%s gc_roots=%zu ps3_ready=%d\n",
+  std::fprintf(stderr, "[moh-native-vfs] policy=%s gc_roots=%zu ps3_ready=%d disc_hook=ON\n",
                PolicyName(ParsePolicy()), s_gc_roots.size(),
                PS3RemasterAssets::IsReady() ? 1 : 0);
   for (const auto& root : s_gc_roots)
@@ -248,8 +311,12 @@ void Initialize()
 
 void Shutdown()
 {
+  DVD::SetMOHNativeVFSReadCallback(nullptr);
+  NativeAudio::Stop();
+
   std::scoped_lock lock(s_mutex);
   s_gc_roots.clear();
+  s_gc_path_cache.clear();
   s_initialized = false;
 }
 
@@ -282,16 +349,38 @@ const char* SourceName(Source source)
 
 void SetGameCubeRoot(std::filesystem::path root)
 {
-  std::scoped_lock lock(s_mutex);
-  s_explicit_gc_root = std::move(root);
-  s_gc_roots = BuildRoots();
-  s_initialized = true;
+  {
+    std::scoped_lock lock(s_mutex);
+    s_explicit_gc_root = std::move(root);
+    s_gc_roots = BuildRoots();
+    s_gc_path_cache.clear();
+    s_initialized = true;
+  }
+  DVD::SetMOHNativeVFSReadCallback(&DiscReadCallback);
 }
 
 std::filesystem::path GetGameCubeRoot()
 {
   std::scoped_lock lock(s_mutex);
   return s_gc_roots.empty() ? std::filesystem::path{} : s_gc_roots.front();
+}
+
+File ResolveGameCube(std::string_view guest_path, PS3AssetPort::Class wanted)
+{
+  {
+    std::scoped_lock lock(s_mutex);
+    if (!s_initialized)
+    {
+      s_gc_roots = BuildRoots();
+      s_initialized = true;
+    }
+  }
+  return ResolveGC(guest_path, wanted);
+}
+
+File ResolvePlayStation3(std::string_view guest_path, PS3AssetPort::Class wanted)
+{
+  return ResolvePS3(guest_path, wanted);
 }
 
 File Resolve(std::string_view guest_path, PS3AssetPort::Class wanted)

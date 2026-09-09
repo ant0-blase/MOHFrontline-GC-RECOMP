@@ -3,9 +3,12 @@
 
 #include "Core/HW/DVD/DVDThread.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,6 +23,7 @@
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/DVD/DVDInterface.h"
+#include "Core/HW/DVD/MOHNativeVFSBridge.h"
 #include "Core/HW/DVD/FileMonitor.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
@@ -27,10 +31,28 @@
 #include "Core/System.h"
 
 #include "DiscIO/Enums.h"
+#include "DiscIO/Filesystem.h"
 #include "DiscIO/Volume.h"
 
 namespace DVD
 {
+namespace
+{
+std::atomic<MOHNativeVFSReadCallback> s_moh_native_vfs_read_callback{nullptr};
+}
+
+void SetMOHNativeVFSReadCallback(MOHNativeVFSReadCallback callback)
+{
+  s_moh_native_vfs_read_callback.store(callback, std::memory_order_release);
+}
+
+bool TryMOHNativeVFSRead(std::string_view guest_path, u64 file_offset,
+                         std::span<u8> destination)
+{
+  const auto callback = s_moh_native_vfs_read_callback.load(std::memory_order_acquire);
+  return callback && callback(guest_path, file_offset, destination);
+}
+
 DVDThread::DVDThread(Core::System& system) : m_system(system)
 {
 }
@@ -298,8 +320,39 @@ void DVDThread::ProcessReadRequest(ReadRequest&& request)
   m_file_logger.Log(*m_disc, request.partition, request.dvd_offset);
 
   std::vector<u8> buffer(request.length);
-  if (!m_disc->Read(request.dvd_offset, request.length, buffer.data(), request.partition))
+  bool native_read = false;
+
+  // Resolve the physical DVD offset back to the FST path. If a host-side
+  // extracted GC file can provide this exact range, bypass the image read.
+  // PS3-format bytes are never copied into guest RAM here.
+  if (m_disc)
+  {
+    const DiscIO::FileSystem* filesystem = m_disc->GetFileSystem(request.partition);
+    if (filesystem)
+    {
+      std::unique_ptr<DiscIO::FileInfo> file = filesystem->FindFileInfo(request.dvd_offset);
+      if (file && !file->IsDirectory())
+      {
+        const u64 file_base = file->GetOffset();
+        const u64 file_size = file->GetSize();
+        if (request.dvd_offset >= file_base)
+        {
+          const u64 file_offset = request.dvd_offset - file_base;
+          if (file_offset <= file_size && request.length <= file_size - file_offset)
+          {
+            native_read = TryMOHNativeVFSRead(
+                file->GetPath(), file_offset, std::span<u8>{buffer.data(), buffer.size()});
+          }
+        }
+      }
+    }
+  }
+
+  if (!native_read &&
+      !m_disc->Read(request.dvd_offset, request.length, buffer.data(), request.partition))
+  {
     buffer.resize(0);
+  }
 
   request.realtime_done_us = Common::Timer::NowUs();
 

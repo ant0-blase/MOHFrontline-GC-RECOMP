@@ -1,12 +1,14 @@
 #include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string>
 
@@ -19,7 +21,9 @@
 extern "C"
 {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/error.h>
+#include <libavutil/mem.h>
 #include <libavutil/samplefmt.h>
 }
 #endif
@@ -28,6 +32,32 @@ namespace MOHFrontline::NativeAudio
 {
 namespace
 {
+std::mutex s_stream_mutex;
+std::string s_pending_guest;
+std::string s_current_guest;
+PCMBuffer s_stream_pcm;
+std::size_t s_stream_frame = 0;
+
+std::string NormalizeAudioName(std::string_view input)
+{
+  std::string value(input);
+  std::replace(value.begin(), value.end(), '\\', '/');
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+bool IsStreamCandidate(std::string_view guest_name)
+{
+  const std::string name = NormalizeAudioName(guest_name);
+  const auto dot = name.find_last_of('.');
+  if (dot == std::string::npos)
+    return false;
+  const std::string_view ext(name.data() + dot, name.size() - dot);
+  return ext == ".asf" || ext == ".asfx" || ext == ".mus" || ext == ".musx" ||
+         ext == ".ast" || ext == ".astx" || ext == ".wav";
+}
+
 u16 LE16(const u8* p)
 {
   return u16(p[0]) | (u16(p[1]) << 8);
@@ -225,7 +255,257 @@ bool AppendFFmpegFrame(const AVFrame& frame, PCMBuffer* pcm)
   return false;
 }
 
-bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
+std::string FFmpegErrorText(int error)
+{
+  char text[AV_ERROR_MAX_STRING_SIZE]{};
+  if (av_strerror(error, text, sizeof(text)) < 0)
+    return "unknown FFmpeg error";
+  return text;
+}
+
+struct EAMemoryReader
+{
+  std::span<const u8> bytes;
+  std::size_t position = 0;
+};
+
+int ReadEAMemory(void* opaque, u8* buffer, int buffer_size)
+{
+  auto* reader = static_cast<EAMemoryReader*>(opaque);
+  if (!reader || !buffer || buffer_size <= 0)
+    return AVERROR(EINVAL);
+  if (reader->position >= reader->bytes.size())
+    return AVERROR_EOF;
+
+  const std::size_t available = reader->bytes.size() - reader->position;
+  const std::size_t amount =
+      std::min<std::size_t>(available, static_cast<std::size_t>(buffer_size));
+  std::memcpy(buffer, reader->bytes.data() + reader->position, amount);
+  reader->position += amount;
+  return static_cast<int>(amount);
+}
+
+std::int64_t SeekEAMemory(void* opaque, std::int64_t offset, int whence)
+{
+  auto* reader = static_cast<EAMemoryReader*>(opaque);
+  if (!reader)
+    return AVERROR(EINVAL);
+  if (whence == AVSEEK_SIZE)
+    return static_cast<std::int64_t>(reader->bytes.size());
+
+  const int origin = whence & ~AVSEEK_FORCE;
+  std::int64_t base = 0;
+  if (origin == SEEK_SET)
+    base = 0;
+  else if (origin == SEEK_CUR)
+    base = static_cast<std::int64_t>(reader->position);
+  else if (origin == SEEK_END)
+    base = static_cast<std::int64_t>(reader->bytes.size());
+  else
+    return AVERROR(EINVAL);
+
+  if ((offset < 0 && base < -offset) ||
+      (offset > 0 && base > std::numeric_limits<std::int64_t>::max() - offset))
+    return AVERROR(EINVAL);
+
+  const std::int64_t target = base + offset;
+  if (target < 0 || static_cast<std::uint64_t>(target) > reader->bytes.size())
+    return AVERROR(EINVAL);
+
+  reader->position = static_cast<std::size_t>(target);
+  return target;
+}
+
+bool DecodeEAStreamDemuxFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
+{
+  if (!out || bytes.size() < 8)
+    return false;
+
+  EAMemoryReader reader{bytes, 0};
+  constexpr int kIOBufferSize = 64 * 1024;
+  u8* io_buffer = static_cast<u8*>(av_malloc(kIOBufferSize));
+  if (!io_buffer)
+    return false;
+
+  AVIOContext* io =
+      avio_alloc_context(io_buffer, kIOBufferSize, 0, &reader, &ReadEAMemory, nullptr,
+                         &SeekEAMemory);
+  if (!io)
+  {
+    av_free(io_buffer);
+    return false;
+  }
+
+  AVFormatContext* format = avformat_alloc_context();
+  if (!format)
+  {
+    avio_context_free(&io);
+    return false;
+  }
+
+  format->pb = io;
+  format->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+  int result = avformat_open_input(&format, nullptr, nullptr, nullptr);
+  if (result < 0)
+  {
+    static unsigned logs = 0;
+    if (logs++ < 8)
+      std::fprintf(stderr, "[moh-native-audio] EA demux probe failed: %s (%d)\n",
+                   FFmpegErrorText(result).c_str(), result);
+    avformat_free_context(format);
+    avio_context_free(&io);
+    return false;
+  }
+
+  result = avformat_find_stream_info(format, nullptr);
+  if (result < 0)
+  {
+    static unsigned logs = 0;
+    if (logs++ < 8)
+      std::fprintf(stderr, "[moh-native-audio] EA stream-info failed: %s (%d)\n",
+                   FFmpegErrorText(result).c_str(), result);
+    avformat_close_input(&format);
+    avio_context_free(&io);
+    return false;
+  }
+
+  const int stream_index = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+  if (stream_index < 0)
+  {
+    static unsigned logs = 0;
+    if (logs++ < 8)
+      std::fprintf(stderr, "[moh-native-audio] EA demux found no audio stream\n");
+    avformat_close_input(&format);
+    avio_context_free(&io);
+    return false;
+  }
+
+  AVStream* stream = format->streams[stream_index];
+  if (!stream || !stream->codecpar)
+  {
+    avformat_close_input(&format);
+    avio_context_free(&io);
+    return false;
+  }
+
+  const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
+  if (!codec)
+  {
+    static unsigned logs = 0;
+    if (logs++ < 8)
+      std::fprintf(stderr, "[moh-native-audio] no decoder for EA codec id=%d\n",
+                   stream->codecpar->codec_id);
+    avformat_close_input(&format);
+    avio_context_free(&io);
+    return false;
+  }
+
+  AVCodecContext* context = avcodec_alloc_context3(codec);
+  AVPacket* packet = av_packet_alloc();
+  AVFrame* frame = av_frame_alloc();
+  if (!context || !packet || !frame)
+  {
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&context);
+    avformat_close_input(&format);
+    avio_context_free(&io);
+    return false;
+  }
+
+  result = avcodec_parameters_to_context(context, stream->codecpar);
+  if (result >= 0 && context->sample_rate <= 0)
+    context->sample_rate = 48000;
+  if (result >= 0 && context->ch_layout.nb_channels <= 0)
+    av_channel_layout_default(&context->ch_layout, 2);
+  if (result >= 0)
+    result = avcodec_open2(context, codec, nullptr);
+
+  PCMBuffer pcm;
+  pcm.sample_rate = context->sample_rate > 0 ? static_cast<u32>(context->sample_rate) : 48000u;
+  pcm.channels = 2;
+  std::size_t audio_packets = 0;
+
+  auto receive_frames = [&]() -> bool
+  {
+    while (true)
+    {
+      const int receive = avcodec_receive_frame(context, frame);
+      if (receive == AVERROR(EAGAIN) || receive == AVERROR_EOF)
+        return true;
+      if (receive < 0)
+        return false;
+      const bool ok = AppendFFmpegFrame(*frame, &pcm);
+      av_frame_unref(frame);
+      if (!ok)
+        return false;
+    }
+  };
+
+  if (result >= 0)
+  {
+    while ((result = av_read_frame(format, packet)) >= 0)
+    {
+      if (packet->stream_index == stream_index && packet->size > 0)
+      {
+        int send = avcodec_send_packet(context, packet);
+        if (send == AVERROR(EAGAIN))
+        {
+          if (!receive_frames())
+          {
+            av_packet_unref(packet);
+            result = AVERROR_INVALIDDATA;
+            break;
+          }
+          send = avcodec_send_packet(context, packet);
+        }
+        if (send < 0 || !receive_frames())
+        {
+          av_packet_unref(packet);
+          result = send < 0 ? send : AVERROR_INVALIDDATA;
+          break;
+        }
+        ++audio_packets;
+      }
+      av_packet_unref(packet);
+    }
+
+    if (result == AVERROR_EOF || result >= 0)
+    {
+      (void)avcodec_send_packet(context, nullptr);
+      (void)receive_frames();
+    }
+  }
+
+  const AVCodecID codec_id = context->codec_id;
+  const int codec_rate = context->sample_rate;
+  const int codec_channels = context->ch_layout.nb_channels;
+
+  av_frame_free(&frame);
+  av_packet_free(&packet);
+  avcodec_free_context(&context);
+  avformat_close_input(&format);
+  avio_context_free(&io);
+
+  if (pcm.interleaved_stereo.empty() || audio_packets == 0)
+    return false;
+
+  static unsigned logs = 0;
+  if (logs++ < 16)
+  {
+    std::fprintf(stderr,
+                 "[moh-native-audio] EA DEMUX OK: codec=%d packets=%zu frames=%zu rate=%u "
+                 "src_rate=%d src_channels=%d\n",
+                 static_cast<int>(codec_id), audio_packets, pcm.Frames(), pcm.sample_rate,
+                 codec_rate, codec_channels);
+  }
+
+  *out = std::move(pcm);
+  return true;
+}
+
+bool DecodeEAStreamPacketsFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
 {
   if (!out || bytes.size() < 8)
     return false;
@@ -248,8 +528,13 @@ bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
   context->sample_rate = 48000;
   av_channel_layout_default(&context->ch_layout, 2);
 
-  if (avcodec_open2(context, codec, nullptr) < 0)
+  int open_result = avcodec_open2(context, codec, nullptr);
+  if (open_result < 0)
   {
+    static unsigned logs = 0;
+    if (logs++ < 8)
+      std::fprintf(stderr, "[moh-native-audio] ADPCM_EA_R1 open failed: %s (%d)\n",
+                   FFmpegErrorText(open_result).c_str(), open_result);
     av_frame_free(&frame);
     av_packet_free(&packet);
     avcodec_free_context(&context);
@@ -273,7 +558,13 @@ bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
       if (result == AVERROR(EAGAIN) || result == AVERROR_EOF)
         return true;
       if (result < 0)
+      {
+        static unsigned logs = 0;
+        if (logs++ < 8)
+          std::fprintf(stderr, "[moh-native-audio] ADPCM_EA_R1 receive failed: %s (%d)\n",
+                       FFmpegErrorText(result).c_str(), result);
         return false;
+      }
 
       const bool ok = AppendFFmpegFrame(*frame, &pcm);
       av_frame_unref(frame);
@@ -283,6 +574,7 @@ bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
   };
 
   bool decoded_packet = false;
+  std::size_t packet_count = 0;
   std::size_t offset = 0;
   while (offset + 8 <= bytes.size())
   {
@@ -290,7 +582,18 @@ bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
     const u32 block_size = LE32(bytes.data() + offset + 4);
     if (block_size < 8 || block_size > 0x40000u ||
         block_size > bytes.size() - offset)
+    {
+      static unsigned logs = 0;
+      if (logs++ < 8)
+      {
+        std::fprintf(stderr,
+                     "[moh-native-audio] SCx bad block at 0x%zx tag=%c%c%c%c size=0x%x "
+                     "remaining=0x%zx\n",
+                     offset, bytes[offset + 0], bytes[offset + 1], bytes[offset + 2],
+                     bytes[offset + 3], block_size, bytes.size() - offset);
+      }
       break;
+    }
 
     if (tag == kTagScdl)
     {
@@ -302,22 +605,32 @@ bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
           break;
 
         std::memcpy(packet->data, bytes.data() + offset + 8, payload_size);
-
-        int result = avcodec_send_packet(context, packet);
-        if (result == AVERROR(EAGAIN))
+        int send = avcodec_send_packet(context, packet);
+        if (send == AVERROR(EAGAIN))
         {
           if (!receive_frames())
           {
             av_packet_unref(packet);
             break;
           }
-          result = avcodec_send_packet(context, packet);
+          send = avcodec_send_packet(context, packet);
         }
         av_packet_unref(packet);
 
-        if (result < 0 || !receive_frames())
+        if (send < 0)
+        {
+          static unsigned logs = 0;
+          if (logs++ < 8)
+            std::fprintf(stderr,
+                         "[moh-native-audio] SCDl packet decode failed: %s (%d) "
+                         "payload=0x%zx offset=0x%zx\n",
+                         FFmpegErrorText(send).c_str(), send, payload_size, offset);
+          break;
+        }
+        if (!receive_frames())
           break;
         decoded_packet = true;
+        ++packet_count;
       }
     }
     else if (tag == kTagScel)
@@ -326,7 +639,11 @@ bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
     }
     else if (tag != kTagSchl && tag != kTagSccl)
     {
-      // This decoder is intentionally only for the verified EA SCx container.
+      static unsigned logs = 0;
+      if (logs++ < 8)
+        std::fprintf(stderr, "[moh-native-audio] SCx unknown tag at 0x%zx: %c%c%c%c\n",
+                     offset, bytes[offset + 0], bytes[offset + 1], bytes[offset + 2],
+                     bytes[offset + 3]);
       break;
     }
 
@@ -346,11 +663,396 @@ bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
   if (!decoded_packet || pcm.interleaved_stereo.empty())
     return false;
 
+  static unsigned logs = 0;
+  if (logs++ < 16)
+  {
+    std::fprintf(stderr,
+                 "[moh-native-audio] EA PACKET WALK OK: packets=%zu frames=%zu rate=%u\n",
+                 packet_count, pcm.Frames(), pcm.sample_rate);
+  }
+
   *out = std::move(pcm);
   return true;
 }
+
+bool DecodeEAStreamFFmpeg(std::span<const u8> bytes, PCMBuffer* out)
+{
+  if (DecodeEAStreamDemuxFFmpeg(bytes, out))
+    return true;
+
+  static unsigned logs = 0;
+  if (logs++ < 16)
+    std::fprintf(stderr, "[moh-native-audio] EA demux fallback -> direct SCDl packet walk\n");
+
+  return DecodeEAStreamPacketsFFmpeg(bytes, out);
+}
+
 #endif
 
+// Dependency-free EA ADPCM R1 decoder.
+//
+// MOH's SCHl/SCCl/SCDl streams store one complete EA R1 packet in each SCDl
+// payload.  This mirrors the packet layout used by FFmpeg's ADPCM_EA_R1
+// decoder, but keeps the MOH native path available even when Dolphin was built
+// without FFmpeg/avformat.
+constexpr std::array<int, 20> kEAAdpcmCoefficients = {
+    0, 240, 460, 392,
+    0,   0, -208, -220,
+    0,   1,    3,    4,
+    7,   8,   10,   11,
+    0,  -1,   -3,   -4,
+};
+
+int SignExtendNibble(u8 nibble)
+{
+  const int value = nibble & 0x0f;
+  return (value & 8) ? value - 16 : value;
+}
+
+u16 EAR1BE16(const u8* p)
+{
+  return (u16(p[0]) << 8) | u16(p[1]);
+}
+
+u32 EAR1BE32(const u8* p)
+{
+  return (u32(p[0]) << 24) | (u32(p[1]) << 16) | (u32(p[2]) << 8) | u32(p[3]);
+}
+
+u32 ReadEAR1U32(const u8* p, bool big_endian)
+{
+  return big_endian ? EAR1BE32(p) : LE32(p);
+}
+
+s16 ReadEAR1S16(const u8* p, bool big_endian)
+{
+  return static_cast<s16>(big_endian ? EAR1BE16(p) : LE16(p));
+}
+
+s16 ClipS16(std::int64_t value)
+{
+  return static_cast<s16>(std::clamp<std::int64_t>(value, -32768, 32767));
+}
+
+bool DecodeEAR1PacketForChannels(std::span<const u8> packet, unsigned channels,
+                                 bool big_endian,
+                                 std::vector<std::vector<s16>>* decoded,
+                                 u32* coded_samples_out)
+{
+  if (!decoded || !coded_samples_out || channels == 0 || channels > 6)
+    return false;
+
+  const std::size_t table_bytes = (static_cast<std::size_t>(channels) + 1u) * 4u;
+  if (packet.size() < table_bytes)
+    return false;
+
+  u32 coded_samples = ReadEAR1U32(packet.data(), big_endian);
+  coded_samples -= coded_samples % 28u;
+  if (coded_samples == 0 || coded_samples > 48000u * 30u)
+    return false;
+
+  const std::size_t block_count = coded_samples / 28u;
+  if (block_count == 0 || block_count > (std::numeric_limits<std::size_t>::max() - 4u) / 15u)
+    return false;
+  const std::size_t channel_bytes = 4u + block_count * 15u;
+
+  std::array<std::size_t, 6> offsets{};
+  for (unsigned channel = 0; channel < channels; ++channel)
+  {
+    const u32 relative =
+        ReadEAR1U32(packet.data() + 4u + static_cast<std::size_t>(channel) * 4u, big_endian);
+    const std::uint64_t absolute = static_cast<std::uint64_t>(relative) + table_bytes;
+    if (absolute > packet.size() || channel_bytes > packet.size() - static_cast<std::size_t>(absolute))
+      return false;
+    offsets[channel] = static_cast<std::size_t>(absolute);
+  }
+
+  // Reject obviously wrong channel guesses. Real R1 channel payloads don't
+  // overlap and their offsets are laid out monotonically in MOH streams.
+  for (unsigned channel = 1; channel < channels; ++channel)
+  {
+    if (offsets[channel] < offsets[channel - 1] + channel_bytes)
+      return false;
+  }
+
+  decoded->assign(channels, std::vector<s16>(coded_samples));
+
+  for (unsigned channel = 0; channel < channels; ++channel)
+  {
+    std::size_t pos = offsets[channel];
+    int current_sample = ReadEAR1S16(packet.data() + pos + 0u, big_endian);
+    int previous_sample = ReadEAR1S16(packet.data() + pos + 2u, big_endian);
+    pos += 4u;
+
+    std::vector<s16>& output = (*decoded)[channel];
+    std::size_t sample_index = 0;
+
+    for (std::size_t block = 0; block < block_count; ++block)
+    {
+      if (pos >= packet.size())
+        return false;
+
+      int byte = packet[pos++];
+      const unsigned filter = static_cast<unsigned>(byte >> 4);
+      if (filter >= 16)
+        return false;
+
+      const int coeff1 = kEAAdpcmCoefficients[filter];
+      const int coeff2 = kEAAdpcmCoefficients[filter + 4u];
+      const int shift = 20 - (byte & 0x0f);
+      if (shift < 5 || shift > 20)
+        return false;
+
+      for (unsigned n = 0; n < 28; ++n)
+      {
+        int nibble = 0;
+        if (n & 1u)
+        {
+          nibble = SignExtendNibble(static_cast<u8>(byte));
+        }
+        else
+        {
+          if (pos >= packet.size())
+            return false;
+          byte = packet[pos++];
+          nibble = SignExtendNibble(static_cast<u8>(byte >> 4));
+        }
+
+        std::int64_t next_sample =
+            static_cast<std::int64_t>(nibble) * (std::int64_t{1} << shift);
+        next_sample += static_cast<std::int64_t>(current_sample) * coeff1;
+        next_sample += static_cast<std::int64_t>(previous_sample) * coeff2;
+        next_sample >>= 8;
+
+        const s16 clipped = ClipS16(next_sample);
+        previous_sample = current_sample;
+        current_sample = clipped;
+        output[sample_index++] = clipped;
+      }
+    }
+  }
+
+  *coded_samples_out = coded_samples;
+  return true;
+}
+
+bool DecodeEAR1Packet(std::span<const u8> packet, PCMBuffer* pcm, unsigned* channels_out,
+                       bool* big_endian_out)
+{
+  if (!pcm || packet.size() < 16)
+    return false;
+
+  std::vector<std::vector<s16>> channels_pcm;
+  u32 coded_samples = 0;
+  unsigned channels = 0;
+
+  // Frontline music/stream banks are normally stereo. The remaining guesses
+  // make the decoder useful for mono or multichannel EA R1 without risking a
+  // false stereo parse: every candidate is structurally validated above.
+  constexpr std::array<unsigned, 4> kChannelCandidates = {2, 1, 4, 6};
+
+  // Original EA R1 streams use little-endian packet metadata. The PS3
+  // Frontline remaster stores the same R1 packet structure with big-endian
+  // u32 offsets/sample counts and s16 predictor history. Structural validation
+  // below makes endian auto-detection deterministic instead of relying on the
+  // filename/platform.
+  bool big_endian = false;
+  bool decoded_packet = false;
+  constexpr std::array<bool, 2> kEndianCandidates = {false, true};
+  for (const bool candidate_big_endian : kEndianCandidates)
+  {
+    for (const unsigned candidate : kChannelCandidates)
+    {
+      if (DecodeEAR1PacketForChannels(packet, candidate, candidate_big_endian,
+                                      &channels_pcm, &coded_samples))
+      {
+        channels = candidate;
+        big_endian = candidate_big_endian;
+        decoded_packet = true;
+        break;
+      }
+    }
+    if (decoded_packet)
+      break;
+  }
+
+  if (channels == 0 || channels_pcm.empty() || coded_samples == 0)
+    return false;
+
+  const unsigned left_channel = 0;
+  const unsigned right_channel =
+      channels == 1 ? 0 : (channels >= 4 ? 2 : 1);
+  if (right_channel >= channels_pcm.size())
+    return false;
+
+  const std::size_t old_frames = pcm->Frames();
+  if (coded_samples > (std::numeric_limits<std::size_t>::max() / 2u) - old_frames)
+    return false;
+
+  pcm->interleaved_stereo.resize((old_frames + coded_samples) * 2u);
+  s16* dst = pcm->interleaved_stereo.data() + old_frames * 2u;
+  for (u32 i = 0; i < coded_samples; ++i)
+  {
+    dst[static_cast<std::size_t>(i) * 2u + 0u] = channels_pcm[left_channel][i];
+    dst[static_cast<std::size_t>(i) * 2u + 1u] = channels_pcm[right_channel][i];
+  }
+
+  if (channels_out)
+    *channels_out = channels;
+  if (big_endian_out)
+    *big_endian_out = big_endian;
+  return true;
+}
+
+bool DecodeEAStreamNativeR1(std::span<const u8> bytes, PCMBuffer* out)
+{
+  if (!out || bytes.size() < 8)
+    return false;
+
+  constexpr u32 kTagSchl = 0x6c484353u;  // SCHl
+  constexpr u32 kTagSccl = 0x6c434353u;  // SCCl
+  constexpr u32 kTagScdl = 0x6c444353u;  // SCDl
+  constexpr u32 kTagScel = 0x6c454353u;  // SCEl
+
+  PCMBuffer pcm;
+  pcm.sample_rate = 48000;
+  pcm.channels = 2;
+
+  std::size_t offset = 0;
+  std::size_t packet_count = 0;
+  unsigned detected_channels = 0;
+  bool detected_big_endian = false;
+  bool detected_endian_known = false;
+
+  while (offset + 8u <= bytes.size())
+  {
+    const u32 tag = LE32(bytes.data() + offset);
+    const u32 block_size = LE32(bytes.data() + offset + 4u);
+    if (block_size < 8u || block_size > 0x40000u || block_size > bytes.size() - offset)
+    {
+      static unsigned logs = 0;
+      if (logs++ < 12)
+        std::fprintf(stderr,
+                     "[moh-native-audio] EA R1 native bad SCx block off=0x%zx tag=%c%c%c%c "
+                     "size=0x%x remaining=0x%zx\n",
+                     offset, bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+                     block_size, bytes.size() - offset);
+      return false;
+    }
+
+    if (tag == kTagScdl)
+    {
+      const std::span<const u8> packet(bytes.data() + offset + 8u, block_size - 8u);
+      unsigned packet_channels = 0;
+      bool packet_big_endian = false;
+      if (!DecodeEAR1Packet(packet, &pcm, &packet_channels, &packet_big_endian))
+      {
+        static unsigned logs = 0;
+        if (logs++ < 12)
+        {
+          const u32 samples_le = packet.size() >= 4 ? LE32(packet.data()) : 0;
+          const u32 samples_be = packet.size() >= 4 ? EAR1BE32(packet.data()) : 0;
+          const u32 off0_le = packet.size() >= 8 ? LE32(packet.data() + 4u) : 0;
+          const u32 off0_be = packet.size() >= 8 ? EAR1BE32(packet.data() + 4u) : 0;
+          const u32 off1_le = packet.size() >= 12 ? LE32(packet.data() + 8u) : 0;
+          const u32 off1_be = packet.size() >= 12 ? EAR1BE32(packet.data() + 8u) : 0;
+          std::fprintf(stderr,
+                       "[moh-native-audio] EA R1 native packet rejected off=0x%zx payload=0x%zx "
+                       "LE[samples=%u off0=0x%x off1=0x%x] "
+                       "BE[samples=%u off0=0x%x off1=0x%x]\n",
+                       offset, packet.size(), samples_le, off0_le, off1_le,
+                       samples_be, off0_be, off1_be);
+        }
+        return false;
+      }
+
+      if (detected_channels == 0)
+        detected_channels = packet_channels;
+      if (!detected_endian_known)
+      {
+        detected_big_endian = packet_big_endian;
+        detected_endian_known = true;
+      }
+      else if (detected_big_endian != packet_big_endian)
+      {
+        static unsigned endian_logs = 0;
+        if (endian_logs++ < 4)
+          std::fprintf(stderr,
+                       "[moh-native-audio] EA R1 packet endian changed at off=0x%zx (%s -> %s)\n",
+                       offset, detected_big_endian ? "BE" : "LE",
+                       packet_big_endian ? "BE" : "LE");
+      }
+      ++packet_count;
+    }
+    else if (tag == kTagScel)
+    {
+      break;
+    }
+    else if (tag != kTagSchl && tag != kTagSccl)
+    {
+      static unsigned logs = 0;
+      if (logs++ < 12)
+        std::fprintf(stderr,
+                     "[moh-native-audio] EA R1 native unknown SCx tag off=0x%zx: %c%c%c%c\n",
+                     offset, bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+      return false;
+    }
+
+    offset += block_size;
+  }
+
+  if (packet_count == 0 || pcm.interleaved_stereo.empty())
+    return false;
+
+  static unsigned logs = 0;
+  if (logs++ < 32)
+  {
+    std::fprintf(stderr,
+                 "[moh-native-audio] EA R1 NATIVE OK: packets=%zu frames=%zu rate=%u "
+                 "source_channels=%u endian=%s (no FFmpeg)\n",
+                 packet_count, pcm.Frames(), pcm.sample_rate, detected_channels,
+                 detected_big_endian ? "BE" : "LE");
+  }
+
+  *out = std::move(pcm);
+  return true;
+}
+
+bool SubmitFrameRange(const PCMBuffer& pcm, std::size_t first_frame, std::size_t frame_count)
+{
+  if (!pcm || frame_count == 0 || first_frame >= pcm.Frames())
+    return false;
+
+  frame_count = std::min(frame_count, pcm.Frames() - first_frame);
+
+  auto& system = Core::System::GetInstance();
+  SoundStream* stream = system.GetSoundStream();
+  if (!stream)
+    return false;
+
+  Mixer* mixer = stream->GetMixer();
+  if (!mixer || !mixer->IsOutputSampleRateValid())
+    return false;
+
+  const double divisor_f =
+      static_cast<double>(Mixer::FIXED_SAMPLE_RATE_DIVIDEND) / pcm.sample_rate;
+  const u32 divisor =
+      std::max<u32>(1u, static_cast<u32>(std::llround(divisor_f)));
+  mixer->SetStreamInputSampleRateDivisor(divisor);
+
+  std::vector<s16> dolphin_order(frame_count * 2);
+  for (std::size_t i = 0; i < frame_count; ++i)
+  {
+    const std::size_t source = (first_frame + i) * 2;
+    const u16 left = static_cast<u16>(pcm.interleaved_stereo[source + 0]);
+    const u16 right = static_cast<u16>(pcm.interleaved_stereo[source + 1]);
+    dolphin_order[i * 2 + 0] = static_cast<s16>(Common::swap16(right));
+    dolphin_order[i * 2 + 1] = static_cast<s16>(Common::swap16(left));
+  }
+
+  mixer->PushStreamingSamples(dolphin_order.data(), frame_count);
+  return true;
+}
 }  // namespace
 
 bool IsEnabled()
@@ -428,10 +1130,10 @@ bool Decode(const Asset& asset, PCMBuffer* out)
 
   case Format::EAStream:
 #if defined(MOH_NATIVE_AUDIO_FFMPEG)
-    return DecodeEAStreamFFmpeg(asset.bytes, out);
-#else
-    return false;
+    if (DecodeEAStreamFFmpeg(asset.bytes, out))
+      return true;
 #endif
+    return DecodeEAStreamNativeR1(asset.bytes, out);
 
   // AEMS/ABK banks still need their event/module lookup layer. Never decode
   // the bank container itself as if it were a single PCM stream.
@@ -445,37 +1147,121 @@ bool Decode(const Asset& asset, PCMBuffer* out)
 
 bool Submit(const PCMBuffer& pcm)
 {
-  if (!pcm || !IsEnabled())
-    return false;
+  return pcm && IsEnabled() && SubmitFrameRange(pcm, 0, pcm.Frames());
+}
 
-  auto& system = Core::System::GetInstance();
-  SoundStream* stream = system.GetSoundStream();
-  if (!stream)
-    return false;
+void NotifyGuestRead(std::string_view guest_name, std::uint64_t file_offset)
+{
+  if (!IsEnabled() || file_offset > 0x100 || !IsStreamCandidate(guest_name))
+    return;
 
-  Mixer* mixer = stream->GetMixer();
-  if (!mixer || !mixer->IsOutputSampleRateValid())
-    return false;
+  if (!EnvSwitch("MOH_NATIVE_AUDIO_AUTOPLAY", true))
+    return;
 
-  const double divisor_f =
-      static_cast<double>(Mixer::FIXED_SAMPLE_RATE_DIVIDEND) / pcm.sample_rate;
-  const u32 divisor =
-      std::max<u32>(1u, static_cast<u32>(std::llround(divisor_f)));
-  mixer->SetStreamInputSampleRateDivisor(divisor);
+  const std::string normalized = NormalizeAudioName(guest_name);
+  std::scoped_lock lock(s_stream_mutex);
+  if (normalized == s_pending_guest || normalized == s_current_guest)
+    return;
 
-  // PushStreamingSamples consumes big-endian R/L pairs. NativeAudio exposes
-  // ordinary host-endian L/R, so adapt only at this boundary.
-  std::vector<s16> dolphin_order(pcm.interleaved_stereo.size());
-  for (std::size_t i = 0; i < pcm.Frames(); ++i)
+  s_pending_guest = normalized;
+  std::fprintf(stderr, "[moh-native-audio] guest stream detected: %s (native decode scheduled)\n",
+               s_pending_guest.c_str());
+}
+
+void Pump()
+{
+  if (!IsEnabled())
+    return;
+
+  std::string pending;
   {
-    const u16 left = static_cast<u16>(pcm.interleaved_stereo[i * 2 + 0]);
-    const u16 right = static_cast<u16>(pcm.interleaved_stereo[i * 2 + 1]);
-    dolphin_order[i * 2 + 0] = static_cast<s16>(Common::swap16(right));
-    dolphin_order[i * 2 + 1] = static_cast<s16>(Common::swap16(left));
+    std::scoped_lock lock(s_stream_mutex);
+    if (!s_pending_guest.empty())
+    {
+      pending = std::move(s_pending_guest);
+      s_pending_guest.clear();
+    }
   }
 
-  mixer->PushStreamingSamples(dolphin_order.data(), pcm.Frames());
-  return true;
+  if (!pending.empty())
+  {
+    Asset asset = Load(pending);
+    PCMBuffer decoded;
+    bool ok = asset && Decode(asset, &decoded);
+
+    // A PS3 remaster match may exist but use a container revision we have not
+    // decoded yet. In that case try the extracted GC host file before giving
+    // up; the guest itself still has the ISO/DSP fallback regardless.
+    if (!ok && asset.file.IsPS3())
+    {
+      const NativeVFS::File gc =
+          NativeVFS::ResolveGameCube(pending, PS3AssetPort::Class::Audio);
+      if (gc)
+      {
+        Asset gc_asset;
+        gc_asset.file = gc;
+        gc_asset.bytes = NativeVFS::Read(gc);
+        gc_asset.format = Detect(gc_asset.bytes);
+        PCMBuffer gc_decoded;
+        if (gc_asset && Decode(gc_asset, &gc_decoded))
+        {
+          asset = std::move(gc_asset);
+          decoded = std::move(gc_decoded);
+          ok = true;
+        }
+      }
+    }
+
+    std::scoped_lock lock(s_stream_mutex);
+    s_current_guest = pending;
+    s_stream_frame = 0;
+    s_stream_pcm = ok ? std::move(decoded) : PCMBuffer{};
+
+    if (ok)
+    {
+      std::fprintf(stderr,
+                   "[moh-native-audio] HOST STREAM START: %s frames=%zu rate=%u source=%s\n",
+                   s_current_guest.c_str(), s_stream_pcm.Frames(), s_stream_pcm.sample_rate,
+                   asset.file.IsPS3() ? "PS3" : "GC-host");
+    }
+    else
+    {
+      std::fprintf(stderr,
+                   "[moh-native-audio] native stream unavailable: %s -> guest GC audio continues\n",
+                   s_current_guest.c_str());
+    }
+  }
+
+  std::scoped_lock lock(s_stream_mutex);
+  if (!s_stream_pcm || s_stream_frame >= s_stream_pcm.Frames())
+    return;
+
+  // Feed roughly 1/30 s per rendered frame. This intentionally keeps a small
+  // lead over 60 Hz without flooding Dolphin's bounded streaming FIFO.
+  const std::size_t chunk =
+      std::max<std::size_t>(256, static_cast<std::size_t>(s_stream_pcm.sample_rate / 30u));
+  const std::size_t count = std::min(chunk, s_stream_pcm.Frames() - s_stream_frame);
+  if (!SubmitFrameRange(s_stream_pcm, s_stream_frame, count))
+    return;
+
+  s_stream_frame += count;
+  if (s_stream_frame >= s_stream_pcm.Frames())
+  {
+    std::fprintf(stderr, "[moh-native-audio] HOST STREAM END: %s\n",
+                 s_current_guest.c_str());
+    s_stream_pcm = {};
+    s_stream_frame = 0;
+    s_current_guest.clear();
+  }
+}
+
+void Stop()
+{
+  std::scoped_lock lock(s_stream_mutex);
+  s_pending_guest.clear();
+  s_current_guest.clear();
+  s_stream_pcm = {};
+  s_stream_frame = 0;
 }
 
 bool TryPlay(std::string_view guest_name)

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/MohPcLayer.h"
+#include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeVFS.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3FontParser.h"
 
@@ -1722,6 +1723,7 @@ void Initialize()
     SetEnv("MOH_PS3_AUTO_TEXTURES", "0");
 
   PS3RemasterAssets::Initialize();
+  MOHFrontline::NativeVFS::Initialize();
   s.requested_fps = 60;
   s.vi_skip = true;
   s.original_post_shader = Config::Get(Config::GFX_ENHANCE_POST_SHADER);
@@ -1772,6 +1774,7 @@ void Shutdown()
     ReleaseScenePostProcessOnGpu();
   }
 
+  MOHFrontline::NativeVFS::Shutdown();
   PS3RemasterAssets::Shutdown();
   SaveSettings();
 }

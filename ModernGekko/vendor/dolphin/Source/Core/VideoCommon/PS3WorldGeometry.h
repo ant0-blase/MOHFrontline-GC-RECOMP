@@ -83,6 +83,16 @@ inline bool MaterialTraceEnabled()
   return enabled;
 }
 
+inline bool NodeTransformEnabled()
+{
+  // v9.9: TABLE3/NODE70 begins with an exact rigid 3x4 affine matrix.  The
+  // v9.8 probe showed orthonormal rows and determinant +1 for every dumped
+  // NODE70, so authored CPT vertices can finally be moved from node-local to
+  // level/world space before bounds matching and host submission.
+  static const bool enabled = EnvSwitch("MOH_PS3_CPT_NODE_TRANSFORM", true);
+  return enabled;
+}
+
 inline u16 BE16(const u8* p)
 {
   return static_cast<u16>((u16(p[0]) << 8) | u16(p[1]));
@@ -522,6 +532,230 @@ inline bool ResolveCPTDescriptorLink(std::span<const u8> bytes, std::size_t desc
   return false;
 }
 
+struct CPTNodeAffine
+{
+  bool valid = false;
+  std::array<float, 12> matrix{};
+  float determinant = 0.0f;
+  float orthogonality_error = std::numeric_limits<float>::infinity();
+};
+
+inline bool DecodeCPTNodeAffine(std::span<const u8> bytes, const CPTDescriptorLink& link,
+                                CPTNodeAffine* out)
+{
+  if (!out || !link.valid || !link.node_offset ||
+      std::size_t(link.node_offset) > bytes.size() ||
+      0x30 > bytes.size() - std::size_t(link.node_offset))
+    return false;
+
+  CPTNodeAffine affine;
+  for (std::size_t i = 0; i < affine.matrix.size(); ++i)
+  {
+    affine.matrix[i] = BEFloat(bytes.data() + std::size_t(link.node_offset) + i * 4);
+    if (!std::isfinite(affine.matrix[i]) || std::fabs(affine.matrix[i]) > 1000000.0f)
+      return false;
+  }
+
+  const auto dot3 = [&](std::size_t a, std::size_t b) {
+    return affine.matrix[a + 0] * affine.matrix[b + 0] +
+           affine.matrix[a + 1] * affine.matrix[b + 1] +
+           affine.matrix[a + 2] * affine.matrix[b + 2];
+  };
+  const float n0 = dot3(0, 0);
+  const float n1 = dot3(4, 4);
+  const float n2 = dot3(8, 8);
+  const float d01 = dot3(0, 4);
+  const float d02 = dot3(0, 8);
+  const float d12 = dot3(4, 8);
+  affine.orthogonality_error = std::max(
+      {std::fabs(n0 - 1.0f), std::fabs(n1 - 1.0f), std::fabs(n2 - 1.0f),
+       std::fabs(d01), std::fabs(d02), std::fabs(d12)});
+
+  const float a00 = affine.matrix[0], a01 = affine.matrix[1], a02 = affine.matrix[2];
+  const float a10 = affine.matrix[4], a11 = affine.matrix[5], a12 = affine.matrix[6];
+  const float a20 = affine.matrix[8], a21 = affine.matrix[9], a22 = affine.matrix[10];
+  affine.determinant =
+      a00 * (a11 * a22 - a12 * a21) -
+      a01 * (a10 * a22 - a12 * a20) +
+      a02 * (a10 * a21 - a11 * a20);
+
+  // Keep this deliberately strict.  A malformed pointer must never turn into
+  // a giant world-space warp.  Retail NODE70 matrices measured by v9.8 were
+  // within ~1e-7 of orthonormal and det +1.
+  if (affine.orthogonality_error > 0.02f ||
+      affine.determinant < 0.95f || affine.determinant > 1.05f)
+    return false;
+
+  affine.valid = true;
+  *out = affine;
+  return true;
+}
+
+inline bool ApplyCPTNodeAffine(Submesh* submesh, const CPTNodeAffine& affine)
+{
+  if (!submesh || !affine.valid || submesh->position_uv.size() != submesh->vertex_count)
+    return false;
+
+  std::vector<PositionUVVertex> transformed = submesh->position_uv;
+  for (auto& vertex : transformed)
+  {
+    const auto p = vertex.position;
+    vertex.position = {
+        affine.matrix[0] * p[0] + affine.matrix[1] * p[1] + affine.matrix[2] * p[2] +
+            affine.matrix[3],
+        affine.matrix[4] * p[0] + affine.matrix[5] * p[1] + affine.matrix[6] * p[2] +
+            affine.matrix[7],
+        affine.matrix[8] * p[0] + affine.matrix[9] * p[1] + affine.matrix[10] * p[2] +
+            affine.matrix[11],
+    };
+    if (!std::isfinite(vertex.position[0]) || !std::isfinite(vertex.position[1]) ||
+        !std::isfinite(vertex.position[2]) || std::fabs(vertex.position[0]) > 1000000.0f ||
+        std::fabs(vertex.position[1]) > 1000000.0f || std::fabs(vertex.position[2]) > 1000000.0f)
+      return false;
+
+    if (submesh->has_normal)
+    {
+      const auto n = vertex.normal;
+      std::array<float, 3> rotated{
+          affine.matrix[0] * n[0] + affine.matrix[1] * n[1] + affine.matrix[2] * n[2],
+          affine.matrix[4] * n[0] + affine.matrix[5] * n[1] + affine.matrix[6] * n[2],
+          affine.matrix[8] * n[0] + affine.matrix[9] * n[1] + affine.matrix[10] * n[2],
+      };
+      const float length = std::sqrt(rotated[0] * rotated[0] + rotated[1] * rotated[1] +
+                                     rotated[2] * rotated[2]);
+      if (!std::isfinite(length) || length < 1.0e-8f)
+        return false;
+      for (std::size_t axis = 0; axis < 3; ++axis)
+        vertex.normal[axis] = rotated[axis] / length;
+    }
+  }
+
+  submesh->position_uv = std::move(transformed);
+  return true;
+}
+
+struct CPTMaterialTextureRef
+{
+  bool valid = false;
+  unsigned slot = 0;
+  u32 size = 0;
+  u32 raw_offset = 0;
+  u32 offset = 0;
+  std::array<u8, 24> descriptor{};
+
+  u32 Width() const { return (u32(descriptor[8]) << 8) | descriptor[9]; }
+  u32 Height() const { return (u32(descriptor[10]) << 8) | descriptor[11]; }
+  u32 Format() const { return descriptor[0]; }
+  u32 Mips() const { return descriptor[1]; }
+};
+
+inline bool DecodeCPTMaterialTextureRef(std::span<const u8> bytes,
+                                        const CPTDescriptorLink& link, unsigned slot,
+                                        std::uint64_t rsx_size, CPTMaterialTextureRef* out)
+{
+  if (!out || !link.valid || slot > 1 || !link.material_offset)
+    return false;
+
+  // MAT94 contains two exact RSX resource records.  Their bases are +0x18 and
+  // +0x40; each uses the same shape already proven by the runtime CPT texture
+  // parser: size@+4, raw rsx offset@+8, 24-byte descriptor@+16.
+  const std::size_t record = std::size_t(link.material_offset) + (slot == 0 ? 0x18 : 0x40);
+  if (record > bytes.size() || 40 > bytes.size() - record)
+    return false;
+
+  CPTMaterialTextureRef ref;
+  ref.slot = slot;
+  ref.size = BE32(bytes.data() + record + 4);
+  ref.raw_offset = BE32(bytes.data() + record + 8);
+  if (!ref.size || !ref.raw_offset || (ref.raw_offset & 0x7Fu) > 1u)
+    return false;
+  ref.offset = ref.raw_offset & ~1u;
+  if (!ref.offset || (ref.offset & 0x7Fu) != 0)
+    return false;
+  std::copy_n(bytes.data() + record + 16, ref.descriptor.size(), ref.descriptor.begin());
+
+  const u8 base_format = static_cast<u8>(ref.descriptor[0] & ~0x20u);
+  if ((base_format != 0x86 && base_format != 0x87 && base_format != 0x88) ||
+      !ref.Mips() || ref.Mips() > 16 || !ref.Width() || !ref.Height() ||
+      ref.Width() > 8192 || ref.Height() > 8192 ||
+      ref.descriptor[6] != 0xAA || ref.descriptor[7] != 0xE4)
+    return false;
+  if (rsx_size && (ref.offset > rsx_size || ref.size > rsx_size - ref.offset))
+    return false;
+
+  ref.valid = true;
+  *out = ref;
+  return true;
+}
+
+inline void AttachCPTMaterialTextures(Submesh* submesh,
+                                      const std::array<CPTMaterialTextureRef, 2>& textures)
+{
+  if (!submesh)
+    return;
+  for (const auto& texture : textures)
+  {
+    if (!texture.valid)
+      continue;
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string descriptor_hex;
+    descriptor_hex.reserve(texture.descriptor.size() * 2);
+    for (const u8 byte : texture.descriptor)
+    {
+      descriptor_hex.push_back(hex[(byte >> 4) & 0x0F]);
+      descriptor_hex.push_back(hex[byte & 0x0F]);
+    }
+    submesh->material_hints.push_back(
+        "@cpt-tex=slot:" + std::to_string(texture.slot) +
+        ";offset:" + std::to_string(texture.offset) +
+        ";size:" + std::to_string(texture.size) +
+        ";format:" + std::to_string(texture.Format()) +
+        ";mips:" + std::to_string(texture.Mips()) +
+        ";width:" + std::to_string(texture.Width()) +
+        ";height:" + std::to_string(texture.Height()) +
+        ";desc:" + descriptor_hex);
+  }
+}
+
+inline void TraceCPTResolvedState(const AssetInfo& cpt, const CPTDescriptorLink& link,
+                                  const CPTNodeAffine& affine,
+                                  const std::array<CPTMaterialTextureRef, 2>& textures,
+                                  bool transform_applied)
+{
+  if (!MaterialTraceEnabled() || !link.valid)
+    return;
+
+  static std::unordered_set<std::string> dumped_nodes;
+  static std::unordered_set<std::string> dumped_textures;
+  const std::string node_key = cpt.relative_path + "#node:" + std::to_string(link.node_offset);
+  if (affine.valid && dumped_nodes.insert(node_key).second)
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-world-mat] NODE AFFINE: source=%s node=%zu off=0x%08X det=%.8f orth=%.8g t=(%.6f %.6f %.6f) applied=%d\n",
+                 cpt.relative_path.c_str(), link.node_record, link.node_offset,
+                 affine.determinant, affine.orthogonality_error,
+                 affine.matrix[3], affine.matrix[7], affine.matrix[11],
+                 transform_applied ? 1 : 0);
+  }
+
+  for (const auto& texture : textures)
+  {
+    if (!texture.valid)
+      continue;
+    const std::string key = cpt.relative_path + "#mat:" +
+                            std::to_string(link.material_offset) + ":" +
+                            std::to_string(texture.slot);
+    if (!dumped_textures.insert(key).second)
+      continue;
+    std::fprintf(stderr,
+                 "[moh-ps3-world-mat] TEXTURE EXACT: source=%s mat=%zu:%zu slot=%u rsx=0x%08X raw=0x%08X size=%u %ux%u fmt=0x%02X mips=%u remap=%02X%02X\n",
+                 cpt.relative_path.c_str(), link.material_table, link.material_record,
+                 texture.slot, texture.offset, texture.raw_offset, texture.size,
+                 texture.Width(), texture.Height(), texture.Format(), texture.Mips(),
+                 texture.descriptor[6], texture.descriptor[7]);
+  }
+}
+
 inline void AttachCPTDescriptorLink(Submesh* submesh, const CPTDescriptorLink& link)
 {
   if (!submesh || !link.valid)
@@ -902,7 +1136,29 @@ inline std::vector<std::shared_ptr<StaticMesh>> Decode(const AssetInfo& cpt, Dec
     CPTDescriptorLink descriptor_link;
     if (ResolveCPTDescriptorLink(bytes, d.source_offset, &descriptor_link))
     {
-      AttachCPTDescriptorLink(&decoded->submeshes.front(), descriptor_link);
+      Submesh& linked_submesh = decoded->submeshes.front();
+      AttachCPTDescriptorLink(&linked_submesh, descriptor_link);
+
+      CPTNodeAffine node_affine;
+      const bool affine_valid = DecodeCPTNodeAffine(bytes, descriptor_link, &node_affine);
+      const bool transform_applied =
+          affine_valid && NodeTransformEnabled() && ApplyCPTNodeAffine(&linked_submesh, node_affine);
+      if (affine_valid)
+      {
+        linked_submesh.material_hints.push_back(
+            "@cpt-node=record:" + std::to_string(descriptor_link.node_record) +
+            ";offset:" + std::to_string(descriptor_link.node_offset) +
+            ";applied:" + std::to_string(transform_applied ? 1 : 0));
+      }
+
+      std::array<CPTMaterialTextureRef, 2> material_textures{};
+      const std::uint64_t rsx_size = rsx ? static_cast<std::uint64_t>(rsx->size) : 0;
+      for (unsigned slot = 0; slot < material_textures.size(); ++slot)
+        DecodeCPTMaterialTextureRef(bytes, descriptor_link, slot, rsx_size,
+                                    &material_textures[slot]);
+      AttachCPTMaterialTextures(&linked_submesh, material_textures);
+      TraceCPTResolvedState(cpt, descriptor_link, node_affine, material_textures,
+                            transform_applied);
       TraceExactCPTDescriptorLink(bytes, cpt, d, descriptor_link);
     }
     else
@@ -919,6 +1175,14 @@ inline std::vector<std::shared_ptr<StaticMesh>> Decode(const AssetInfo& cpt, Dec
                                    sub.indices.size() * sizeof(u16)), key);
     key ^= u64(sub.vertex_count) << 32;
     key ^= sub.index_count;
+    // Local vertex/index bytes can be identical for authored instances placed
+    // by different NODE70 transforms or materials.  Keep those instances
+    // distinct after v9.9 starts applying the exact node affine.
+    if (descriptor_link.valid)
+    {
+      key ^= u64(descriptor_link.node_offset) * 0x9E3779B185EBCA87ULL;
+      key ^= u64(descriptor_link.material_offset) * 0xC2B2AE3D27D4EB4FULL;
+    }
     if (!accepted_keys.insert(key).second)
     {
       ++local.duplicate;

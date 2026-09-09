@@ -172,13 +172,33 @@ bool TrySubmitCurrentDraw()
 
   if (!submitter)
   {
-    static bool logged = false;
-    if (!logged)
+    // Shadow mode is useful even before the final Vulkan/D3D/Metal backend:
+    // prove that a PS3 MSH/DMF has been converted into a complete host-neutral
+    // draw packet while keeping the original GX draw for pixels.
+    DrawPacket shadow;
+    if (BuildCurrentDraw(&shadow))
     {
-      logged = true;
-      std::fprintf(stderr,
-                   "[moh-native-render] mode=%s, no native backend registered -> GX fallback\n",
-                   ModeName(mode));
+      static unsigned shadow_logs = 0;
+      if (shadow_logs++ < 128)
+      {
+        std::fprintf(stderr,
+                     "[moh-native-render] SHADOW PACKET %s source=%s material=%s "
+                     "vertices=%zu indices=%zu matrices=%zu -> GX mirror\n",
+                     shadow.skinned ? "DMF" : "MSH", shadow.source_name.c_str(),
+                     shadow.material_name.c_str(), shadow.vertices.size(),
+                     shadow.indices.size(), shadow.model_to_gc_local.size());
+      }
+    }
+    else
+    {
+      static bool waiting_logged = false;
+      if (!waiting_logged)
+      {
+        waiting_logged = true;
+        std::fprintf(stderr,
+                     "[moh-native-render] mode=%s waiting for a matched PS3 MSH/DMF -> GX fallback\n",
+                     ModeName(mode));
+      }
     }
     return false;
   }

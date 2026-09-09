@@ -61,6 +61,13 @@ std::filesystem::path GetGameCubeRoot();
 File Resolve(std::string_view guest_path,
              PS3AssetPort::Class wanted = PS3AssetPort::Class::Unknown);
 
+// Explicit-source variants used by bridges that must never inject PS3 binary
+// layouts into a GameCube guest loader.
+File ResolveGameCube(std::string_view guest_path,
+                     PS3AssetPort::Class wanted = PS3AssetPort::Class::Unknown);
+File ResolvePlayStation3(std::string_view guest_path,
+                         PS3AssetPort::Class wanted = PS3AssetPort::Class::Unknown);
+
 std::vector<u8> Read(const File& file);
 bool ReadRange(const File& file, std::uint64_t offset, std::span<u8> destination);
 

@@ -58,7 +58,15 @@ bool Decode(const Asset& asset, PCMBuffer* out);
 // is handled internally.
 bool Submit(const PCMBuffer& pcm);
 
-// Convenience: NativeVFS -> decode -> host mixer. Returns false for any
-// unsupported/missing asset so the caller can immediately fall back to GC.
+// Called by the native DVD/FST bridge when the guest starts reading an audio
+// file. This only schedules host playback; the guest still receives its normal
+// GC bytes, so unsupported assets transparently keep the original DSP path.
+void NotifyGuestRead(std::string_view guest_name, std::uint64_t file_offset);
+
+// Pump a bounded amount of decoded host PCM. Call once per rendered frame.
+void Pump();
+void Stop();
+
+// Convenience one-shot path retained for small WAV/SFX tests.
 bool TryPlay(std::string_view guest_name);
 }  // namespace MOHFrontline::NativeAudio

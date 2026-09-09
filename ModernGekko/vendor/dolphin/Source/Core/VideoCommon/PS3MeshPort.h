@@ -283,6 +283,13 @@ void NotifySkinnedDrawSubmitted(const SkinnedDrawReplacement& replacement);
 void PrintDrawStatistics();
 
 bool IsStaticDrawReplacementEnabled();
+
+// v10.1 experimental complete CPT world proof-of-life. The renderer builds a
+// single host mesh from every decoded *_ART_cN.cpt descriptor after NODE70
+// transforms and may submit it once per frame from a direct GC world draw.
+bool IsFullCPTLevelRenderEnabled();
+StaticDrawMatch AcquireFullCPTLevelDraw(u32 gc_triangle_count);
+
 StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices,
                                 u32 gc_vertex_count,
                                 u32 gc_vertex_stride,

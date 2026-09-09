@@ -41,6 +41,8 @@
 #include "VideoCommon/PerfQueryBase.h"
 #include "VideoCommon/PixelShaderGen.h"
 #include "VideoCommon/PS3MeshPort.h"
+#include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
+#include "VideoCommon/MOHFrontline/Engine/Renderer/NativeHostRenderer.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/NativeRenderBridge.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/Statistics.h"
@@ -351,7 +353,10 @@ VertexManagerBase::VertexManagerBase()
 {
 }
 
-VertexManagerBase::~VertexManagerBase() = default;
+VertexManagerBase::~VertexManagerBase()
+{
+  MOHFrontline::NativeHostRenderer::Shutdown();
+}
 
 bool VertexManagerBase::Initialize()
 {
@@ -364,6 +369,7 @@ bool VertexManagerBase::Initialize()
   m_index_generator.Init();
   m_custom_shader_cache = std::make_unique<CustomShaderCache>();
   m_cpu_cull.Init();
+  MOHFrontline::NativeHostRenderer::Initialize();
   return true;
 }
 
@@ -591,10 +597,21 @@ void VertexManagerBase::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 ba
     g_bounding_box->Flush();
   }
 
-  if (MOHFrontline::NativeRender::TrySubmitCurrentDraw())
+  // A native utility draw uploads its own vertex/index buffer.  In shadow mode
+  // the original GX batch must therefore be submitted first, then the host
+  // overlay can safely replace the binding.  PreferNative intentionally does
+  // the opposite: if the host backend accepts the PS3 packet, GX is skipped.
+  const auto native_mode = MOHFrontline::NativeRender::GetMode();
+  if (native_mode == MOHFrontline::NativeRender::Mode::PreferNative &&
+      MOHFrontline::NativeRender::TrySubmitCurrentDraw())
+  {
     return;
+  }
 
   g_gfx->DrawIndexed(base_index, num_indices, base_vertex);
+
+  if (native_mode == MOHFrontline::NativeRender::Mode::Shadow)
+    (void)MOHFrontline::NativeRender::TrySubmitCurrentDraw();
 }
 
 void VertexManagerBase::UploadUniforms()
@@ -682,7 +699,9 @@ void VertexManagerBase::Flush()
 
   if (m_draw_counter == 0)
   {
-    // This is more or less the start of the Frame
+    // This is more or less the start of the Frame. Pump the native host audio
+    // bridge here so decoding never runs on Dolphin's DVD worker thread.
+    MOHFrontline::NativeAudio::Pump();
     GetVideoEvents().before_frame_event.Trigger();
   }
 
@@ -2354,15 +2373,42 @@ void VertexManagerBase::RenderDrawCall(
         gc_triangle_count = gc_index_count / 3;
       }
 
-      const auto match =
-          PS3MeshPort::MatchStaticDraw(gc_vertices, gc_vertex_count, vertex_stride,
-                                       static_cast<u32>(decl.position.offset), gc_triangle_count);
+      // v10.1 full-level CPT proof-of-life. m_draw_counter is reset by
+      // OnEndFrame(), so zero marks the first render batch of a new frame.
+      static bool s_moh_full_cpt_level_drawn_this_frame = false;
+      if (m_draw_counter == 0)
+        s_moh_full_cpt_level_drawn_this_frame = false;
+
+      PS3MeshPort::StaticDrawMatch match;
+      if (!s_moh_full_cpt_level_drawn_this_frame)
+      {
+        match = PS3MeshPort::AcquireFullCPTLevelDraw(gc_triangle_count);
+        if (match)
+        {
+          s_moh_full_cpt_level_drawn_this_frame = true;
+          static unsigned full_level_select_logs = 0;
+          if (full_level_select_logs++ < 8)
+          {
+            std::fprintf(stderr,
+                         "[moh-ps3-world-full] DRAW SELECTED: trigger GCverts=%u GCtris=%u stride=%u | complete CPT level will replace this direct world batch\n",
+                         gc_vertex_count, gc_triangle_count, vertex_stride);
+          }
+        }
+      }
+      if (!match)
+      {
+        match = PS3MeshPort::MatchStaticDraw(gc_vertices, gc_vertex_count, vertex_stride,
+                                             static_cast<u32>(decl.position.offset),
+                                             gc_triangle_count);
+      }
 
       if (match)
       {
         const PS3MeshPort::Submesh& submesh = *match.submesh;
         const bool world_cpt_match =
             match.mesh && match.mesh->source_name.find(".cpt#cpt-") != std::string::npos;
+        const bool full_cpt_level_match =
+            match.mesh && match.mesh->source_name.find("#cpt-full-level") != std::string::npos;
 
         auto attribute_is_float = [vertex_stride](const AttributeFormat& attribute,
                                                   int minimum_components) {
@@ -2429,6 +2475,7 @@ void VertexManagerBase::RenderDrawCall(
 
         bool posmtx_layout_ok = true;
         bool posmtx_constant = true;
+        std::size_t posmtx_bytes = 0;
         // Rigid replacement may reuse a per-vertex position-matrix index only
         // when the whole original draw used exactly the same index/value.
         if (stream_ok && decl.posmtx.enable)
@@ -2436,7 +2483,8 @@ void VertexManagerBase::RenderDrawCall(
           const u32 element_size = GetElementSize(decl.posmtx.type);
           const std::size_t matrix_bytes =
               std::size_t(element_size) * std::max(decl.posmtx.components, 1);
-          if (decl.posmtx.offset < 0 ||
+          posmtx_bytes = matrix_bytes;
+          if (matrix_bytes == 0 || decl.posmtx.offset < 0 ||
               std::size_t(decl.posmtx.offset) + matrix_bytes > vertex_stride)
           {
             posmtx_layout_ok = false;
@@ -2452,8 +2500,121 @@ void VertexManagerBase::RenderDrawCall(
               if (std::memcmp(first, current, matrix_bytes) != 0)
               {
                 posmtx_constant = false;
-                stream_ok = false;
+                // A world CPT draw may legitimately span several GX position
+                // matrix indices. Keep ordinary rigid MSH strict, but defer
+                // CPT validation to the spatial matrix-index bridge below.
+                if (!world_cpt_match)
+                  stream_ok = false;
                 break;
+              }
+            }
+          }
+        }
+
+        // v10.0: large GC world batches can use a varying position-matrix
+        // index. Preserve that live GX/XF palette by assigning each PS3 vertex
+        // the matrix field of the spatially nearest GC vertex after applying
+        // the already-validated CPT world translation.
+        std::vector<u32> world_posmtx_source_vertices;
+        float world_posmtx_max_nearest_ratio = 0.0f;
+        if (stream_ok && world_cpt_match && !full_cpt_level_match &&
+            decl.posmtx.enable && !posmtx_constant && posmtx_layout_ok && posmtx_bytes != 0)
+        {
+          std::array<float, 3> gc_min = {1.0e30f, 1.0e30f, 1.0e30f};
+          std::array<float, 3> gc_max = {-1.0e30f, -1.0e30f, -1.0e30f};
+          bool gc_positions_valid = true;
+          for (u32 gc_i = 0; gc_i < gc_vertex_count; ++gc_i)
+          {
+            std::array<float, 3> p{};
+            std::memcpy(p.data(),
+                        gc_vertices.data() + std::size_t(gc_i) * vertex_stride +
+                            decl.position.offset,
+                        sizeof(float) * 3);
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]))
+            {
+              gc_positions_valid = false;
+              break;
+            }
+            for (std::size_t axis = 0; axis < 3; ++axis)
+            {
+              gc_min[axis] = std::min(gc_min[axis], p[axis]);
+              gc_max[axis] = std::max(gc_max[axis], p[axis]);
+            }
+          }
+
+          const float dx = gc_max[0] - gc_min[0];
+          const float dy = gc_max[1] - gc_min[1];
+          const float dz = gc_max[2] - gc_min[2];
+          const float gc_diagonal2 = dx * dx + dy * dy + dz * dz;
+          const float maximum_nearest_ratio =
+              MohEnvFloat("MOH_PS3_CPT_POSMTX_MAX_NEAREST", 0.20f);
+
+          if (!gc_positions_valid || !std::isfinite(gc_diagonal2) || gc_diagonal2 <= 1.0e-12f)
+          {
+            stream_ok = false;
+          }
+          else
+          {
+            world_posmtx_source_vertices.resize(submesh.vertex_count);
+            float max_nearest_distance2 = 0.0f;
+            for (u32 ps3_i = 0; ps3_i < submesh.vertex_count; ++ps3_i)
+            {
+              std::array<float, 3> p = submesh.position_uv[ps3_i].position;
+              if (match.world_translation_valid)
+              {
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                  p[axis] += match.world_translation[axis];
+              }
+
+              u32 nearest_gc = 0;
+              float nearest_distance2 = 1.0e30f;
+              for (u32 gc_i = 0; gc_i < gc_vertex_count; ++gc_i)
+              {
+                std::array<float, 3> q{};
+                std::memcpy(q.data(),
+                            gc_vertices.data() + std::size_t(gc_i) * vertex_stride +
+                                decl.position.offset,
+                            sizeof(float) * 3);
+                const float px = p[0] - q[0];
+                const float py = p[1] - q[1];
+                const float pz = p[2] - q[2];
+                const float distance2 = px * px + py * py + pz * pz;
+                if (distance2 < nearest_distance2)
+                {
+                  nearest_distance2 = distance2;
+                  nearest_gc = gc_i;
+                }
+              }
+              world_posmtx_source_vertices[ps3_i] = nearest_gc;
+              max_nearest_distance2 = std::max(max_nearest_distance2, nearest_distance2);
+            }
+
+            world_posmtx_max_nearest_ratio = std::sqrt(max_nearest_distance2 / gc_diagonal2);
+            if (!std::isfinite(world_posmtx_max_nearest_ratio) ||
+                world_posmtx_max_nearest_ratio > maximum_nearest_ratio)
+            {
+              static unsigned world_posmtx_reject_logs = 0;
+              if (world_posmtx_reject_logs++ < 32)
+              {
+                std::fprintf(stderr,
+                             "[moh-ps3-world-geo] WORLD POSMTX BRIDGE REJECT: ps3=%s GCverts=%u PS3verts=%u bytes=%zu max-nearest=%.6f limit=%.6f -> GC\n",
+                             match.mesh->source_name.c_str(), gc_vertex_count,
+                             submesh.vertex_count, posmtx_bytes,
+                             world_posmtx_max_nearest_ratio, maximum_nearest_ratio);
+              }
+              world_posmtx_source_vertices.clear();
+              stream_ok = false;
+            }
+            else
+            {
+              static unsigned world_posmtx_ready_logs = 0;
+              if (world_posmtx_ready_logs++ < 32)
+              {
+                std::fprintf(stderr,
+                             "[moh-ps3-world-geo] WORLD POSMTX BRIDGE READY: ps3=%s GCverts=%u PS3verts=%u bytes=%zu max-nearest=%.6f limit=%.6f | nearest GC matrix index per PS3 vertex\n",
+                             match.mesh->source_name.c_str(), gc_vertex_count,
+                             submesh.vertex_count, posmtx_bytes,
+                             world_posmtx_max_nearest_ratio, maximum_nearest_ratio);
               }
             }
           }
@@ -2499,6 +2660,22 @@ void VertexManagerBase::RenderDrawCall(
 
               std::memcpy(destination + decl.position.offset, ps3_position.data(),
                           sizeof(float) * 3);
+
+              if (full_cpt_level_match && decl.posmtx.enable && posmtx_bytes != 0)
+              {
+                // NODE70 already moved every descriptor into authored PS3
+                // level/world space. Position matrix slot 0 keeps the common
+                // live camera transform without a random GC sector matrix.
+                std::memset(destination + decl.posmtx.offset, 0, posmtx_bytes);
+              }
+              else if (!world_posmtx_source_vertices.empty())
+              {
+                const u32 gc_source_vertex = world_posmtx_source_vertices[i];
+                std::memcpy(destination + decl.posmtx.offset,
+                            gc_vertices.data() +
+                                std::size_t(gc_source_vertex) * vertex_stride + decl.posmtx.offset,
+                            posmtx_bytes);
+              }
 
               if (decl.normals[0].enable)
               {

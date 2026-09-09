@@ -184,12 +184,23 @@ std::unordered_set<std::string> g_dmf_draw_logged;
 
 std::mutex g_dmf_cache_mutex;
 std::unordered_map<std::string, std::shared_ptr<DMFResource>> g_dmf_cache;
+struct GCSkinGroupRecord
+{
+  u8 bone_a = 0;
+  u8 bone_b = 0;
+  u16 blend_q = 0;
+};
+
 struct ExactDMFPair
 {
   std::shared_ptr<DMFResource> ps3;
   u32 gc_size = 0;
   u32 gc_version_word = 0;
   std::vector<s16> ps3_group_to_gc;
+
+  std::vector<GCSkinGroupRecord> gc_skin_groups;
+  bool gc_bone_order_proven = false;
+
   std::size_t mapped_skin_groups = 0;
   std::string skeleton_name;
   std::size_t skeleton_name_matches = 0;
@@ -259,6 +270,13 @@ std::unordered_map<std::string, std::shared_ptr<const DMFCluster>>
 std::unordered_map<std::string, SkinnedPaletteAnalysis>
     g_dmf_palette_flow_analyses;
 std::unordered_set<std::string> g_dmf_palette_flow_material_attempts;
+
+// v12.4:
+// Palette-flow proves triangle ownership, not animated bind equivalence.
+// A model that required same-bones / different-q association is therefore
+// quarantined from PS3 mohf_body rendering until its exact GC bind convention
+// is independently proven.
+std::unordered_set<std::string> g_dmf_nonexact_skin_group_models;
 
 struct DMFAddressCacheEntry
 {
@@ -512,6 +530,63 @@ void EnsureDMFPaletteFlowPartition(const SkinnedDrawMatch& draw)
       draw.ps3_group_to_gc.empty() || IsSupportedPlayerWeaponDMF(draw.gc_name))
   {
     return;
+  }
+
+  // v12.3 proved several BM character resources only after associating the
+  // same bone pair with a different authored 4.12 coefficient.
+  //
+  // That association is sufficient to understand topology/palette identity,
+  // but it is NOT sufficient to prove that a PS3 model-bind vertex can be
+  // driven by that retail GC XF group. Allowing it caused the characteristic
+  // stretched triangles / trapezoid soldiers.
+  //
+  // Keep PS3 rendering for bodies whose COMPLETE group mapping is exact.
+  // v12.5:
+  //
+  // Palette-flow proves triangle ownership.  v12.4.1 then proved that the
+  // remaining visual corruption is specifically in the body bind-space
+  // conversion.
+  //
+  // Test model-space body skinning ONLY for resources whose PS3->GC group
+  // mapping did not need a q approximation.  Any model in
+  // g_dmf_nonexact_skin_group_models remains on the retail GC body path.
+  static const bool body_model_space = [] {
+    const char* value =
+        std::getenv("MOH_PS3_DMF_BODY_MODEL_SPACE");
+
+    return value != nullptr &&
+           value[0] != '\0' &&
+           value[0] != '0';
+  }();
+
+  if (draw.gc_material_name == "mohf_body")
+  {
+    const bool nonexact_groups =
+        g_dmf_nonexact_skin_group_models.contains(
+            std::string(draw.gc_name));
+
+    if (!body_model_space || nonexact_groups)
+    {
+      static unsigned body_skin_fallback_logs = 0;
+
+      if (body_skin_fallback_logs++ < 64)
+      {
+        std::fprintf(
+            stderr,
+            "[moh-ps3-dmf] BODY SKIN SAFE-FALLBACK: "
+            "gc=%.*s material=%.*s reason=%s -> GC body; "
+            "other exact PS3 DMF materials remain enabled\n",
+            static_cast<int>(draw.gc_name.size()),
+            draw.gc_name.data(),
+            static_cast<int>(draw.gc_material_name.size()),
+            draw.gc_material_name.data(),
+            nonexact_groups ?
+                "nonexact-skin-group-q" :
+                "body-model-space-disabled");
+      }
+
+      return;
+    }
   }
 
   const std::string material_key =
@@ -1358,6 +1433,194 @@ struct WorldCPTSequence
 
 std::vector<WorldCPTSequence> g_world_cpt_sequences;
 
+std::shared_ptr<StaticMesh> g_world_full_level_mesh;
+std::shared_ptr<std::vector<std::array<float, 3>>> g_world_full_level_normals;
+
+// v10.1 experimental full-level proof-of-life renderer. Unlike fixed/dynamic
+// packs, this aggregate is not used for geometry matching: it is a single host
+// draw containing every decoded *_ART_cN.cpt descriptor for the active level.
+// v9.9 has already applied each descriptor's exact NODE70 affine transform, so
+// this gives us the first way to inspect the complete PS3 world independently
+// of GameCube batch boundaries.
+std::shared_ptr<StaticMesh> BuildWorldCPTFullLevelMesh(
+    const std::vector<WorldCPTSequence>& sequences,
+    std::shared_ptr<std::vector<std::array<float, 3>>>* out_normals)
+{
+  if (!out_normals)
+    return {};
+
+  auto full = std::make_shared<StaticMesh>();
+  Submesh merged;
+  merged.has_uv0 = true;
+  merged.has_uv1 = true;
+  merged.has_normal = true;
+  merged.vertex_stride = 32;
+
+  std::size_t vertex_base = 0;
+  std::size_t total_indices = 0;
+  std::size_t member_ordinal = 0;
+  std::size_t synthesized_normal_members = 0;
+  std::size_t synthesized_normal_vertices = 0;
+  std::size_t synthesized_uv1_members = 0;
+  bool have_attributes = false;
+
+  for (const auto& sequence : sequences)
+  {
+    for (const auto& mesh : sequence.meshes)
+    {
+      if (!mesh || mesh->submeshes.size() != 1)
+        continue;
+      const auto& sub = mesh->submeshes[0];
+      if (!sub.vertex_count || sub.position_uv.size() != sub.vertex_count ||
+          sub.indices.empty() || (sub.indices.size() % 3) != 0)
+        continue;
+
+      if (vertex_base + sub.vertex_count > 65535u ||
+          total_indices + sub.indices.size() > 300000u)
+      {
+        std::fprintf(stderr,
+                     "[moh-ps3-world-full] BUILD REJECT: vertices=%zu+%u indices=%zu+%zu exceed host aggregate limits\n",
+                     vertex_base, sub.vertex_count, total_indices, sub.indices.size());
+        return {};
+      }
+
+      if (!have_attributes)
+      {
+        merged.attributes = sub.attributes;
+        have_attributes = true;
+      }
+
+      // A small subset of CPT descriptors uses the compact 20-byte stream
+      // (position + UV0 only).  v10.1 ANDed has_normal/has_uv1 across every
+      // descriptor, so those few meshes invalidated the whole 770-mesh level.
+      // For the full-level proof-of-life draw, rebuild missing vertex normals
+      // from authored triangle geometry and mirror UV0 into UV1 when the
+      // descriptor has no secondary/lightmap coordinate.
+      auto vertices = sub.position_uv;
+      if (!sub.has_normal)
+      {
+        std::vector<std::array<float, 3>> accumulated(vertices.size(), {0.0f, 0.0f, 0.0f});
+        for (std::size_t tri = 0; tri + 2 < sub.indices.size(); tri += 3)
+        {
+          const u16 ia = sub.indices[tri + 0];
+          const u16 ib = sub.indices[tri + 1];
+          const u16 ic = sub.indices[tri + 2];
+          if (ia >= vertices.size() || ib >= vertices.size() || ic >= vertices.size())
+            continue;
+
+          const auto& a = vertices[ia].position;
+          const auto& b = vertices[ib].position;
+          const auto& c = vertices[ic].position;
+          const float abx = b[0] - a[0];
+          const float aby = b[1] - a[1];
+          const float abz = b[2] - a[2];
+          const float acx = c[0] - a[0];
+          const float acy = c[1] - a[1];
+          const float acz = c[2] - a[2];
+          const std::array<float, 3> n{
+              aby * acz - abz * acy,
+              abz * acx - abx * acz,
+              abx * acy - aby * acx};
+          const float length2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+          if (!std::isfinite(length2) || length2 <= 1.0e-18f)
+            continue;
+          for (const u16 index : {ia, ib, ic})
+          {
+            accumulated[index][0] += n[0];
+            accumulated[index][1] += n[1];
+            accumulated[index][2] += n[2];
+          }
+        }
+
+        for (std::size_t i = 0; i < vertices.size(); ++i)
+        {
+          auto n = accumulated[i];
+          const float length2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+          if (std::isfinite(length2) && length2 > 1.0e-18f)
+          {
+            const float inverse_length = 1.0f / std::sqrt(length2);
+            n[0] *= inverse_length;
+            n[1] *= inverse_length;
+            n[2] *= inverse_length;
+          }
+          else
+          {
+            // Degenerate/unreferenced vertices are harmless in this debug
+            // aggregate; keep a finite fallback so the host stream is valid.
+            n = {0.0f, 0.0f, 1.0f};
+          }
+          vertices[i].normal = n;
+        }
+        ++synthesized_normal_members;
+        synthesized_normal_vertices += vertices.size();
+      }
+
+      if (!sub.has_uv1)
+      {
+        for (auto& vertex : vertices)
+          vertex.uv1 = vertex.uv0;
+        ++synthesized_uv1_members;
+      }
+
+      merged.material_hints.push_back(
+          "@cpt-full-span=member:" + std::to_string(member_ordinal) +
+          ";source:" + mesh->source_name +
+          ";first-index:" + std::to_string(total_indices) +
+          ";index-count:" + std::to_string(sub.indices.size()) +
+          ";first-vertex:" + std::to_string(vertex_base) +
+          ";vertex-count:" + std::to_string(sub.vertex_count));
+      for (const std::string& hint : sub.material_hints)
+      {
+        if (hint.rfind("@cpt-", 0) == 0)
+          merged.material_hints.push_back("@cpt-full-member=" +
+                                          std::to_string(member_ordinal) + ";" + hint);
+      }
+
+      merged.position_uv.insert(merged.position_uv.end(), vertices.begin(), vertices.end());
+      for (u16 index : sub.indices)
+      {
+        const std::size_t shifted = vertex_base + index;
+        if (shifted > 65535u)
+          return {};
+        merged.indices.push_back(static_cast<u16>(shifted));
+      }
+
+      vertex_base += sub.vertex_count;
+      total_indices += sub.indices.size();
+      ++member_ordinal;
+    }
+  }
+
+  if (!have_attributes || merged.position_uv.empty() || merged.indices.empty())
+    return {};
+
+  // Every aggregate vertex now has a finite normal and both UV channels,
+  // either authored by the PS3 CPT or synthesized above.
+  merged.has_uv0 = true;
+  merged.has_uv1 = true;
+  merged.has_normal = true;
+  merged.vertex_count = static_cast<u32>(merged.position_uv.size());
+  merged.index_count = static_cast<u32>(merged.indices.size());
+
+  auto normals = std::make_shared<std::vector<std::array<float, 3>>>();
+  normals->reserve(merged.position_uv.size());
+  for (const auto& vertex : merged.position_uv)
+    normals->push_back(vertex.normal);
+
+  std::fprintf(stderr,
+               "[moh-ps3-world-full] STREAM NORMALIZED: members=%zu vertices=%zu "
+               "indices=%zu synth-normal-members=%zu synth-normal-verts=%zu "
+               "synth-uv1-members=%zu\n",
+               member_ordinal, merged.position_uv.size(), merged.indices.size(),
+               synthesized_normal_members, synthesized_normal_vertices,
+               synthesized_uv1_members);
+
+  full->source_name = "data/@host/full_level.cpt#cpt-full-level";
+  full->submeshes.push_back(std::move(merged));
+  *out_normals = std::move(normals);
+  return full;
+}
+
 std::string WorldDescriptorClaimKey(std::string_view source, std::size_t descriptor)
 {
   std::string key;
@@ -2110,6 +2373,19 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
   if (gc_bones.empty())
     return;
 
+  pair->gc_skin_groups.clear();
+  pair->gc_skin_groups.reserve(gc_group_count);
+
+  for (u32 i = 0; i < gc_group_count; ++i)
+  {
+    const u8* q =
+        gc_bytes.data() + gc_group_offset +
+        static_cast<std::size_t>(i) * 4;
+
+    pair->gc_skin_groups.push_back(
+        {q[0], q[1], BE16(q + 2)});
+  }
+
   const auto index_group_key = [](u32 bone_a, u32 bone_b, int blend_q) {
     return std::to_string(bone_a) + "\n" + std::to_string(bone_b) + "\n" +
            std::to_string(blend_q);
@@ -2207,6 +2483,8 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
       !bone_order_conflict &&
       bone_order_anchors >= required_anchors;
 
+  pair->gc_bone_order_proven = bone_order_proven;
+
   pair->ps3_group_to_gc.assign(decoded.skin_groups.size(), -1);
   pair->mapped_skin_groups = 0;
 
@@ -2217,6 +2495,13 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
 
   std::size_t swapped_equivalent_groups = 0;
   std::size_t structural_index_groups = 0;
+
+  // PS3 export can re-quantize the old 4.12 coefficient by a few integer
+  // units while preserving the exact two bone refs. Only bridge a UNIQUE
+  // nearest GC group and only inside this extremely small error window.
+  constexpr int kBlendQRequantizationTolerance = 4;
+  std::size_t requantized_groups = 0;
+  int maximum_requantized_delta = 0;
 
   for (std::size_t i = 0; i < decoded.skin_groups.size(); ++i)
   {
@@ -2287,6 +2572,226 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
       }
     }
 
+    // v12.3: generic character models may keep the same exact
+    // two-bone semantic group but use a slightly different authored q value.
+    //
+    // Mapping != transform equality:
+    // we only identify which GC group owns these vertices here.
+    // The renderer later reconstructs local space from the exact GC q.
+    if (!matches && bone_order_proven &&
+        !IsSupportedPlayerWeaponDMF(
+            CanonicalDMFName(pair->ps3->source_name)) &&
+        blend_q >= 0 && blend_q <= 4096)
+    {
+      constexpr int maximum_delta = 96;
+      constexpr int minimum_margin = 24;
+
+      int best_delta = std::numeric_limits<int>::max();
+      int second_delta = std::numeric_limits<int>::max();
+      int best_q = -1;
+      s16 best_gc_group = -1;
+
+      for (std::size_t gc_index = 0;
+           gc_index < pair->gc_skin_groups.size();
+           ++gc_index)
+      {
+        const auto& gc = pair->gc_skin_groups[gc_index];
+
+        int comparable_q = -1;
+
+        if (gc.bone_a == group.bone_a &&
+            gc.bone_b == group.bone_b)
+        {
+          comparable_q = gc.blend_q;
+        }
+        else if (gc.bone_a == group.bone_b &&
+                 gc.bone_b == group.bone_a &&
+                 gc.blend_q <= 4096)
+        {
+          comparable_q = 4096 - gc.blend_q;
+        }
+        else
+        {
+          continue;
+        }
+
+        const int delta =
+            std::abs(comparable_q - blend_q);
+
+        if (delta < best_delta)
+        {
+          second_delta = best_delta;
+          best_delta = delta;
+          best_q = comparable_q;
+          best_gc_group =
+              static_cast<s16>(gc_index);
+        }
+        else if (delta < second_delta)
+        {
+          second_delta = delta;
+        }
+      }
+
+      if (best_gc_group >= 0 &&
+          best_delta <= maximum_delta &&
+          (second_delta ==
+               std::numeric_limits<int>::max() ||
+           second_delta - best_delta >=
+               minimum_margin))
+      {
+        pair->ps3_group_to_gc[i] =
+            best_gc_group;
+
+        ++pair->mapped_skin_groups;
+
+        // Do NOT confuse structural group association with transform
+        // equivalence. qPS3 != qGC means this character body still needs a
+        // real cross-platform bind proof before using the GC XF group.
+        g_dmf_nonexact_skin_group_models.insert(
+            CanonicalDMFName(pair->ps3->source_name));
+
+        static unsigned logs = 0;
+
+        if (logs++ < 64)
+        {
+          std::fprintf(
+              stderr,
+              "[moh-ps3-dmf] GC-BIND GROUP MAP: "
+              "ps3=%s group=%zu bones=%u/%u "
+              "ps3_q=%d -> gc_group=%d "
+              "gc_q=%d delta=%d/4096 | "
+              "exact GC bind selected\n",
+              pair->ps3->source_name.c_str(),
+              i,
+              group.bone_a,
+              group.bone_b,
+              blend_q,
+              best_gc_group,
+              best_q,
+              best_delta);
+        }
+
+        continue;
+      }
+    }
+
+    // v12.2: exact-bones / near-identical-q bridge.
+    //
+    // This runs only after:
+    //   * string identity failed;
+    //   * swapped exact identity failed;
+    //   * bone-index ordering was independently proven;
+    //   * exact index/q identity failed.
+    //
+    // A PS3 q may differ by a few 1/4096 units after remaster export.
+    // Require the nearest GC group to be UNIQUE and <= 4/4096 away.
+    if (!matches && bone_order_proven &&
+        !IsSupportedPlayerWeaponDMF(
+            CanonicalDMFName(pair->ps3->source_name)) &&
+        blend_q >= 0 && blend_q <= 4096)
+    {
+      int best_delta = 0x7fffffff;
+      int second_delta = 0x7fffffff;
+      s16 best_gc_group = -1;
+      int best_gc_q = -1;
+
+      for (u32 gc_index = 0; gc_index < gc_group_count; ++gc_index)
+      {
+        const u8* gc =
+            gc_bytes.data() + gc_group_offset +
+            static_cast<std::size_t>(gc_index) * 4;
+
+        const u8 gc_a = gc[0];
+        const u8 gc_b = gc[1];
+        const int gc_q = BE16(gc + 2);
+
+        int comparable_q = -1;
+
+        if (gc_a == group.bone_a &&
+            gc_b == group.bone_b)
+        {
+          comparable_q = gc_q;
+        }
+        else if (gc_a == group.bone_b &&
+                 gc_b == group.bone_a &&
+                 gc_q >= 0 && gc_q <= 4096)
+        {
+          comparable_q = 4096 - gc_q;
+        }
+        else
+        {
+          continue;
+        }
+
+        const int delta = std::abs(comparable_q - blend_q);
+
+        if (delta < best_delta)
+        {
+          second_delta = best_delta;
+          best_delta = delta;
+          best_gc_group = static_cast<s16>(gc_index);
+          best_gc_q = comparable_q;
+        }
+        else if (delta < second_delta)
+        {
+          second_delta = delta;
+        }
+      }
+
+      if (best_gc_group >= 0 &&
+          best_delta <= kBlendQRequantizationTolerance &&
+          second_delta > best_delta)
+      {
+        pair->ps3_group_to_gc[i] = best_gc_group;
+        ++pair->mapped_skin_groups;
+        ++requantized_groups;
+        maximum_requantized_delta =
+            std::max(maximum_requantized_delta, best_delta);
+
+        static unsigned requantized_logs = 0;
+        if (requantized_logs++ < 64)
+        {
+          std::fprintf(
+              stderr,
+              "[moh-ps3-dmf] REQUANTIZED GROUP: ps3=%s "
+              "ps3_group=%zu bones=%u/%u q=%d -> "
+              "gc_group=%d q=%d delta=%d/4096\n",
+              pair->ps3->source_name.c_str(),
+              i,
+              group.bone_a,
+              group.bone_b,
+              blend_q,
+              best_gc_group,
+              best_gc_q,
+              best_delta);
+        }
+
+        continue;
+      }
+      else if (best_gc_group >= 0)
+      {
+        static unsigned nearest_reject_logs = 0;
+        if (nearest_reject_logs++ < 64)
+        {
+          std::fprintf(
+              stderr,
+              "[moh-ps3-dmf] REQUANTIZED GROUP REJECT: ps3=%s "
+              "group=%zu bones=%u/%u q=%d nearest_gc=%d "
+              "nearest_q=%d delta=%d second=%d limit=%d\n",
+              pair->ps3->source_name.c_str(),
+              i,
+              group.bone_a,
+              group.bone_b,
+              blend_q,
+              best_gc_group,
+              best_gc_q,
+              best_delta,
+              second_delta,
+              kBlendQRequantizationTolerance);
+        }
+      }
+    }
+
     if (!matches || matches->empty() || !occurrence)
       continue;
 
@@ -2308,7 +2813,9 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
       ++structural_index_groups;
   }
 
-  if (swapped_equivalent_groups != 0 || structural_index_groups != 0)
+  if (swapped_equivalent_groups != 0 ||
+      structural_index_groups != 0 ||
+      requantized_groups != 0)
   {
     static unsigned structural_map_logs = 0;
     if (structural_map_logs++ < 64)
@@ -2316,13 +2823,16 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
       std::fprintf(
           stderr,
           "[moh-ps3-dmf] EXTENDED GROUP MAP: ps3=%s mapped=%zu/%zu "
-          "swapped=%zu structural_index=%zu bone_order=%s anchors=%zu | "
-          "no fuzzy mapping\n",
+          "swapped=%zu structural_index=%zu requantized=%zu "
+          "max_q_delta=%d/4096 bone_order=%s anchors=%zu | "
+          "strict structural mapping\n",
           pair->ps3->source_name.c_str(),
           pair->mapped_skin_groups,
           decoded.skin_groups.size(),
           swapped_equivalent_groups,
           structural_index_groups,
+          requantized_groups,
+          maximum_requantized_delta,
           bone_order_proven ? "proven" : "unproven",
           bone_order_anchors);
     }
@@ -2534,6 +3044,7 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
   g_dmf_palette_flow_clusters.clear();
   g_dmf_palette_flow_analyses.clear();
   g_dmf_palette_flow_material_attempts.clear();
+  g_dmf_nonexact_skin_group_models.clear();
   if (level.empty())
     return;
 
@@ -2731,6 +3242,8 @@ void ClearMSHCache()
   g_world_dynamic_descriptor_claims.clear();
   g_world_direct_descriptor_keys.clear();
   g_world_cpt_sequences.clear();
+  g_world_full_level_mesh.reset();
+  g_world_full_level_normals.reset();
   g_current_draw = {};
   g_current_draw_transient_world = false;
   g_current_world_direct_key = 0;
@@ -2772,6 +3285,7 @@ void PreloadCurrentLevelMSH(std::string_view level)
   std::unordered_map<std::string, std::shared_ptr<StaticMesh>> next;
   std::size_t candidates = 0;
   std::size_t decoded = 0;
+  std::size_t recognized_no_draw = 0;
   std::size_t rejected = 0;
 
   for (const auto& asset : PS3RemasterAssets::GetAssets())
@@ -2792,9 +3306,57 @@ void PreloadCurrentLevelMSH(std::string_view level)
 
     auto mesh = std::make_shared<StaticMesh>();
     mesh->source_name = asset.relative_path;
-    if (!ParseMSHv8(bytes, mesh.get()) || !IsHostRenderable(*mesh))
+
+    const bool parsed = ParseMSHv8(bytes, mesh.get());
+    const bool renderable = parsed && IsHostRenderable(*mesh);
+
+    const std::string no_draw_name =
+        Lower(asset.relative_path);
+
+    const bool intentional_no_draw =
+        !parsed &&
+        bytes.size() <= 256 &&
+        (no_draw_name.find(
+             "invisblocker") !=
+             std::string::npos ||
+         no_draw_name.find(
+             "invisibleblocker") !=
+             std::string::npos);
+
+    if (intentional_no_draw)
+    {
+      ++decoded;
+      ++recognized_no_draw;
+
+      std::fprintf(
+          stderr,
+          "[moh-ps3-msh] READY NO-DRAW: "
+          "%s size=%zu | "
+          "invisible/collision-only resource\n",
+          asset.relative_path.c_str(),
+          bytes.size());
+
+      continue;
+    }
+
+    if (!renderable)
     {
       ++rejected;
+
+      static unsigned msh_decode_reject_logs = 0;
+      if (msh_decode_reject_logs++ < 64)
+      {
+        std::fprintf(
+            stderr,
+            "[moh-ps3-msh] DECODE REJECT DETAIL: %s size=%zu "
+            "parsed=%d host_renderable=%d submeshes=%zu\n",
+            asset.relative_path.c_str(),
+            bytes.size(),
+            parsed ? 1 : 0,
+            renderable ? 1 : 0,
+            mesh->submeshes.size());
+      }
+
       continue;
     }
 
@@ -2826,6 +3388,8 @@ void PreloadCurrentLevelMSH(std::string_view level)
   std::size_t world_meshes = 0;
   std::size_t world_packs = 0;
   std::vector<WorldCPTSequence> next_world_sequences;
+  std::shared_ptr<StaticMesh> next_world_full_level_mesh;
+  std::shared_ptr<std::vector<std::array<float, 3>>> next_world_full_level_normals;
   if (PS3WorldGeometry::Enabled())
   {
     const bool build_packs = EnvSwitchLocal("MOH_PS3_CPT_GEOMETRY_PACKS", true);
@@ -2879,6 +3443,26 @@ void PreloadCurrentLevelMSH(std::string_view level)
         }
       }
     }
+    if (IsFullCPTLevelRenderEnabled())
+    {
+      next_world_full_level_mesh =
+          BuildWorldCPTFullLevelMesh(next_world_sequences, &next_world_full_level_normals);
+      if (next_world_full_level_mesh && !next_world_full_level_mesh->submeshes.empty())
+      {
+        const auto& full = next_world_full_level_mesh->submeshes[0];
+        std::fprintf(stderr,
+                     "[moh-ps3-world-full] READY: level=%.*s members=%zu vertices=%u triangles=%zu indices=%zu | NODE70 world aggregate ready; material split remains diagnostic\n",
+                     static_cast<int>(level.size()), level.data(), world_meshes,
+                     full.vertex_count, full.indices.size() / 3, full.indices.size());
+      }
+      else
+      {
+        std::fprintf(stderr,
+                     "[moh-ps3-world-full] BUILD FAILED: level=%.*s | normal CPT renderer retained\n",
+                     static_cast<int>(level.size()), level.data());
+      }
+    }
+
     std::fprintf(stderr,
                  "[moh-ps3-world-geo] CACHE READY: level=%.*s chunks=%zu descriptors=%zu inline=%zu rsx=%zu meshes=%zu packs=%zu duplicate=%zu rejected=%zu | renderer=PS3MeshPort strict-bootstrap\n",
                  static_cast<int>(level.size()), level.data(), world_cpt_chunks,
@@ -2896,12 +3480,16 @@ void PreloadCurrentLevelMSH(std::string_view level)
     g_world_dynamic_descriptor_claims.clear();
     g_world_direct_descriptor_keys.clear();
     g_world_cpt_sequences = std::move(next_world_sequences);
+    g_world_full_level_mesh = std::move(next_world_full_level_mesh);
+    g_world_full_level_normals = std::move(next_world_full_level_normals);
     g_msh_cache = std::move(next);
   }
 
   std::fprintf(stderr,
-               "[moh-ps3-msh] ALL-MSH cache ready: level=%.*s candidates=%zu decoded=%zu rejected=%zu keys=%zu\n",
-               static_cast<int>(level.size()), level.data(), candidates, decoded, rejected,
+               "[moh-ps3-msh] ALL-MSH cache ready: level=%.*s "
+               "candidates=%zu decoded=%zu nodraw=%zu rejected=%zu keys=%zu\n",
+               static_cast<int>(level.size()), level.data(),
+               candidates, decoded, recognized_no_draw, rejected,
                CachedMSHCount());
 
   IndexOriginalGCLevelMSHSignatures(level);
@@ -2967,6 +3555,539 @@ void PreloadCurrentLevelDMF(std::string_view level)
                      "[moh-ps3-dmf] DECODE REJECT: %s size=%zu groups=%u@%08X materials=%u@%08X textures@%08X bones=%u@%08X | resource remains identity-only GC fallback\n",
                      asset.relative_path.c_str(), bytes.size(), groups, group_off, materials,
                      material_off, texture_off, bones, bone_off);
+
+
+        const auto probe_fail =
+            [&](u32 material, u32 cluster, const char* stage,
+                u32 a = 0, u32 b = 0, u32 c = 0, u32 d = 0)
+        {
+          std::fprintf(
+              stderr,
+              "[moh-ps3-dmf] 0502 FIRST FAIL: %s "
+              "material=%u cluster=%u stage=%s "
+              "a=%08X b=%08X c=%08X d=%08X\n",
+              asset.relative_path.c_str(),
+              material,
+              cluster,
+              stage,
+              a, b, c, d);
+        };
+
+        bool probe_reported = false;
+
+        // Bone-ref table.
+        if (!probe_reported)
+        {
+          if (!bones || bones > 4096 ||
+              bone_off > bytes.size() ||
+              static_cast<std::size_t>(bones) * 16 >
+                  bytes.size() - bone_off)
+          {
+            probe_fail(0, 0, "bone-table",
+                       bones, bone_off,
+                       static_cast<u32>(bytes.size()), 0);
+            probe_reported = true;
+          }
+          else
+          {
+            for (u32 bone = 0; bone < bones; ++bone)
+            {
+              const std::string name =
+                  FixedString(bytes.data() + bone_off +
+                                  static_cast<std::size_t>(bone) * 16,
+                              16);
+
+              if (name.empty())
+              {
+                probe_fail(0, 0, "empty-bone-ref",
+                           bone, bone_off +
+                                     static_cast<u32>(bone * 16),
+                           0, 0);
+                probe_reported = true;
+                break;
+              }
+            }
+          }
+        }
+
+        // Skin group table.
+        if (!probe_reported)
+        {
+          if (!groups || groups > 4096 ||
+              group_off > bytes.size() ||
+              static_cast<std::size_t>(groups) * 28 >
+                  bytes.size() - group_off)
+          {
+            probe_fail(0, 0, "skin-group-table",
+                       groups, group_off,
+                       static_cast<u32>(bytes.size()), 0);
+            probe_reported = true;
+          }
+          else
+          {
+            for (u32 group = 0; group < groups; ++group)
+            {
+              const u8* g =
+                  bytes.data() + group_off +
+                  static_cast<std::size_t>(group) * 28;
+
+              const u8 bone_a = g[0];
+              const u8 bone_b = g[4];
+              const float blend = BEFloat(g + 8);
+              const float blend_q = blend * 4096.0f;
+
+              if (bone_a >= bones || bone_b >= bones ||
+                  !std::isfinite(blend) ||
+                  !std::isfinite(blend_q) ||
+                  blend_q < -0.5f ||
+                  blend_q > 65535.5f)
+              {
+                probe_fail(0, group, "skin-group-record",
+                           bone_a, bone_b,
+                           static_cast<u32>(
+                               std::max(0.0f, blend_q)),
+                           0);
+                probe_reported = true;
+                break;
+              }
+
+              for (unsigned aux = 0; aux < 4; ++aux)
+              {
+                const float value =
+                    BEFloat(g + 12 + aux * 4);
+
+                if (!std::isfinite(value))
+                {
+                  probe_fail(0, group,
+                             "skin-group-aux-nonfinite",
+                             aux, 0, 0, 0);
+                  probe_reported = true;
+                  break;
+                }
+              }
+
+              if (probe_reported)
+                break;
+            }
+          }
+        }
+
+        // Material/cluster stream.
+        if (!probe_reported)
+        {
+          if (materials > 1024 ||
+              material_off > bytes.size() ||
+              static_cast<std::size_t>(materials) * 60 >
+                  bytes.size() - material_off)
+          {
+            probe_fail(0, 0, "material-table",
+                       materials, material_off,
+                       static_cast<u32>(bytes.size()), 0);
+            probe_reported = true;
+          }
+        }
+
+        if (!probe_reported)
+        {
+          for (u32 material = 0;
+               material < materials && !probe_reported;
+               ++material)
+          {
+            const u8* m =
+                bytes.data() + material_off +
+                static_cast<std::size_t>(material) * 60;
+
+            const u32 texture_index = BE32(m + 44);
+            const u32 cluster_count = BE32(m + 48);
+            u32 palette = BE32(m + 52);
+            u32 geometry = BE32(m + 56);
+
+            if (cluster_count > 8192 ||
+                palette > bytes.size() ||
+                geometry > bytes.size())
+            {
+              probe_fail(material, 0,
+                         "material-head",
+                         texture_index,
+                         cluster_count,
+                         palette,
+                         geometry);
+              probe_reported = true;
+              break;
+            }
+
+            for (u32 cluster = 0;
+                 cluster < cluster_count;
+                 ++cluster)
+            {
+              if (palette > bytes.size() ||
+                  bytes.size() - palette < 4)
+              {
+                probe_fail(material, cluster,
+                           "palette-header-oob",
+                           palette, geometry,
+                           cluster_count,
+                           static_cast<u32>(bytes.size()));
+                probe_reported = true;
+                break;
+              }
+
+              if (geometry > bytes.size() ||
+                  bytes.size() - geometry < 12)
+              {
+                probe_fail(material, cluster,
+                           "geometry-header-oob",
+                           palette, geometry,
+                           cluster_count,
+                           static_cast<u32>(bytes.size()));
+                probe_reported = true;
+                break;
+              }
+
+              const u8 palette_count =
+                  bytes[palette + 2];
+
+              const std::size_t palette_bytes =
+                  4 +
+                  static_cast<std::size_t>(
+                      palette_count) * 2;
+
+              if (!palette_count)
+              {
+                probe_fail(material, cluster,
+                           "zero-palette",
+                           palette, geometry,
+                           0, 0);
+                probe_reported = true;
+                break;
+              }
+
+              if (palette_bytes >
+                  bytes.size() - palette)
+              {
+                probe_fail(material, cluster,
+                           "palette-size-oob",
+                           palette_count,
+                           static_cast<u32>(
+                               palette_bytes),
+                           palette,
+                           geometry);
+                probe_reported = true;
+                break;
+              }
+
+              for (u8 slot = 0;
+                   slot < palette_count;
+                   ++slot)
+              {
+                const u16 group =
+                    BE16(bytes.data() +
+                         palette + 4 +
+                         static_cast<std::size_t>(
+                             slot) * 2);
+
+                if (group >= groups)
+                {
+                  probe_fail(material, cluster,
+                             "palette-group-oob",
+                             slot, group,
+                             groups, palette);
+                  probe_reported = true;
+                  break;
+                }
+              }
+
+              if (probe_reported)
+                break;
+
+              palette +=
+                  static_cast<u32>(
+                      palette_bytes);
+
+              const u32 index_count =
+                  BE32(bytes.data() + geometry);
+
+              const u32 vertex_count =
+                  BE32(bytes.data() +
+                       geometry + 4);
+
+              const u8 stride =
+                  bytes[geometry + 8];
+
+              const u8 attribute_count =
+                  bytes[geometry + 9];
+
+              if (!index_count ||
+                  !vertex_count ||
+                  index_count >
+                      16 * 1024 * 1024 ||
+                  vertex_count >
+                      4 * 1024 * 1024 ||
+                  (index_count % 3) != 0)
+              {
+                probe_fail(material, cluster,
+                           "geometry-counts",
+                           index_count,
+                           vertex_count,
+                           stride,
+                           attribute_count);
+                probe_reported = true;
+                break;
+              }
+
+              if (stride < 30 ||
+                  stride > 192)
+              {
+                probe_fail(material, cluster,
+                           "vertex-stride",
+                           stride,
+                           index_count,
+                           vertex_count,
+                           geometry);
+                probe_reported = true;
+                break;
+              }
+
+              if (attribute_count > 32)
+              {
+                probe_fail(material, cluster,
+                           "attribute-count",
+                           attribute_count,
+                           stride,
+                           geometry, 0);
+                probe_reported = true;
+                break;
+              }
+
+              const std::size_t attribute_start =
+                  static_cast<std::size_t>(
+                      geometry) + 12;
+
+              const std::size_t attribute_bytes =
+                  static_cast<std::size_t>(
+                      attribute_count) * 4;
+
+              if (attribute_start >
+                      bytes.size() ||
+                  attribute_bytes >
+                      bytes.size() -
+                          attribute_start)
+              {
+                probe_fail(material, cluster,
+                           "attributes-oob",
+                           static_cast<u32>(
+                               attribute_start),
+                           static_cast<u32>(
+                               attribute_bytes),
+                           geometry, stride);
+                probe_reported = true;
+                break;
+              }
+
+              bool duplicate_position = false;
+              bool duplicate_normal = false;
+              bool duplicate_uv = false;
+              bool have_position = false;
+              bool have_normal = false;
+              bool have_uv = false;
+
+              for (u8 attribute = 0;
+                   attribute < attribute_count;
+                   ++attribute)
+              {
+                const u8* d =
+                    bytes.data() +
+                    attribute_start +
+                    static_cast<std::size_t>(
+                        attribute) * 4;
+
+                if (d[3] >= stride)
+                {
+                  probe_fail(material, cluster,
+                             "attribute-offset",
+                             attribute,
+                             d[0], d[3],
+                             stride);
+                  probe_reported = true;
+                  break;
+                }
+
+                if (d[0] == 0)
+                {
+                  duplicate_position =
+                      have_position;
+                  have_position = true;
+                }
+                else if (d[0] == 2)
+                {
+                  duplicate_normal =
+                      have_normal;
+                  have_normal = true;
+                }
+                else if (d[0] == 8)
+                {
+                  duplicate_uv =
+                      have_uv;
+                  have_uv = true;
+                }
+              }
+
+              if (probe_reported)
+                break;
+
+              if (duplicate_position ||
+                  duplicate_normal ||
+                  duplicate_uv)
+              {
+                probe_fail(material, cluster,
+                           "duplicate-semantic",
+                           duplicate_position,
+                           duplicate_normal,
+                           duplicate_uv, 0);
+                probe_reported = true;
+                break;
+              }
+
+              const std::size_t vertex_start =
+                  attribute_start +
+                  attribute_bytes;
+
+              const std::size_t vertex_bytes =
+                  static_cast<std::size_t>(
+                      vertex_count) *
+                  stride;
+
+              if (vertex_start >
+                      bytes.size() ||
+                  vertex_bytes >
+                      bytes.size() -
+                          vertex_start)
+              {
+                probe_fail(material, cluster,
+                           "vertices-oob",
+                           static_cast<u32>(
+                               vertex_start),
+                           static_cast<u32>(
+                               vertex_bytes),
+                           vertex_count,
+                           stride);
+                probe_reported = true;
+                break;
+              }
+
+              // Current ordinary-0502 layout uses BE16
+              // palette slot at vertex+28.
+              for (u32 vertex = 0;
+                   vertex < vertex_count;
+                   ++vertex)
+              {
+                const u8* v =
+                    bytes.data() +
+                    vertex_start +
+                    static_cast<std::size_t>(
+                        vertex) * stride;
+
+                const u16 slot =
+                    BE16(v + 28);
+
+                if (slot >= palette_count)
+                {
+                  probe_fail(material, cluster,
+                             "vertex-palette-slot",
+                             vertex,
+                             slot,
+                             palette_count,
+                             stride);
+                  probe_reported = true;
+                  break;
+                }
+              }
+
+              if (probe_reported)
+                break;
+
+              const std::size_t index_start =
+                  vertex_start +
+                  vertex_bytes;
+
+              const std::size_t index_bytes =
+                  static_cast<std::size_t>(
+                      index_count) * 2;
+
+              if (index_start >
+                      bytes.size() ||
+                  index_bytes >
+                      bytes.size() -
+                          index_start)
+              {
+                probe_fail(material, cluster,
+                           "indices-oob",
+                           static_cast<u32>(
+                               index_start),
+                           static_cast<u32>(
+                               index_bytes),
+                           index_count, 0);
+                probe_reported = true;
+                break;
+              }
+
+              for (u32 index = 0;
+                   index < index_count;
+                   ++index)
+              {
+                const u16 value =
+                    BE16(bytes.data() +
+                         index_start +
+                         static_cast<std::size_t>(
+                             index) * 2);
+
+                if (value >= vertex_count)
+                {
+                  probe_fail(material, cluster,
+                             "index-out-of-range",
+                             index,
+                             value,
+                             vertex_count, 0);
+                  probe_reported = true;
+                  break;
+                }
+              }
+
+              if (probe_reported)
+                break;
+
+              const std::size_t next =
+                  (index_start +
+                   index_bytes + 15) &
+                  ~std::size_t(15);
+
+              if (next > bytes.size())
+              {
+                probe_fail(material, cluster,
+                           "next-geometry-oob",
+                           static_cast<u32>(next),
+                           geometry,
+                           index_count,
+                           vertex_count);
+                probe_reported = true;
+                break;
+              }
+
+              geometry =
+                  static_cast<u32>(next);
+            }
+          }
+        }
+
+        if (!probe_reported)
+        {
+          std::fprintf(
+              stderr,
+              "[moh-ps3-dmf] 0502 FIRST FAIL: %s "
+              "probe reached end of ordinary layout; "
+              "failure is inside RSX component decoding/bind validation\n",
+              asset.relative_path.c_str());
+        }
       }
       // Keep the exact resource/name available even when a platform-layout
       // variant is not yet geometry-decodable. It must remain GC-rendered.
@@ -3209,6 +4330,42 @@ std::size_t CachedEMTCount()
 {
   std::scoped_lock lock(g_emt_cache_mutex);
   return g_emt_cache.size();
+}
+
+bool IsFullCPTLevelRenderEnabled()
+{
+  if (!PS3WorldGeometry::Enabled() ||
+      !EnvSwitchLocal("MOH_PS3_CPT_FULL_LEVEL", false))
+  {
+    return false;
+  }
+
+  // v10.3 safety gate: v10.1/v10.2 proved that a raw aggregate of every CPT
+  // descriptor is not yet a valid world replacement. NODE70 gives each
+  // descriptor's local rigid transform, but successful direct/range matches
+  // still require an additional GC-world translation which differs between
+  // descriptor groups. Submitting the raw aggregate on an arbitrary GX world
+  // batch therefore duplicates the GC world and makes props/sections appear to
+  // float. Keep aggregate construction available for diagnostics, but require
+  // an explicit second opt-in before it can ever replace a draw.
+  const bool unsafe_raw_overlay =
+      EnvSwitchLocal("MOH_PS3_CPT_FULL_LEVEL_UNSAFE", false);
+  if (!unsafe_raw_overlay)
+  {
+    static bool logged_safe_hold = false;
+    if (!logged_safe_hold)
+    {
+      logged_safe_hold = true;
+      std::fprintf(stderr,
+                   "[moh-ps3-world-full] SAFE HOLD: raw full-level overlay disabled; "
+                   "NODE70 descriptors still require per-group GC-world anchors. "
+                   "Normal CPT direct/range replacement remains active. "
+                   "Set MOH_PS3_CPT_FULL_LEVEL_UNSAFE=1 only for geometry diagnostics.\n");
+    }
+    return false;
+  }
+
+  return true;
 }
 
 bool IsStaticDrawReplacementEnabled()
@@ -3977,6 +5134,24 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
       (!generic_exact && !IsSupportedPlayerWeaponDMF(draw.gc_name)))
     return {};
 
+
+  static const bool body_model_space = [] {
+    const char* value =
+        std::getenv("MOH_PS3_DMF_BODY_MODEL_SPACE");
+
+    return value != nullptr &&
+           value[0] != '\0' &&
+           value[0] != '0';
+  }();
+
+  if (draw.gc_material_name == "mohf_body" &&
+      (!body_model_space ||
+       g_dmf_nonexact_skin_group_models.contains(
+           std::string(draw.gc_name))))
+  {
+    return {};
+  }
+
   const auto& ready = draw.prepared->readiness;
   const auto& analysis = draw.prepared->analysis;
 
@@ -4132,6 +5307,16 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   // PS3 positions are model/bind-space. Use the inverse bind authored in THIS
   // DMF by ref index; do not require a sibling SKL and never estimate offsets.
   const auto& decoded = *draw.owner->decoded;
+
+  const ExactDMFPair* exact_pair = nullptr;
+
+  if (const auto it =
+          g_dmf_pairs.find(std::string(draw.gc_name));
+      it != g_dmf_pairs.end())
+  {
+    exact_pair = &it->second;
+  }
+
   if (!decoded.bind_tables_valid ||
       decoded.inverse_bind_by_ref.size() != decoded.bone_refs.size())
     return matrix_reject("dmf-bind-table-unavailable", 0, 0xffffu, 0xffffu, -1);
@@ -4201,113 +5386,724 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   };
 
   const auto build_group_transform =
-      [&](u16 ps3_group, std::array<float, 12>* position_transform,
-          std::array<float, 9>* normal_transform, bool* blended,
-          std::string_view* reason) {
-        if (!position_transform || !normal_transform || !blended || !reason)
+      [&](u16 ps3_group, s16 gc_group,
+          std::array<float, 12>* position_transform,
+          std::array<float, 9>* normal_transform,
+          bool* blended,
+          std::string_view* reason)
+      {
+        if (!position_transform ||
+            !normal_transform ||
+            !blended ||
+            !reason)
           return false;
+
         *blended = false;
         *reason = "unknown-bind-transform";
-        if (ps3_group >= decoded.skin_groups.size())
+
+        if (ps3_group >=
+            decoded.skin_groups.size())
         {
-          *reason = "ps3-skin-group-out-of-range";
+          *reason =
+              "ps3-skin-group-out-of-range";
           return false;
         }
 
-        const auto& group = decoded.skin_groups[ps3_group];
-        const float blend_q_float = group.blend * 4096.0f;
-        if (!std::isfinite(blend_q_float))
+        if (draw.gc_material_name == "mohf_body")
         {
-          *reason = "nonfinite-bind-weight";
+          // v12.6:
+          //
+          // v11/v12 used inverse(linear blend(bindA, bindB)).
+          // A linear blend of two substantially rotated 3x3 matrices is not
+          // necessarily rigid and can approach singularity. Its inverse can
+          // therefore send character vertices extremely far away.
+          //
+          // v12.5 tested the opposite hypothesis (identity/model-space) and
+          // proved that the retail GC XF matrix DOES expect group-local input.
+          //
+          // Build the group bind as a rigid transform instead:
+          //   rotation    = SLERP(bindB.rotation, bindA.rotation, q)
+          //   translation = LERP(bindB.translation, bindA.translation, q)
+          //   local_pos   = inverse(group_bind) * PS3_model_bind_pos
+          //
+          // q=0    -> bone_b
+          // q=4096 -> bone_a
+          //
+          // No offset, no scale, no AABB/centre correction.
+
+          if (!exact_pair ||
+              !exact_pair->gc_bone_order_proven ||
+              gc_group < 0 ||
+              static_cast<std::size_t>(gc_group) >=
+                  exact_pair->gc_skin_groups.size())
+          {
+            *reason = "body-gc-group-bind-unavailable";
+            return false;
+          }
+
+          const auto& gc =
+              exact_pair->gc_skin_groups[
+                  static_cast<std::size_t>(gc_group)];
+
+          // Do not extrapolate unproven legacy coefficients.
+          if (gc.blend_q > 4096 ||
+              gc.bone_a >= inverse_bind_by_ref.size() ||
+              gc.bone_b >= inverse_bind_by_ref.size())
+          {
+            *reason = "body-gc-group-bind-out-of-range";
+            return false;
+          }
+
+          std::array<float, 12> inverse_a{};
+          std::array<float, 12> inverse_b{};
+          std::array<float, 12> world_a{};
+          std::array<float, 12> world_b{};
+
+          if (!load_inverse_bind(gc.bone_a, &inverse_a) ||
+              !load_inverse_bind(gc.bone_b, &inverse_b) ||
+              !invert_affine(inverse_a, &world_a) ||
+              !invert_affine(inverse_b, &world_b))
+          {
+            *reason = "body-bone-bind-noninvertible";
+            return false;
+          }
+
+          // Quaternion layout: {w, x, y, z}.
+          using BodyQuat = std::array<float, 4>;
+
+          const auto normalize_quat =
+              [](BodyQuat* q)
+              {
+                if (!q)
+                  return false;
+
+                const double length2 =
+                    static_cast<double>((*q)[0]) * (*q)[0] +
+                    static_cast<double>((*q)[1]) * (*q)[1] +
+                    static_cast<double>((*q)[2]) * (*q)[2] +
+                    static_cast<double>((*q)[3]) * (*q)[3];
+
+                if (!std::isfinite(length2) ||
+                    length2 < 1.0e-12)
+                {
+                  return false;
+                }
+
+                const float inverse_length =
+                    static_cast<float>(
+                        1.0 / std::sqrt(length2));
+
+                for (float& value : *q)
+                {
+                  value *= inverse_length;
+
+                  if (!std::isfinite(value))
+                    return false;
+                }
+
+                return true;
+              };
+
+          const auto matrix_to_quat =
+              [&](const std::array<float, 12>& m,
+                  BodyQuat* out)
+              {
+                if (!out)
+                  return false;
+
+                const float m00 = m[0];
+                const float m01 = m[1];
+                const float m02 = m[2];
+
+                const float m10 = m[4];
+                const float m11 = m[5];
+                const float m12 = m[6];
+
+                const float m20 = m[8];
+                const float m21 = m[9];
+                const float m22 = m[10];
+
+                for (const float value :
+                     {m00, m01, m02,
+                      m10, m11, m12,
+                      m20, m21, m22})
+                {
+                  if (!std::isfinite(value))
+                    return false;
+                }
+
+                BodyQuat q{};
+
+                const float trace =
+                    m00 + m11 + m22;
+
+                if (trace > 0.0f)
+                {
+                  const float s =
+                      std::sqrt(trace + 1.0f) *
+                      2.0f;
+
+                  if (!std::isfinite(s) ||
+                      s < 1.0e-8f)
+                  {
+                    return false;
+                  }
+
+                  q[0] = 0.25f * s;
+                  q[1] = (m21 - m12) / s;
+                  q[2] = (m02 - m20) / s;
+                  q[3] = (m10 - m01) / s;
+                }
+                else if (m00 > m11 &&
+                         m00 > m22)
+                {
+                  const float s =
+                      std::sqrt(
+                          std::max(
+                              0.0f,
+                              1.0f + m00 -
+                                  m11 - m22)) *
+                      2.0f;
+
+                  if (!std::isfinite(s) ||
+                      s < 1.0e-8f)
+                  {
+                    return false;
+                  }
+
+                  q[0] = (m21 - m12) / s;
+                  q[1] = 0.25f * s;
+                  q[2] = (m01 + m10) / s;
+                  q[3] = (m02 + m20) / s;
+                }
+                else if (m11 > m22)
+                {
+                  const float s =
+                      std::sqrt(
+                          std::max(
+                              0.0f,
+                              1.0f + m11 -
+                                  m00 - m22)) *
+                      2.0f;
+
+                  if (!std::isfinite(s) ||
+                      s < 1.0e-8f)
+                  {
+                    return false;
+                  }
+
+                  q[0] = (m02 - m20) / s;
+                  q[1] = (m01 + m10) / s;
+                  q[2] = 0.25f * s;
+                  q[3] = (m12 + m21) / s;
+                }
+                else
+                {
+                  const float s =
+                      std::sqrt(
+                          std::max(
+                              0.0f,
+                              1.0f + m22 -
+                                  m00 - m11)) *
+                      2.0f;
+
+                  if (!std::isfinite(s) ||
+                      s < 1.0e-8f)
+                  {
+                    return false;
+                  }
+
+                  q[0] = (m10 - m01) / s;
+                  q[1] = (m02 + m20) / s;
+                  q[2] = (m12 + m21) / s;
+                  q[3] = 0.25f * s;
+                }
+
+                if (!normalize_quat(&q))
+                  return false;
+
+                *out = q;
+                return true;
+              };
+
+          const auto slerp_quat =
+              [&](BodyQuat from,
+                  BodyQuat to,
+                  float t,
+                  BodyQuat* out)
+              {
+                if (!out ||
+                    !std::isfinite(t))
+                {
+                  return false;
+                }
+
+                t = std::clamp(
+                    t, 0.0f, 1.0f);
+
+                float dot =
+                    from[0] * to[0] +
+                    from[1] * to[1] +
+                    from[2] * to[2] +
+                    from[3] * to[3];
+
+                if (!std::isfinite(dot))
+                  return false;
+
+                // Same physical quaternion, shortest arc.
+                if (dot < 0.0f)
+                {
+                  for (float& value : to)
+                    value = -value;
+
+                  dot = -dot;
+                }
+
+                dot = std::clamp(
+                    dot, -1.0f, 1.0f);
+
+                BodyQuat result{};
+
+                // Avoid numerical instability for almost
+                // identical rotations.
+                if (dot > 0.9995f)
+                {
+                  for (std::size_t i = 0;
+                       i < result.size();
+                       ++i)
+                  {
+                    result[i] =
+                        from[i] +
+                        (to[i] - from[i]) * t;
+                  }
+
+                  if (!normalize_quat(&result))
+                    return false;
+
+                  *out = result;
+                  return true;
+                }
+
+                const float theta =
+                    std::acos(dot);
+
+                const float sin_theta =
+                    std::sin(theta);
+
+                if (!std::isfinite(theta) ||
+                    !std::isfinite(sin_theta) ||
+                    std::abs(sin_theta) <
+                        1.0e-8f)
+                {
+                  return false;
+                }
+
+                const float scale_from =
+                    std::sin(
+                        (1.0f - t) * theta) /
+                    sin_theta;
+
+                const float scale_to =
+                    std::sin(t * theta) /
+                    sin_theta;
+
+                for (std::size_t i = 0;
+                     i < result.size();
+                     ++i)
+                {
+                  result[i] =
+                      from[i] * scale_from +
+                      to[i] * scale_to;
+                }
+
+                if (!normalize_quat(&result))
+                  return false;
+
+                *out = result;
+                return true;
+              };
+
+          const auto quat_to_rotation =
+              [](const BodyQuat& q,
+                 std::array<float, 12>* m)
+              {
+                if (!m)
+                  return false;
+
+                const float w = q[0];
+                const float x = q[1];
+                const float y = q[2];
+                const float z = q[3];
+
+                const float xx = x * x;
+                const float yy = y * y;
+                const float zz = z * z;
+
+                const float xy = x * y;
+                const float xz = x * z;
+                const float yz = y * z;
+
+                const float wx = w * x;
+                const float wy = w * y;
+                const float wz = w * z;
+
+                (*m)[0] =
+                    1.0f - 2.0f * (yy + zz);
+                (*m)[1] =
+                    2.0f * (xy - wz);
+                (*m)[2] =
+                    2.0f * (xz + wy);
+
+                (*m)[4] =
+                    2.0f * (xy + wz);
+                (*m)[5] =
+                    1.0f - 2.0f * (xx + zz);
+                (*m)[6] =
+                    2.0f * (yz - wx);
+
+                (*m)[8] =
+                    2.0f * (xz - wy);
+                (*m)[9] =
+                    2.0f * (yz + wx);
+                (*m)[10] =
+                    1.0f - 2.0f * (xx + yy);
+
+                for (const std::size_t index :
+                     {std::size_t{0},
+                      std::size_t{1},
+                      std::size_t{2},
+                      std::size_t{4},
+                      std::size_t{5},
+                      std::size_t{6},
+                      std::size_t{8},
+                      std::size_t{9},
+                      std::size_t{10}})
+                {
+                  if (!std::isfinite(
+                          (*m)[index]))
+                  {
+                    return false;
+                  }
+                }
+
+                return true;
+              };
+
+          BodyQuat rotation_a{};
+          BodyQuat rotation_b{};
+          BodyQuat group_rotation{};
+
+          if (!matrix_to_quat(
+                  world_a, &rotation_a) ||
+              !matrix_to_quat(
+                  world_b, &rotation_b))
+          {
+            *reason =
+                "body-bind-rotation-invalid";
+            return false;
+          }
+
+          const float weight_a =
+              static_cast<float>(
+                  gc.blend_q) /
+              4096.0f;
+
+          const float weight_b =
+              1.0f - weight_a;
+
+          // q=0 -> bone_b
+          // q=4096 -> bone_a
+          if (!slerp_quat(
+                  rotation_b,
+                  rotation_a,
+                  weight_a,
+                  &group_rotation))
+          {
+            *reason =
+                "body-bind-slerp-failed";
+            return false;
+          }
+
+          std::array<float, 12>
+              group_world{};
+
+          if (!quat_to_rotation(
+                  group_rotation,
+                  &group_world))
+          {
+            *reason =
+                "body-bind-rotation-build-failed";
+            return false;
+          }
+
+          // Translation is the same authored two-bone
+          // weight but remains an affine linear blend.
+          group_world[3] =
+              world_a[3] * weight_a +
+              world_b[3] * weight_b;
+
+          group_world[7] =
+              world_a[7] * weight_a +
+              world_b[7] * weight_b;
+
+          group_world[11] =
+              world_a[11] * weight_a +
+              world_b[11] * weight_b;
+
+          if (!std::isfinite(group_world[3]) ||
+              !std::isfinite(group_world[7]) ||
+              !std::isfinite(group_world[11]) ||
+              !invert_affine(
+                  group_world,
+                  position_transform))
+          {
+            *reason =
+                "body-rigid-group-bind-noninvertible";
+            return false;
+          }
+
+          // local normal =
+          // transpose(group_bind.rotation) * model normal
+          for (std::size_t row = 0;
+               row < 3;
+               ++row)
+          {
+            for (std::size_t column = 0;
+                 column < 3;
+                 ++column)
+            {
+              (*normal_transform)
+                  [row * 3 + column] =
+                  group_world[
+                      column * 4 + row];
+            }
+          }
+
+          *blended =
+              gc.blend_q != 0 &&
+              gc.blend_q != 4096;
+
+          *reason = {};
+
+          static std::unordered_set<
+              std::string>
+              body_rigid_blend_logged;
+
+          const std::string body_log_key =
+              std::string(draw.gc_name) +
+              "|" +
+              std::to_string(gc_group);
+
+          if (body_rigid_blend_logged
+                  .insert(body_log_key)
+                  .second &&
+              body_rigid_blend_logged
+                      .size() <=
+                  128)
+          {
+            std::fprintf(
+                stderr,
+                "[moh-ps3-skin] "
+                "BODY RIGID-BLEND READY: "
+                "gc=%.*s gc_group=%d "
+                "ps3_group=%u bones=%u/%u "
+                "q=%u/4096 mode=slerp | "
+                "PS3 model-bind -> "
+                "rigid GC group-local\n",
+                static_cast<int>(
+                    draw.gc_name.size()),
+                draw.gc_name.data(),
+                gc_group,
+                ps3_group,
+                gc.bone_a,
+                gc.bone_b,
+                gc.blend_q);
+          }
+
+          return true;
+        }
+
+        const auto& ps3 =
+            decoded.skin_groups[ps3_group];
+
+        u32 bone_a = ps3.bone_a;
+        u32 bone_b = ps3.bone_b;
+
+        float blend_q =
+            ps3.blend * 4096.0f;
+
+        bool gc_bind = false;
+
+        if (!IsSupportedPlayerWeaponDMF(
+                draw.gc_name) &&
+            exact_pair &&
+            exact_pair->gc_bone_order_proven &&
+            gc_group >= 0 &&
+            static_cast<std::size_t>(gc_group) <
+                exact_pair->gc_skin_groups.size())
+        {
+          const auto& gc =
+              exact_pair->gc_skin_groups[
+                  static_cast<std::size_t>(
+                      gc_group)];
+
+          bone_a = gc.bone_a;
+          bone_b = gc.bone_b;
+          blend_q =
+              static_cast<float>(
+                  gc.blend_q);
+
+          gc_bind = true;
+        }
+
+        if (!std::isfinite(blend_q))
+        {
+          *reason =
+              "nonfinite-bind-weight";
           return false;
         }
 
         int rigid_ref = -1;
-        if (std::abs(blend_q_float - 4096.0f) <= 0.5f)
-          rigid_ref = group.bone_a;
-        else if (std::abs(blend_q_float) <= 0.5f)
-          rigid_ref = group.bone_b;
-        else if (group.bone_a == group.bone_b)
-          rigid_ref = group.bone_a;
+
+        if (std::abs(
+                blend_q - 4096.0f) <=
+            0.5f)
+          rigid_ref =
+              static_cast<int>(bone_a);
+
+        else if (std::abs(blend_q) <=
+                 0.5f)
+          rigid_ref =
+              static_cast<int>(bone_b);
+
+        else if (bone_a == bone_b)
+          rigid_ref =
+              static_cast<int>(bone_a);
 
         if (rigid_ref >= 0)
         {
-          if (!load_inverse_bind(static_cast<u32>(rigid_ref), position_transform))
+          if (!load_inverse_bind(
+                  static_cast<u32>(
+                      rigid_ref),
+                  position_transform))
           {
-            *reason = "invalid-rigid-inverse-bind";
+            *reason =
+                "invalid-rigid-inverse-bind";
             return false;
           }
-          // This is exactly the v9 weapon path. For a rigid bind matrix the
-          // inverse linear part is also the model->local normal rotation.
-          for (std::size_t row = 0; row < 3; ++row)
-            for (std::size_t column = 0; column < 3; ++column)
-              (*normal_transform)[row * 3 + column] =
-                  (*position_transform)[row * 4 + column];
+
+          for (std::size_t row = 0;
+               row < 3; ++row)
+            for (std::size_t column = 0;
+                 column < 3;
+                 ++column)
+              (*normal_transform)
+                  [row * 3 + column] =
+                  (*position_transform)
+                      [row * 4 + column];
+
           return true;
         }
 
-        // The GC record stores a 4.12 group coefficient: 4096 = bone_a,
-        // 0 = bone_b.  Generic character bodies contain true intermediate
-        // groups.  Values outside that proven interval are not extrapolated.
         if (!blended_groups)
         {
-          *reason = "blended-bind-disabled";
-          return false;
-        }
-        if (blend_q_float < -0.5f || blend_q_float > 4096.5f ||
-            group.bone_a >= inverse_bind_by_ref.size() ||
-            group.bone_b >= inverse_bind_by_ref.size())
-        {
-          *reason = "unsupported-blended-bind-weight";
+          *reason =
+              "blended-bind-disabled";
           return false;
         }
 
-        std::array<float, 12> inverse_a{}, inverse_b{}, world_a{}, world_b{};
-        if (!load_inverse_bind(group.bone_a, &inverse_a) ||
-            !load_inverse_bind(group.bone_b, &inverse_b) ||
-            !invert_affine(inverse_a, &world_a) ||
-            !invert_affine(inverse_b, &world_b))
+        if (blend_q < -0.5f ||
+            blend_q > 4096.5f ||
+            bone_a >=
+                inverse_bind_by_ref.size() ||
+            bone_b >=
+                inverse_bind_by_ref.size())
         {
-          *reason = "blend-bone-bind-noninvertible";
+          *reason =
+              "unsupported-blended-bind-weight";
           return false;
         }
 
-        const float weight_a = std::clamp(blend_q_float / 4096.0f, 0.0f, 1.0f);
-        const float weight_b = 1.0f - weight_a;
-        std::array<float, 12> group_world{};
-        for (std::size_t element = 0; element < group_world.size(); ++element)
+        std::array<float, 12>
+            inverse_a{},
+            inverse_b{},
+            world_a{},
+            world_b{};
+
+        if (!load_inverse_bind(
+                bone_a, &inverse_a) ||
+            !load_inverse_bind(
+                bone_b, &inverse_b) ||
+            !invert_affine(
+                inverse_a, &world_a) ||
+            !invert_affine(
+                inverse_b, &world_b))
         {
-          const float value = world_a[element] * weight_a + world_b[element] * weight_b;
-          if (!std::isfinite(value))
+          *reason =
+              "blend-bone-bind-noninvertible";
+          return false;
+        }
+
+        const float weight_a =
+            std::clamp(
+                blend_q / 4096.0f,
+                0.0f, 1.0f);
+
+        const float weight_b =
+            1.0f - weight_a;
+
+        std::array<float, 12>
+            group_world{};
+
+        for (std::size_t i = 0;
+             i < group_world.size();
+             ++i)
+        {
+          group_world[i] =
+              world_a[i] * weight_a +
+              world_b[i] * weight_b;
+
+          if (!std::isfinite(
+                  group_world[i]))
           {
-            *reason = "nonfinite-blended-bind";
+            *reason =
+                "nonfinite-blended-bind";
             return false;
           }
-          group_world[element] = value;
         }
 
-        // GC's live XF matrix for this slot is the animated counterpart of
-        // this bind-pose group matrix.  Therefore PS3 model-bind positions must
-        // first be converted by inverse(group_bind), not by either bone alone.
-        if (!invert_affine(group_world, position_transform))
+        if (!invert_affine(
+                group_world,
+                position_transform))
         {
-          *reason = "blended-group-bind-noninvertible";
+          *reason =
+              gc_bind ?
+              "gc-group-bind-noninvertible" :
+              "blended-group-bind-noninvertible";
+
           return false;
         }
 
-        // Normals use the inverse-transpose relationship. If
-        // N_model = inverse-transpose(group_bind) * N_local, then recovering
-        // GC local space is N_local = transpose(group_bind) * N_model.
-        for (std::size_t row = 0; row < 3; ++row)
-          for (std::size_t column = 0; column < 3; ++column)
+        for (std::size_t row = 0;
+             row < 3; ++row)
+          for (std::size_t column = 0;
+               column < 3;
+               ++column)
           {
-            const float value = group_world[column * 4 + row];
+            const float value =
+                group_world[
+                    column * 4 + row];
+
             if (!std::isfinite(value))
             {
-              *reason = "nonfinite-blended-normal-bind";
+              *reason =
+                  "nonfinite-blended-normal-bind";
               return false;
             }
-            (*normal_transform)[row * 3 + column] = value;
+
+            (*normal_transform)
+                [row * 3 + column] =
+                value;
           }
 
         *blended = true;
@@ -4352,8 +6148,12 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
     std::array<float, 9> normal_transform{};
     bool blended = false;
     std::string_view transform_reason;
-    if (!build_group_transform(ps3_group, &position_transform, &normal_transform, &blended,
-                               &transform_reason))
+    if (!build_group_transform(
+            ps3_group, gc_group,
+            &position_transform,
+            &normal_transform,
+            &blended,
+            &transform_reason))
       return matrix_reject(transform_reason, vertex, local_slot, ps3_group, gc_group);
 
     blended_group_used = blended_group_used || blended;
@@ -4440,6 +6240,68 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   replacement.model_to_gc_local_normal = std::move(model_to_gc_local_normal);
   replacement.gc_material_draws = gc_material_draws;
   return replacement;
+}
+
+
+StaticDrawMatch AcquireFullCPTLevelDraw(u32 gc_triangle_count)
+{
+  if (!IsFullCPTLevelRenderEnabled() || g_current_dmf_draw || g_active_display_list)
+    return {};
+
+  const u32 minimum_triangles = static_cast<u32>(
+      EnvFloatLocal("MOH_PS3_CPT_FULL_LEVEL_TRIGGER_TRIS", 96.0f, 1.0f, 100000.0f));
+  if (gc_triangle_count < minimum_triangles)
+    return {};
+
+  if (g_current_draw_transient_world)
+    RejectStaticDrawCandidate();
+  if (g_current_draw)
+    return {};
+
+  std::shared_ptr<StaticMesh> owner;
+  std::shared_ptr<std::vector<std::array<float, 3>>> normals;
+  {
+    std::scoped_lock lock(g_msh_cache_mutex);
+    owner = g_world_full_level_mesh;
+    normals = g_world_full_level_normals;
+  }
+  if (!owner || !normals || owner->submeshes.size() != 1)
+    return {};
+
+  const auto& sub = owner->submeshes[0];
+  if (!sub.vertex_count || sub.position_uv.size() != sub.vertex_count ||
+      sub.indices.empty() || normals->size() != sub.vertex_count)
+    return {};
+
+  const Bounds3 bounds = BoundsFromPS3(sub);
+  StaticDrawMatch match;
+  match.owner = owner;
+  match.normals = normals;
+  match.mesh = owner.get();
+  match.submesh = &sub;
+  match.submesh_index = 0;
+  match.score = 0.0f;
+  match.bounds_valid = bounds.valid;
+  match.bounds_min = bounds.minimum;
+  match.bounds_max = bounds.maximum;
+  match.world_translation_valid = false;
+  match.guest_resource = 0;
+  match.display_list = 0;
+
+  g_current_draw = match;
+  g_current_draw_transient_world = true;
+  g_current_world_direct_key = 0;
+  ++g_matches;
+
+  static unsigned logs = 0;
+  if (logs++ < 8)
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-world-full] ACQUIRE: trigger-gc-tris=%u vertices=%u triangles=%zu indices=%zu | replacing one direct GC world batch with complete PS3 CPT level\n",
+                 gc_triangle_count, sub.vertex_count, sub.indices.size() / 3,
+                 sub.indices.size());
+  }
+  return match;
 }
 
 StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 stride, u32 offset,
@@ -5190,32 +7052,131 @@ bool DecodeDMF0502(std::span<const u8> bytes, DMFDecoded* out)
       out->inverse_bind_by_ref.clear();
   }
 
-  out->skin_groups.reserve(group_count);
-  for (u32 i = 0; i < group_count; ++i)
-  {
-    const u8* q = bytes.data() + group_offset + static_cast<std::size_t>(i) * 28;
-    DMFSkinGroup group;
-    group.bone_a = q[0];
-    group.bone_b = q[4];
-    group.blend = BEFloat(q + 8);
-    for (std::size_t j = 0; j < group.auxiliary.size(); ++j)
-      group.auxiliary[j] = BEFloat(q + 12 + j * 4);
+  const auto validate_group =
+      [&](const DMFSkinGroup& group)
+      {
+        const float q =
+            group.blend * 4096.0f;
 
-    // PS3 0x0502 stores the legacy GC 16-bit skin coefficient as float/4096.
-    // It is NOT a normalized [0,1] weight. The M1 Garand contains authored
-    // values above 1.0, so the old <= 1.01 check rejected the complete DMF
-    // before the valid M1TOP/M1SIDE clusters and UV0 streams could be used.
-    // Exact PS3->GC matching still requires the original u16 coefficient.
-    const float legacy_blend_q = group.blend * 4096.0f;
-    if (group.bone_a >= bone_count || group.bone_b >= bone_count ||
-        !std::isfinite(group.blend) || !std::isfinite(legacy_blend_q) ||
-        legacy_blend_q < -0.5f || legacy_blend_q > 65535.5f)
-      return false;
-    for (float value : group.auxiliary)
-      if (!std::isfinite(value))
-        return false;
-    out->skin_groups.push_back(group);
+        if (group.bone_a >= bone_count ||
+            group.bone_b >= bone_count ||
+            !std::isfinite(group.blend) ||
+            !std::isfinite(q) ||
+            q < -0.5f ||
+            q > 65535.5f)
+          return false;
+
+        for (float value :
+             group.auxiliary)
+          if (!std::isfinite(value))
+            return false;
+
+        return true;
+      };
+
+  std::vector<DMFSkinGroup>
+      parsed_groups;
+
+  parsed_groups.reserve(group_count);
+
+  bool ordinary = true;
+
+  if (static_cast<std::size_t>(
+          group_count) * 28 >
+      bytes.size() - group_offset)
+  {
+    ordinary = false;
   }
+  else
+  {
+    for (u32 i = 0;
+         i < group_count;
+         ++i)
+    {
+      const u8* q =
+          bytes.data() +
+          group_offset +
+          static_cast<std::size_t>(i) *
+              28;
+
+      DMFSkinGroup group;
+
+      group.bone_a = q[0];
+      group.bone_b = q[4];
+      group.blend =
+          BEFloat(q + 8);
+
+      for (std::size_t j = 0;
+           j <
+               group.auxiliary.size();
+           ++j)
+      {
+        group.auxiliary[j] =
+            BEFloat(
+                q + 12 + j * 4);
+      }
+
+      if (!validate_group(group))
+      {
+        ordinary = false;
+        parsed_groups.clear();
+        break;
+      }
+
+      parsed_groups.push_back(
+          group);
+    }
+  }
+
+  if (!ordinary)
+  {
+    parsed_groups.clear();
+
+    if (static_cast<std::size_t>(
+            group_count) * 4 >
+        bytes.size() - group_offset)
+      return false;
+
+    for (u32 i = 0;
+         i < group_count;
+         ++i)
+    {
+      const u8* q =
+          bytes.data() +
+          group_offset +
+          static_cast<std::size_t>(i) *
+              4;
+
+      DMFSkinGroup group;
+
+      group.bone_a = q[0];
+      group.bone_b = q[1];
+
+      group.blend =
+          static_cast<float>(
+              BE16(q + 2)) /
+          4096.0f;
+
+      group.auxiliary.fill(0.0f);
+
+      if (!validate_group(group))
+        return false;
+
+      parsed_groups.push_back(
+          group);
+    }
+
+    std::fprintf(
+        stderr,
+        "[moh-ps3-dmf] "
+        "0502 COMPACT SKIN GROUPS: "
+        "groups=%u stride=4 "
+        "layout=boneA/boneB/q16\n",
+        group_count);
+  }
+
+  out->skin_groups =
+      std::move(parsed_groups);
 
   for (u32 material = 0; material < material_count; ++material)
   {
@@ -5260,12 +7221,62 @@ bool DecodeDMF0502(std::span<const u8> bytes, DMFDecoded* out)
 
       const u32 index_count = BE32(bytes.data() + geometry);
       const u32 vertex_count = BE32(bytes.data() + geometry + 4);
-      cluster.vertex_stride = bytes[geometry + 8];
-      cluster.attribute_word_count = bytes[geometry + 9];
-      if (!index_count || !vertex_count || index_count > 16 * 1024 * 1024 ||
-          vertex_count > 4 * 1024 * 1024 || (index_count % 3) != 0 ||
-          cluster.vertex_stride < 30 || cluster.vertex_stride > 192 ||
-          cluster.attribute_word_count > 32)
+      const u8 field_a =
+          bytes[geometry + 8];
+
+      const u8 field_b =
+          bytes[geometry + 9];
+
+      bool swapped_geometry_header =
+          false;
+
+      if (field_a >= 30 &&
+          field_a <= 192 &&
+          field_b <= 32)
+      {
+        cluster.vertex_stride =
+            field_a;
+
+        cluster.attribute_word_count =
+            field_b;
+      }
+      else if (field_b >= 30 &&
+               field_b <= 192 &&
+               field_a > 0 &&
+               field_a <= 32)
+      {
+        cluster.attribute_word_count =
+            field_a;
+
+        cluster.vertex_stride =
+            field_b;
+
+        swapped_geometry_header =
+            true;
+
+        std::fprintf(
+            stderr,
+            "[moh-ps3-dmf] "
+            "0502 SWAPPED GEOMETRY HEADER: "
+            "material=%u cluster=%u "
+            "attributes=%u stride=%u\n",
+            material,
+            cluster_index,
+            cluster.attribute_word_count,
+            cluster.vertex_stride);
+      }
+      else
+      {
+        return false;
+      }
+
+      if (!index_count ||
+          !vertex_count ||
+          index_count >
+              16 * 1024 * 1024 ||
+          vertex_count >
+              4 * 1024 * 1024 ||
+          (index_count % 3) != 0)
         return false;
 
       const std::size_t attribute_start = static_cast<std::size_t>(geometry) + 12;
@@ -5318,8 +7329,142 @@ bool DecodeDMF0502(std::span<const u8> bytes, DMFDecoded* out)
       if (index_bytes > bytes.size() - index_start)
         return false;
 
-      cluster.vertices.assign(bytes.begin() + vertex_start, bytes.begin() + index_start);
-      cluster.vertex_palette_slots.reserve(vertex_count);
+      cluster.vertices.assign(
+          bytes.begin() + vertex_start,
+          bytes.begin() + index_start);
+
+      cluster.vertex_palette_slots.reserve(
+          vertex_count);
+
+      const auto attribute_width =
+          [](const Attribute& a) -> u32
+          {
+            if (a.type == 2)
+              return
+                  static_cast<u32>(
+                      a.components) * 4;
+
+            if (a.type == 3)
+              return
+                  static_cast<u32>(
+                      a.components) * 2;
+
+            if (a.type == 6)
+              return 4;
+
+            return 0;
+          };
+
+      const auto overlaps =
+          [&](u32 offset)
+          {
+            for (const auto& a :
+                 cluster.attributes)
+            {
+              const u32 width =
+                  attribute_width(a);
+
+              if (!width)
+                continue;
+
+              if (offset <
+                      a.offset + width &&
+                  offset + 2 >
+                      a.offset)
+                return true;
+            }
+
+            return false;
+          };
+
+      const auto valid_palette_offset =
+          [&](u32 offset)
+          {
+            if (offset + 2 >
+                cluster.vertex_stride)
+              return false;
+
+            for (u32 v = 0;
+                 v < vertex_count;
+                 ++v)
+            {
+              const u8* vertex =
+                  bytes.data() +
+                  vertex_start +
+                  static_cast<std::size_t>(
+                      v) *
+                      cluster.vertex_stride;
+
+              if (BE16(vertex + offset) >=
+                  cluster.palette_groups.size())
+                return false;
+            }
+
+            return true;
+          };
+
+      u32 palette_slot_offset = 28;
+
+      if (!valid_palette_offset(
+              palette_slot_offset))
+      {
+        std::vector<u32>
+            offsets;
+
+        for (u32 offset = 0;
+             offset + 2 <=
+                 cluster.vertex_stride;
+             offset += 2)
+        {
+          if (overlaps(offset))
+            continue;
+
+          if (valid_palette_offset(offset))
+            offsets.push_back(offset);
+        }
+
+        std::sort(
+            offsets.begin(),
+            offsets.end());
+
+        offsets.erase(
+            std::unique(
+                offsets.begin(),
+                offsets.end()),
+            offsets.end());
+
+        if (offsets.size() != 1)
+        {
+          std::fprintf(
+              stderr,
+              "[moh-ps3-dmf] "
+              "0502 PALETTE SLOT REJECT: "
+              "material=%u cluster=%u "
+              "stride=%u candidates=%zu "
+              "swapped=%d\n",
+              material,
+              cluster_index,
+              cluster.vertex_stride,
+              offsets.size(),
+              swapped_geometry_header ? 1 : 0);
+
+          return false;
+        }
+
+        palette_slot_offset =
+            offsets.front();
+
+        std::fprintf(
+            stderr,
+            "[moh-ps3-dmf] "
+            "0502 PALETTE SLOT VARIANT: "
+            "material=%u cluster=%u "
+            "offset=%u stride=%u\n",
+            material,
+            cluster_index,
+            palette_slot_offset,
+            cluster.vertex_stride);
+      }
       if (position)
         cluster.positions.resize(vertex_count);
       if (normal)
@@ -5333,7 +7478,10 @@ bool DecodeDMF0502(std::span<const u8> bytes, DMFDecoded* out)
       for (u32 v = 0; v < vertex_count; ++v)
       {
         const u8* vertex = bytes.data() + vertex_start + static_cast<std::size_t>(v) * cluster.vertex_stride;
-        const u16 slot = BE16(vertex + 28);
+        const u16 slot =
+            BE16(
+                vertex +
+                palette_slot_offset);
         if (slot >= cluster.palette_groups.size())
           return false;
         cluster.vertex_palette_slots.push_back(slot);

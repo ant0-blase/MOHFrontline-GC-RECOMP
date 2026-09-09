@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -24,6 +25,7 @@
 #include "VideoCommon/Assets/CustomTextureData.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 #include "VideoCommon/PS3RemasterAssets.h"
+#include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/PS3TextureDecoder.h"
 #include "VideoCommon/TextureDecoder.h"
 #include "VideoCommon/TextureInfo.h"
@@ -1435,10 +1437,229 @@ inline std::shared_ptr<VideoCommon::CustomTextureData> Decode(const Entry& entry
   }
   return decoded;
 }
+
+
+struct CPTDrawTextureIdentity
+{
+  std::string level;
+  std::string source;
+  u32 offset = 0;
+  u32 size = 0;
+  u32 width = 0;
+  u32 height = 0;
+  u32 format = 0;
+  u32 mips = 0;
+  std::array<u8, 24> descriptor{};
+};
+
+inline bool ParseUnsignedAfter(std::string_view text, std::string_view token, u32* out)
+{
+  if (!out)
+    return false;
+  const std::size_t pos = text.find(token);
+  if (pos == std::string_view::npos)
+    return false;
+  std::size_t i = pos + token.size();
+  if (i >= text.size() || text[i] < '0' || text[i] > '9')
+    return false;
+  u64 value = 0;
+  while (i < text.size() && text[i] >= '0' && text[i] <= '9')
+  {
+    value = value * 10 + static_cast<unsigned>(text[i] - '0');
+    if (value > std::numeric_limits<u32>::max())
+      return false;
+    ++i;
+  }
+  *out = static_cast<u32>(value);
+  return true;
+}
+
+inline int HexNibble(char c)
+{
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+inline bool ParseDescriptorHex(std::string_view text, std::array<u8, 24>* out)
+{
+  if (!out)
+    return false;
+  const std::size_t pos = text.find("desc:");
+  if (pos == std::string_view::npos)
+    return false;
+  const std::string_view hex = text.substr(pos + 5);
+  if (hex.size() < out->size() * 2)
+    return false;
+  for (std::size_t i = 0; i < out->size(); ++i)
+  {
+    const int hi = HexNibble(hex[i * 2]);
+    const int lo = HexNibble(hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0)
+      return false;
+    (*out)[i] = static_cast<u8>((hi << 4) | lo);
+  }
+  return true;
+}
+
+inline bool SameTexture(const CPTDrawTextureIdentity& a, const CPTDrawTextureIdentity& b)
+{
+  return a.offset == b.offset && a.size == b.size && a.width == b.width &&
+         a.height == b.height && a.format == b.format && a.mips == b.mips &&
+         a.descriptor == b.descriptor;
+}
+
+inline std::optional<CPTDrawTextureIdentity> ResolveExactCurrentDrawTexture()
+{
+  const auto& draw = PS3MeshPort::CurrentStaticDraw();
+  if (!draw || !draw.mesh || !draw.submesh)
+    return std::nullopt;
+
+  const std::string& source = draw.mesh->source_name;
+  if (source.find(".cpt#cpt-") == std::string::npos ||
+      source.find("#cpt-full-level") != std::string::npos)
+    return std::nullopt;
+
+  const std::string level = MOHFrontline::NativeAssets::GetCurrentLevel();
+  if (level.empty())
+    return std::nullopt;
+
+  std::unordered_set<u32> pack_members;
+  std::unordered_set<u32> textured_members;
+  std::optional<CPTDrawTextureIdentity> chosen;
+  bool conflict = false;
+
+  for (const std::string& owned_hint : draw.submesh->material_hints)
+  {
+    const std::string_view hint(owned_hint);
+    if (hint.starts_with("@cpt-pack-span=member:"))
+    {
+      u32 member = 0;
+      if (ParseUnsignedAfter(hint, "member:", &member))
+        pack_members.insert(member);
+      continue;
+    }
+
+    const std::size_t marker = hint.find("@cpt-tex=");
+    if (marker == std::string_view::npos)
+      continue;
+    const std::string_view tex = hint.substr(marker + 9);
+
+    u32 slot = 0;
+    if (!ParseUnsignedAfter(tex, "slot:", &slot) || slot != 0)
+      continue;
+
+    CPTDrawTextureIdentity candidate;
+    candidate.level = level;
+    candidate.source = source;
+    if (!ParseUnsignedAfter(tex, "offset:", &candidate.offset) ||
+        !ParseUnsignedAfter(tex, "size:", &candidate.size) ||
+        !ParseUnsignedAfter(tex, "format:", &candidate.format) ||
+        !ParseUnsignedAfter(tex, "mips:", &candidate.mips) ||
+        !ParseUnsignedAfter(tex, "width:", &candidate.width) ||
+        !ParseUnsignedAfter(tex, "height:", &candidate.height) ||
+        !ParseDescriptorHex(tex, &candidate.descriptor) ||
+        !candidate.size || !candidate.width || !candidate.height)
+    {
+      conflict = true;
+      break;
+    }
+
+    const std::size_t member_marker = hint.find("@cpt-pack-member=");
+    if (member_marker != std::string_view::npos)
+    {
+      u32 member = 0;
+      if (!ParseUnsignedAfter(hint, "@cpt-pack-member=", &member))
+      {
+        conflict = true;
+        break;
+      }
+      textured_members.insert(member);
+    }
+
+    if (!chosen)
+      chosen = candidate;
+    else if (!SameTexture(*chosen, candidate))
+    {
+      conflict = true;
+      break;
+    }
+  }
+
+  if (conflict || !chosen)
+    return std::nullopt;
+  if (!pack_members.empty() && textured_members != pack_members)
+    return std::nullopt;
+  return chosen;
+}
+
+inline u64 ExactDrawTextureKey(const CPTDrawTextureIdentity& identity)
+{
+  constexpr u64 tag = 0x4350544D41540000ULL;  // "CPTMAT"
+  u64 key = tag;
+  key ^= static_cast<u64>(identity.offset) * 0x9E3779B185EBCA87ULL;
+  key ^= static_cast<u64>(identity.size) * 0xC2B2AE3D27D4EB4FULL;
+  key ^= static_cast<u64>(identity.width) << 32;
+  key ^= static_cast<u64>(identity.height) << 16;
+  for (const u8 byte : identity.descriptor)
+  {
+    key ^= byte;
+    key *= 0x100000001b3ULL;
+  }
+  return key ? key : 1;
+}
+
+inline std::shared_ptr<VideoCommon::CustomTextureData>
+DecodeExactCurrentDrawTexture(const CPTDrawTextureIdentity& identity)
+{
+  const u64 key = ExactDrawTextureKey(identity);
+  static std::mutex cache_mutex;
+  static std::unordered_map<u64, std::shared_ptr<VideoCommon::CustomTextureData>> cache;
+  {
+    std::scoped_lock lock(cache_mutex);
+    if (const auto it = cache.find(key); it != cache.end())
+      return it->second;
+  }
+
+  const auto* rsx = FindRSX(identity.level);
+  if (!rsx)
+    return nullptr;
+  const std::vector<u8> payload =
+      PS3RemasterAssets::ReadRange(*rsx, identity.offset, identity.size);
+  if (payload.size() != identity.size)
+    return nullptr;
+
+  PS3Record record;
+  record.offset = identity.offset;
+  record.size = identity.size;
+  record.descriptor = identity.descriptor;
+  const std::vector<u8> gtf = MakeGTF(record, payload);
+  if (gtf.empty())
+    return nullptr;
+
+  std::vector<PS3TextureDecoder::Level> levels;
+  if (!PS3TextureDecoder::Decode(gtf, &levels) || levels.empty())
+    return nullptr;
+  auto decoded = BuildCustomTexture(levels);
+  if (!decoded)
+    return nullptr;
+
+  {
+    std::scoped_lock lock(cache_mutex);
+    cache.emplace(key, decoded);
+  }
+  return decoded;
+}
 }  // namespace detail
 
 inline u64 ReplacementKey(const TextureInfo& info)
 {
+  if (info.GetStage() == 0)
+  {
+    if (const auto exact = detail::ResolveExactCurrentDrawTexture())
+      return detail::ExactDrawTextureKey(*exact);
+  }
   return detail::LookupReplacementKeyFast(info);
 }
 
@@ -1449,6 +1670,34 @@ inline bool IsKnownWorldTexture(const TextureInfo& info)
 
 inline std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
 {
+  if (info.GetStage() == 0)
+  {
+    if (const auto exact = detail::ResolveExactCurrentDrawTexture())
+    {
+      auto decoded = detail::DecodeExactCurrentDrawTexture(*exact);
+      if (decoded)
+      {
+        static std::mutex log_mutex;
+        static std::unordered_set<u64> logged;
+        const u64 key = detail::ExactDrawTextureKey(*exact);
+        std::scoped_lock lock(log_mutex);
+        if (logged.insert(key).second)
+        {
+          std::fprintf(stderr,
+                       "[moh-ps3-material] CPT DRAW EXACT: level=%s source=%s stage=0 "
+                       "GC=%ux%u fmt=%u -> rsx.viv+0x%08X size=%u "
+                       "PS3=%ux%u fmt=0x%02X mips=%u\n",
+                       exact->level.c_str(), exact->source.c_str(),
+                       info.GetRawWidth(), info.GetRawHeight(),
+                       static_cast<unsigned>(info.GetTextureFormat()),
+                       exact->offset, exact->size, exact->width, exact->height,
+                       exact->format, exact->mips);
+        }
+        return decoded;
+      }
+    }
+  }
+
   detail::Entry entry;
   u64 hash = 0;
   if (!detail::Lookup(info, &entry, &hash))
