@@ -1510,9 +1510,9 @@ inline bool SameTexture(const CPTDrawTextureIdentity& a, const CPTDrawTextureIde
          a.descriptor == b.descriptor;
 }
 
-inline std::optional<CPTDrawTextureIdentity> ResolveExactCurrentDrawTexture()
+inline std::optional<CPTDrawTextureIdentity> ResolveExactDrawTexture(
+    const PS3MeshPort::StaticDrawMatch& draw)
 {
-  const auto& draw = PS3MeshPort::CurrentStaticDraw();
   if (!draw || !draw.mesh || !draw.submesh)
     return std::nullopt;
 
@@ -1594,6 +1594,11 @@ inline std::optional<CPTDrawTextureIdentity> ResolveExactCurrentDrawTexture()
   return chosen;
 }
 
+inline std::optional<CPTDrawTextureIdentity> ResolveExactCurrentDrawTexture()
+{
+  return ResolveExactDrawTexture(PS3MeshPort::CurrentStaticDraw());
+}
+
 inline u64 ExactDrawTextureKey(const CPTDrawTextureIdentity& identity)
 {
   constexpr u64 tag = 0x4350544D41540000ULL;  // "CPTMAT"
@@ -1651,12 +1656,176 @@ DecodeExactCurrentDrawTexture(const CPTDrawTextureIdentity& identity)
   }
   return decoded;
 }
+
+
+// v10.5: direct CPT geometry is selected after Dolphin has already performed
+// the texture-cache load for that GC draw. Remember the stage-0 GC texture
+// observed immediately before MatchStaticDraw(), then learn a conservative
+// GC-texture -> exact MAT94 diffuse relationship. The next bind of that exact
+// GC texture uses the authored CPT/RSX texture through the normal texcache path.
+struct ObservedStage0Texture
+{
+  u64 scoped_key = 0;
+  u64 level_hash = 0;
+  u64 gc_hash = 0;
+  u32 address = 0;
+  u32 width = 0;
+  u32 height = 0;
+  u32 format = 0;
+  bool valid = false;
+};
+
+inline thread_local ObservedStage0Texture observed_stage0_texture{};
+inline std::mutex learned_draw_texture_mutex;
+inline std::unordered_map<u64, CPTDrawTextureIdentity> learned_draw_textures;
+inline std::unordered_set<u64> ambiguous_draw_textures;
+
+inline u64 LevelHash(std::string_view level)
+{
+  u64 hash = 0xcbf29ce484222325ULL;
+  for (unsigned char c : level)
+  {
+    if (c >= 'A' && c <= 'Z')
+      c = static_cast<unsigned char>(c - 'A' + 'a');
+    hash ^= c;
+    hash *= 0x100000001b3ULL;
+  }
+  return hash ? hash : 1;
+}
+
+inline u64 ScopedGCTextureKey(u64 level_hash, u64 gc_key)
+{
+  u64 key = gc_key ^ (level_hash + 0x9E3779B97F4A7C15ULL +
+                      (gc_key << 6) + (gc_key >> 2));
+  key ^= 0x43505447434C4154ULL;  // "CPTGCLAT"
+  return key ? key : 1;
+}
+
+inline u64 ObserveStage0Texture(const TextureInfo& info)
+{
+  if (info.GetStage() != 0 || !info.IsDataValid() || !info.GetData() ||
+      !info.GetTextureSize())
+    return 0;
+
+  const std::string level = MOHFrontline::NativeAssets::GetCurrentLevel();
+  if (level.empty())
+    return 0;
+
+  const u64 gc_hash = RuntimeTextureHash(info);
+  if (!gc_hash)
+    return 0;
+
+  const u64 gc_key = IdentityKey(gc_hash, info.GetRawWidth(), info.GetRawHeight(),
+                                 static_cast<u32>(info.GetTextureFormat()));
+  const u64 level_hash = LevelHash(level);
+  const u64 scoped_key = ScopedGCTextureKey(level_hash, gc_key);
+
+  observed_stage0_texture.scoped_key = scoped_key;
+  observed_stage0_texture.level_hash = level_hash;
+  observed_stage0_texture.gc_hash = gc_hash;
+  observed_stage0_texture.address = info.GetRawAddress();
+  observed_stage0_texture.width = info.GetRawWidth();
+  observed_stage0_texture.height = info.GetRawHeight();
+  observed_stage0_texture.format = static_cast<u32>(info.GetTextureFormat());
+  observed_stage0_texture.valid = true;
+  return scoped_key;
+}
+
+inline std::optional<CPTDrawTextureIdentity> FindLearnedDrawTexture(u64 scoped_key)
+{
+  if (!scoped_key)
+    return std::nullopt;
+  std::scoped_lock lock(learned_draw_texture_mutex);
+  if (ambiguous_draw_textures.contains(scoped_key))
+    return std::nullopt;
+  const auto it = learned_draw_textures.find(scoped_key);
+  if (it == learned_draw_textures.end())
+    return std::nullopt;
+  return it->second;
+}
+
+inline void LearnDrawTexture(const PS3MeshPort::StaticDrawMatch& draw)
+{
+  const auto exact = ResolveExactDrawTexture(draw);
+  if (!exact)
+  {
+    if (draw && draw.mesh && draw.submesh &&
+        draw.mesh->source_name.find(".cpt#cpt-") != std::string::npos)
+    {
+      static thread_local unsigned skip_logs = 0;
+      if (skip_logs++ < 64)
+      {
+        std::fprintf(stderr,
+                     "[moh-ps3-material] CPT LATCH SKIP: source=%s "
+                     "reason=missing-or-mixed-MAT94-slot0\n",
+                     draw.mesh->source_name.c_str());
+      }
+    }
+    return;
+  }
+
+  if (!observed_stage0_texture.valid ||
+      observed_stage0_texture.level_hash != LevelHash(exact->level))
+    return;
+
+  const u64 scoped_key = observed_stage0_texture.scoped_key;
+  bool learned = false;
+  bool conflict = false;
+  {
+    std::scoped_lock lock(learned_draw_texture_mutex);
+    if (ambiguous_draw_textures.contains(scoped_key))
+      return;
+    const auto it = learned_draw_textures.find(scoped_key);
+    if (it == learned_draw_textures.end())
+    {
+      learned_draw_textures.emplace(scoped_key, *exact);
+      learned = true;
+    }
+    else if (!SameTexture(it->second, *exact))
+    {
+      learned_draw_textures.erase(it);
+      ambiguous_draw_textures.insert(scoped_key);
+      conflict = true;
+    }
+  }
+
+  static thread_local unsigned latch_logs = 0;
+  if (learned && latch_logs++ < 128)
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-material] CPT LATCH LEARN: GC=%08X %ux%u fmt=%u "
+                 "hash=%016llX -> %s rsx.viv+0x%08X size=%u "
+                 "PS3=%ux%u fmt=0x%02X mips=%u\n",
+                 observed_stage0_texture.address, observed_stage0_texture.width,
+                 observed_stage0_texture.height, observed_stage0_texture.format,
+                 static_cast<unsigned long long>(observed_stage0_texture.gc_hash),
+                 exact->source.c_str(), exact->offset, exact->size, exact->width,
+                 exact->height, exact->format, exact->mips);
+  }
+  else if (conflict && latch_logs++ < 128)
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-material] CPT LATCH CONFLICT: GC=%08X %ux%u fmt=%u "
+                 "hash=%016llX -> GC fallback\n",
+                 observed_stage0_texture.address, observed_stage0_texture.width,
+                 observed_stage0_texture.height, observed_stage0_texture.format,
+                 static_cast<unsigned long long>(observed_stage0_texture.gc_hash));
+  }
+}
 }  // namespace detail
+
+inline void LearnExactDrawMaterial(const PS3MeshPort::StaticDrawMatch& draw)
+{
+  detail::LearnDrawTexture(draw);
+}
 
 inline u64 ReplacementKey(const TextureInfo& info)
 {
   if (info.GetStage() == 0)
   {
+    const u64 scoped_key = detail::ObserveStage0Texture(info);
+    if (const auto learned = detail::FindLearnedDrawTexture(scoped_key))
+      return detail::ExactDrawTextureKey(*learned);
     if (const auto exact = detail::ResolveExactCurrentDrawTexture())
       return detail::ExactDrawTextureKey(*exact);
   }
@@ -1672,6 +1841,31 @@ inline std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& i
 {
   if (info.GetStage() == 0)
   {
+    const u64 scoped_key = detail::ObserveStage0Texture(info);
+    if (const auto learned = detail::FindLearnedDrawTexture(scoped_key))
+    {
+      auto decoded = detail::DecodeExactCurrentDrawTexture(*learned);
+      if (decoded)
+      {
+        static std::mutex latch_log_mutex;
+        static std::unordered_set<u64> latch_logged;
+        const u64 key = detail::ExactDrawTextureKey(*learned);
+        std::scoped_lock lock(latch_log_mutex);
+        if (latch_logged.insert(key).second)
+        {
+          std::fprintf(stderr,
+                       "[moh-ps3-material] CPT DRAW LATCHED: level=%s source=%s stage=0 "
+                       "GC=%ux%u fmt=%u -> rsx.viv+0x%08X size=%u "
+                       "PS3=%ux%u fmt=0x%02X mips=%u\n",
+                       learned->level.c_str(), learned->source.c_str(),
+                       info.GetRawWidth(), info.GetRawHeight(),
+                       static_cast<unsigned>(info.GetTextureFormat()),
+                       learned->offset, learned->size, learned->width, learned->height,
+                       learned->format, learned->mips);
+        }
+        return decoded;
+      }
+    }
     if (const auto exact = detail::ResolveExactCurrentDrawTexture())
     {
       auto decoded = detail::DecodeExactCurrentDrawTexture(*exact);

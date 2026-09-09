@@ -9,6 +9,7 @@
 #include "VideoCommon/MOHFrontline/Assets/PS3/Formats/MSH.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3WorldGeometry.h"
+#include "VideoCommon/PS3WorldCPTRuntime.h"
 
 #include <array>
 #include <algorithm>
@@ -200,6 +201,11 @@ struct ExactDMFPair
 
   std::vector<GCSkinGroupRecord> gc_skin_groups;
   bool gc_bone_order_proven = false;
+
+  // v12.7:
+  // Keep the retail GC inverse bind completely separate from the PS3 bind.
+  std::vector<std::array<float, 16>> gc_inverse_bind_by_ref;
+  bool gc_bind_tables_valid = false;
 
   std::size_t mapped_skin_groups = 0;
   std::string skeleton_name;
@@ -2357,11 +2363,253 @@ std::string SkinGroupKey(std::string_view a, std::string_view b, int blend_q)
   return key;
 }
 
+
+bool DecodeGCInverseBindTables(
+    std::span<const u8> bytes,
+    ExactDMFPair* pair)
+{
+  if (!pair)
+    return false;
+
+  pair->gc_inverse_bind_by_ref.clear();
+  pair->gc_bind_tables_valid = false;
+
+  if (bytes.size() < 0x54)
+    return false;
+
+  const u32 bone_count =
+      BE32(bytes.data() + 0x48);
+
+  const u32 bone_offset =
+      BE32(bytes.data() + 0x4c);
+
+  const u32 bind_angle_offset =
+      BE32(bytes.data() + 0x50);
+
+  if (!bone_count ||
+      bone_count > 4096 ||
+      bone_offset > bytes.size() ||
+      static_cast<std::size_t>(bone_count) * 16 >
+          bytes.size() - bone_offset ||
+      bind_angle_offset > bytes.size())
+  {
+    return false;
+  }
+
+  const std::size_t angle_bytes =
+      static_cast<std::size_t>(
+          bone_count) * 6;
+
+  if (angle_bytes >
+      bytes.size() - bind_angle_offset)
+  {
+    return false;
+  }
+
+  const std::size_t matrix_offset =
+      (static_cast<std::size_t>(
+           bind_angle_offset) +
+       angle_bytes + 15u) &
+      ~std::size_t(15u);
+
+  const std::size_t matrix_bytes =
+      static_cast<std::size_t>(
+          bone_count) * 64;
+
+  if (matrix_offset > bytes.size() ||
+      matrix_bytes >
+          bytes.size() - matrix_offset)
+  {
+    return false;
+  }
+
+  const auto decode_candidate =
+      [&](bool transposed,
+          std::vector<
+              std::array<float, 16>>* out)
+      {
+        if (!out)
+          return false;
+
+        out->clear();
+        out->resize(bone_count);
+
+        for (u32 ref = 0;
+             ref < bone_count;
+             ++ref)
+        {
+          auto& matrix = (*out)[ref];
+
+          for (std::size_t row = 0;
+               row < 4;
+               ++row)
+          {
+            for (std::size_t column = 0;
+                 column < 4;
+                 ++column)
+            {
+              const std::size_t element =
+                  transposed ?
+                      column * 4 + row :
+                      row * 4 + column;
+
+              const float value =
+                  BEFloat(
+                      bytes.data() +
+                      matrix_offset +
+                      static_cast<std::size_t>(
+                          ref) *
+                          64 +
+                      element * 4);
+
+              if (!std::isfinite(value) ||
+                  std::abs(value) >
+                      1000000.0f)
+              {
+                return false;
+              }
+
+              matrix[
+                  row * 4 + column] =
+                  value;
+            }
+          }
+
+          // Must be a real affine row-major matrix.
+          if (std::abs(matrix[12]) >
+                  1.0e-3f ||
+              std::abs(matrix[13]) >
+                  1.0e-3f ||
+              std::abs(matrix[14]) >
+                  1.0e-3f ||
+              std::abs(
+                  matrix[15] - 1.0f) >
+                  1.0e-3f)
+          {
+            return false;
+          }
+
+          const double det =
+              static_cast<double>(
+                  matrix[0]) *
+                  (static_cast<double>(
+                       matrix[5]) *
+                       matrix[10] -
+                   static_cast<double>(
+                       matrix[6]) *
+                       matrix[9]) -
+              static_cast<double>(
+                  matrix[1]) *
+                  (static_cast<double>(
+                       matrix[4]) *
+                       matrix[10] -
+                   static_cast<double>(
+                       matrix[6]) *
+                       matrix[8]) +
+              static_cast<double>(
+                  matrix[2]) *
+                  (static_cast<double>(
+                       matrix[4]) *
+                       matrix[9] -
+                   static_cast<double>(
+                       matrix[5]) *
+                       matrix[8]);
+
+          if (!std::isfinite(det) ||
+              std::abs(det) < 1.0e-8)
+          {
+            return false;
+          }
+        }
+
+        return true;
+      };
+
+  std::vector<std::array<float, 16>>
+      transposed;
+
+  std::vector<std::array<float, 16>>
+      direct;
+
+  const bool transposed_valid =
+      decode_candidate(
+          true, &transposed);
+
+  const bool direct_valid =
+      decode_candidate(
+          false, &direct);
+
+  // Never guess matrix orientation.
+  if (transposed_valid ==
+      direct_valid)
+  {
+    static unsigned logs = 0;
+
+    if (logs++ < 32)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-ps3-dmf] "
+          "GC BIND TABLE REJECT: "
+          "ps3=%s refs=%u offset=%zu "
+          "transposed=%d direct=%d | "
+          "ambiguous/invalid GC bind layout\n",
+          pair->ps3 ?
+              pair->ps3->
+                  source_name.c_str() :
+              "<unpaired>",
+          bone_count,
+          matrix_offset,
+          transposed_valid ? 1 : 0,
+          direct_valid ? 1 : 0);
+    }
+
+    return false;
+  }
+
+  pair->gc_inverse_bind_by_ref =
+      transposed_valid ?
+          std::move(transposed) :
+          std::move(direct);
+
+  pair->gc_bind_tables_valid = true;
+
+  static unsigned logs = 0;
+
+  if (logs++ < 32)
+  {
+    std::fprintf(
+        stderr,
+        "[moh-ps3-dmf] "
+        "GC BIND TABLE READY: "
+        "ps3=%s refs=%u offset=%zu "
+        "storage=%s | "
+        "authored retail GC inverse bind retained\n",
+        pair->ps3 ?
+            pair->ps3->
+                source_name.c_str() :
+            "<unpaired>",
+        bone_count,
+        matrix_offset,
+        transposed_valid ?
+            "transposed" :
+            "direct");
+  }
+
+  return true;
+}
+
 void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
 {
   if (!pair || !pair->ps3 || !pair->ps3->decoded || !pair->ps3->decoded->valid ||
       gc_bytes.size() < 0x50)
     return;
+
+  // v12.7:
+  // Decode GC bind now. Failure is safe: body rendering
+  // stays on the original GameCube path.
+  DecodeGCInverseBindTables(
+      gc_bytes, pair);
 
   const u32 gc_group_count = BE32(gc_bytes.data() + 0x20);
   const u32 gc_group_offset = BE32(gc_bytes.data() + 0x24);
@@ -5411,505 +5659,289 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
 
         if (draw.gc_material_name == "mohf_body")
         {
-          // v12.6:
+          // v12.7:
           //
-          // v11/v12 used inverse(linear blend(bindA, bindB)).
-          // A linear blend of two substantially rotated 3x3 matrices is not
-          // necessarily rigid and can approach singularity. Its inverse can
-          // therefore send character vertices extremely far away.
+          // The live XF palette comes from the retail GameCube
+          // animation system. Therefore the local-space conversion
+          // must use the retail GC authored bind as its counterpart.
           //
-          // v12.5 tested the opposite hypothesis (identity/model-space) and
-          // proved that the retail GC XF matrix DOES expect group-local input.
+          // PS3 model-bind vertex
+          //   -> authored GC group-local
+          //   -> unchanged live GC XF.
           //
-          // Build the group bind as a rigid transform instead:
-          //   rotation    = SLERP(bindB.rotation, bindA.rotation, q)
-          //   translation = LERP(bindB.translation, bindA.translation, q)
-          //   local_pos   = inverse(group_bind) * PS3_model_bind_pos
-          //
-          // q=0    -> bone_b
-          // q=4096 -> bone_a
-          //
-          // No offset, no scale, no AABB/centre correction.
+          // NO offset, scale, AABB recentering or visual heuristic.
 
           if (!exact_pair ||
               !exact_pair->gc_bone_order_proven ||
+              !exact_pair->gc_bind_tables_valid ||
+              exact_pair->
+                  gc_inverse_bind_by_ref.empty() ||
               gc_group < 0 ||
-              static_cast<std::size_t>(gc_group) >=
-                  exact_pair->gc_skin_groups.size())
+              static_cast<std::size_t>(
+                  gc_group) >=
+                  exact_pair->
+                      gc_skin_groups.size())
           {
-            *reason = "body-gc-group-bind-unavailable";
+            *reason =
+                "body-gc-authored-bind-unavailable";
+
             return false;
           }
 
           const auto& gc =
               exact_pair->gc_skin_groups[
-                  static_cast<std::size_t>(gc_group)];
+                  static_cast<std::size_t>(
+                      gc_group)];
 
-          // Do not extrapolate unproven legacy coefficients.
-          if (gc.blend_q > 4096 ||
-              gc.bone_a >= inverse_bind_by_ref.size() ||
-              gc.bone_b >= inverse_bind_by_ref.size())
-          {
-            *reason = "body-gc-group-bind-out-of-range";
-            return false;
-          }
-
-          std::array<float, 12> inverse_a{};
-          std::array<float, 12> inverse_b{};
-          std::array<float, 12> world_a{};
-          std::array<float, 12> world_b{};
-
-          if (!load_inverse_bind(gc.bone_a, &inverse_a) ||
-              !load_inverse_bind(gc.bone_b, &inverse_b) ||
-              !invert_affine(inverse_a, &world_a) ||
-              !invert_affine(inverse_b, &world_b))
-          {
-            *reason = "body-bone-bind-noninvertible";
-            return false;
-          }
-
-          // Quaternion layout: {w, x, y, z}.
-          using BodyQuat = std::array<float, 4>;
-
-          const auto normalize_quat =
-              [](BodyQuat* q)
-              {
-                if (!q)
-                  return false;
-
-                const double length2 =
-                    static_cast<double>((*q)[0]) * (*q)[0] +
-                    static_cast<double>((*q)[1]) * (*q)[1] +
-                    static_cast<double>((*q)[2]) * (*q)[2] +
-                    static_cast<double>((*q)[3]) * (*q)[3];
-
-                if (!std::isfinite(length2) ||
-                    length2 < 1.0e-12)
-                {
-                  return false;
-                }
-
-                const float inverse_length =
-                    static_cast<float>(
-                        1.0 / std::sqrt(length2));
-
-                for (float& value : *q)
-                {
-                  value *= inverse_length;
-
-                  if (!std::isfinite(value))
-                    return false;
-                }
-
-                return true;
-              };
-
-          const auto matrix_to_quat =
-              [&](const std::array<float, 12>& m,
-                  BodyQuat* out)
-              {
-                if (!out)
-                  return false;
-
-                const float m00 = m[0];
-                const float m01 = m[1];
-                const float m02 = m[2];
-
-                const float m10 = m[4];
-                const float m11 = m[5];
-                const float m12 = m[6];
-
-                const float m20 = m[8];
-                const float m21 = m[9];
-                const float m22 = m[10];
-
-                for (const float value :
-                     {m00, m01, m02,
-                      m10, m11, m12,
-                      m20, m21, m22})
-                {
-                  if (!std::isfinite(value))
-                    return false;
-                }
-
-                BodyQuat q{};
-
-                const float trace =
-                    m00 + m11 + m22;
-
-                if (trace > 0.0f)
-                {
-                  const float s =
-                      std::sqrt(trace + 1.0f) *
-                      2.0f;
-
-                  if (!std::isfinite(s) ||
-                      s < 1.0e-8f)
-                  {
-                    return false;
-                  }
-
-                  q[0] = 0.25f * s;
-                  q[1] = (m21 - m12) / s;
-                  q[2] = (m02 - m20) / s;
-                  q[3] = (m10 - m01) / s;
-                }
-                else if (m00 > m11 &&
-                         m00 > m22)
-                {
-                  const float s =
-                      std::sqrt(
-                          std::max(
-                              0.0f,
-                              1.0f + m00 -
-                                  m11 - m22)) *
-                      2.0f;
-
-                  if (!std::isfinite(s) ||
-                      s < 1.0e-8f)
-                  {
-                    return false;
-                  }
-
-                  q[0] = (m21 - m12) / s;
-                  q[1] = 0.25f * s;
-                  q[2] = (m01 + m10) / s;
-                  q[3] = (m02 + m20) / s;
-                }
-                else if (m11 > m22)
-                {
-                  const float s =
-                      std::sqrt(
-                          std::max(
-                              0.0f,
-                              1.0f + m11 -
-                                  m00 - m22)) *
-                      2.0f;
-
-                  if (!std::isfinite(s) ||
-                      s < 1.0e-8f)
-                  {
-                    return false;
-                  }
-
-                  q[0] = (m02 - m20) / s;
-                  q[1] = (m01 + m10) / s;
-                  q[2] = 0.25f * s;
-                  q[3] = (m12 + m21) / s;
-                }
-                else
-                {
-                  const float s =
-                      std::sqrt(
-                          std::max(
-                              0.0f,
-                              1.0f + m22 -
-                                  m00 - m11)) *
-                      2.0f;
-
-                  if (!std::isfinite(s) ||
-                      s < 1.0e-8f)
-                  {
-                    return false;
-                  }
-
-                  q[0] = (m10 - m01) / s;
-                  q[1] = (m02 + m20) / s;
-                  q[2] = (m12 + m21) / s;
-                  q[3] = 0.25f * s;
-                }
-
-                if (!normalize_quat(&q))
-                  return false;
-
-                *out = q;
-                return true;
-              };
-
-          const auto slerp_quat =
-              [&](BodyQuat from,
-                  BodyQuat to,
-                  float t,
-                  BodyQuat* out)
+          const auto load_gc_inverse =
+              [&](u32 ref,
+                  std::array<float, 12>* out)
               {
                 if (!out ||
-                    !std::isfinite(t))
+                    ref >=
+                        exact_pair->
+                            gc_inverse_bind_by_ref
+                                .size())
                 {
                   return false;
                 }
 
-                t = std::clamp(
-                    t, 0.0f, 1.0f);
+                const auto& source =
+                    exact_pair->
+                        gc_inverse_bind_by_ref[
+                            ref];
 
-                float dot =
-                    from[0] * to[0] +
-                    from[1] * to[1] +
-                    from[2] * to[2] +
-                    from[3] * to[3];
-
-                if (!std::isfinite(dot))
-                  return false;
-
-                // Same physical quaternion, shortest arc.
-                if (dot < 0.0f)
+                for (std::size_t row = 0;
+                     row < 3;
+                     ++row)
                 {
-                  for (float& value : to)
-                    value = -value;
-
-                  dot = -dot;
-                }
-
-                dot = std::clamp(
-                    dot, -1.0f, 1.0f);
-
-                BodyQuat result{};
-
-                // Avoid numerical instability for almost
-                // identical rotations.
-                if (dot > 0.9995f)
-                {
-                  for (std::size_t i = 0;
-                       i < result.size();
-                       ++i)
+                  for (std::size_t column = 0;
+                       column < 4;
+                       ++column)
                   {
-                    result[i] =
-                        from[i] +
-                        (to[i] - from[i]) * t;
-                  }
+                    const float value =
+                        source[
+                            row * 4 +
+                            column];
 
-                  if (!normalize_quat(&result))
-                    return false;
+                    if (!std::isfinite(value) ||
+                        std::abs(value) >
+                            1000000.0f)
+                    {
+                      return false;
+                    }
 
-                  *out = result;
-                  return true;
-                }
-
-                const float theta =
-                    std::acos(dot);
-
-                const float sin_theta =
-                    std::sin(theta);
-
-                if (!std::isfinite(theta) ||
-                    !std::isfinite(sin_theta) ||
-                    std::abs(sin_theta) <
-                        1.0e-8f)
-                {
-                  return false;
-                }
-
-                const float scale_from =
-                    std::sin(
-                        (1.0f - t) * theta) /
-                    sin_theta;
-
-                const float scale_to =
-                    std::sin(t * theta) /
-                    sin_theta;
-
-                for (std::size_t i = 0;
-                     i < result.size();
-                     ++i)
-                {
-                  result[i] =
-                      from[i] * scale_from +
-                      to[i] * scale_to;
-                }
-
-                if (!normalize_quat(&result))
-                  return false;
-
-                *out = result;
-                return true;
-              };
-
-          const auto quat_to_rotation =
-              [](const BodyQuat& q,
-                 std::array<float, 12>* m)
-              {
-                if (!m)
-                  return false;
-
-                const float w = q[0];
-                const float x = q[1];
-                const float y = q[2];
-                const float z = q[3];
-
-                const float xx = x * x;
-                const float yy = y * y;
-                const float zz = z * z;
-
-                const float xy = x * y;
-                const float xz = x * z;
-                const float yz = y * z;
-
-                const float wx = w * x;
-                const float wy = w * y;
-                const float wz = w * z;
-
-                (*m)[0] =
-                    1.0f - 2.0f * (yy + zz);
-                (*m)[1] =
-                    2.0f * (xy - wz);
-                (*m)[2] =
-                    2.0f * (xz + wy);
-
-                (*m)[4] =
-                    2.0f * (xy + wz);
-                (*m)[5] =
-                    1.0f - 2.0f * (xx + zz);
-                (*m)[6] =
-                    2.0f * (yz - wx);
-
-                (*m)[8] =
-                    2.0f * (xz - wy);
-                (*m)[9] =
-                    2.0f * (yz + wx);
-                (*m)[10] =
-                    1.0f - 2.0f * (xx + yy);
-
-                for (const std::size_t index :
-                     {std::size_t{0},
-                      std::size_t{1},
-                      std::size_t{2},
-                      std::size_t{4},
-                      std::size_t{5},
-                      std::size_t{6},
-                      std::size_t{8},
-                      std::size_t{9},
-                      std::size_t{10}})
-                {
-                  if (!std::isfinite(
-                          (*m)[index]))
-                  {
-                    return false;
+                    (*out)[
+                        row * 4 +
+                        column] =
+                        value;
                   }
                 }
 
                 return true;
               };
 
-          BodyQuat rotation_a{};
-          BodyQuat rotation_b{};
-          BodyQuat group_rotation{};
+          int rigid_ref = -1;
 
-          if (!matrix_to_quat(
-                  world_a, &rotation_a) ||
-              !matrix_to_quat(
-                  world_b, &rotation_b))
+          if (gc.blend_q == 4096)
           {
-            *reason =
-                "body-bind-rotation-invalid";
-            return false;
+            rigid_ref =
+                static_cast<int>(
+                    gc.bone_a);
+          }
+          else if (gc.blend_q == 0)
+          {
+            rigid_ref =
+                static_cast<int>(
+                    gc.bone_b);
+          }
+          else if (gc.bone_a ==
+                   gc.bone_b)
+          {
+            rigid_ref =
+                static_cast<int>(
+                    gc.bone_a);
           }
 
-          const float weight_a =
-              static_cast<float>(
-                  gc.blend_q) /
-              4096.0f;
-
-          const float weight_b =
-              1.0f - weight_a;
-
-          // q=0 -> bone_b
-          // q=4096 -> bone_a
-          if (!slerp_quat(
-                  rotation_b,
-                  rotation_a,
-                  weight_a,
-                  &group_rotation))
+          if (rigid_ref >= 0)
           {
-            *reason =
-                "body-bind-slerp-failed";
-            return false;
-          }
-
-          std::array<float, 12>
-              group_world{};
-
-          if (!quat_to_rotation(
-                  group_rotation,
-                  &group_world))
-          {
-            *reason =
-                "body-bind-rotation-build-failed";
-            return false;
-          }
-
-          // Translation is the same authored two-bone
-          // weight but remains an affine linear blend.
-          group_world[3] =
-              world_a[3] * weight_a +
-              world_b[3] * weight_b;
-
-          group_world[7] =
-              world_a[7] * weight_a +
-              world_b[7] * weight_b;
-
-          group_world[11] =
-              world_a[11] * weight_a +
-              world_b[11] * weight_b;
-
-          if (!std::isfinite(group_world[3]) ||
-              !std::isfinite(group_world[7]) ||
-              !std::isfinite(group_world[11]) ||
-              !invert_affine(
-                  group_world,
-                  position_transform))
-          {
-            *reason =
-                "body-rigid-group-bind-noninvertible";
-            return false;
-          }
-
-          // local normal =
-          // transpose(group_bind.rotation) * model normal
-          for (std::size_t row = 0;
-               row < 3;
-               ++row)
-          {
-            for (std::size_t column = 0;
-                 column < 3;
-                 ++column)
+            if (!load_gc_inverse(
+                    static_cast<u32>(
+                        rigid_ref),
+                    position_transform))
             {
-              (*normal_transform)
-                  [row * 3 + column] =
-                  group_world[
-                      column * 4 + row];
-            }
-          }
+              *reason =
+                  "body-gc-rigid-inverse-bind-invalid";
 
-          *blended =
-              gc.blend_q != 0 &&
-              gc.blend_q != 4096;
+              return false;
+            }
+
+            for (std::size_t row = 0;
+                 row < 3;
+                 ++row)
+            {
+              for (std::size_t column = 0;
+                   column < 3;
+                   ++column)
+              {
+                (*normal_transform)[
+                    row * 3 +
+                    column] =
+                    (*position_transform)[
+                        row * 4 +
+                        column];
+              }
+            }
+
+            *blended = false;
+          }
+          else
+          {
+            if (!blended_groups)
+            {
+              *reason =
+                  "body-gc-blended-bind-disabled";
+
+              return false;
+            }
+
+            // Do not clamp or extrapolate legacy values.
+            if (gc.blend_q > 4096)
+            {
+              *reason =
+                  "body-gc-blend-q-unproven";
+
+              return false;
+            }
+
+            std::array<float, 12>
+                inverse_a{},
+                inverse_b{},
+                world_a{},
+                world_b{};
+
+            if (!load_gc_inverse(
+                    gc.bone_a,
+                    &inverse_a) ||
+                !load_gc_inverse(
+                    gc.bone_b,
+                    &inverse_b) ||
+                !invert_affine(
+                    inverse_a,
+                    &world_a) ||
+                !invert_affine(
+                    inverse_b,
+                    &world_b))
+            {
+              *reason =
+                  "body-gc-bone-bind-noninvertible";
+
+              return false;
+            }
+
+            const float weight_a =
+                static_cast<float>(
+                    gc.blend_q) /
+                4096.0f;
+
+            const float weight_b =
+                1.0f - weight_a;
+
+            std::array<float, 12>
+                group_world{};
+
+            for (std::size_t i = 0;
+                 i < group_world.size();
+                 ++i)
+            {
+              group_world[i] =
+                  world_a[i] *
+                      weight_a +
+                  world_b[i] *
+                      weight_b;
+
+              if (!std::isfinite(
+                      group_world[i]))
+              {
+                *reason =
+                    "body-gc-group-bind-nonfinite";
+
+                return false;
+              }
+            }
+
+            if (!invert_affine(
+                    group_world,
+                    position_transform))
+            {
+              *reason =
+                  "body-gc-group-bind-noninvertible";
+
+              return false;
+            }
+
+            // Normal(model -> local):
+            // inverse-transpose(model_to_local)
+            // = transpose(group_world).
+            for (std::size_t row = 0;
+                 row < 3;
+                 ++row)
+            {
+              for (std::size_t column = 0;
+                   column < 3;
+                   ++column)
+              {
+                const float value =
+                    group_world[
+                        column * 4 +
+                        row];
+
+                if (!std::isfinite(value))
+                {
+                  *reason =
+                      "body-gc-normal-bind-nonfinite";
+
+                  return false;
+                }
+
+                (*normal_transform)[
+                    row * 3 +
+                    column] =
+                    value;
+              }
+            }
+
+            *blended = true;
+          }
 
           *reason = {};
 
           static std::unordered_set<
               std::string>
-              body_rigid_blend_logged;
+              body_gc_bind_logged;
 
-          const std::string body_log_key =
+          const std::string log_key =
               std::string(draw.gc_name) +
               "|" +
               std::to_string(gc_group);
 
-          if (body_rigid_blend_logged
-                  .insert(body_log_key)
+          if (body_gc_bind_logged
+                  .insert(log_key)
                   .second &&
-              body_rigid_blend_logged
-                      .size() <=
-                  128)
+              body_gc_bind_logged.size() <=
+                  160)
           {
             std::fprintf(
                 stderr,
                 "[moh-ps3-skin] "
-                "BODY RIGID-BLEND READY: "
+                "BODY GC-BIND READY: "
                 "gc=%.*s gc_group=%d "
-                "ps3_group=%u bones=%u/%u "
-                "q=%u/4096 mode=slerp | "
+                "ps3_group=%u "
+                "bones=%u/%u "
+                "q=%u/4096 rigid=%d | "
                 "PS3 model-bind -> "
-                "rigid GC group-local\n",
+                "authored retail GC group-local "
+                "-> live XF\n",
                 static_cast<int>(
                     draw.gc_name.size()),
                 draw.gc_name.data(),
@@ -5917,7 +5949,8 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
                 ps3_group,
                 gc.bone_a,
                 gc.bone_b,
-                gc.blend_q);
+                gc.blend_q,
+                rigid_ref >= 0 ? 1 : 0);
           }
 
           return true;
@@ -6396,15 +6429,16 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
         g_current_draw = cached->second;
         g_current_draw_transient_world = true;
         g_current_world_direct_key = direct_key;
+        PS3WorldCPTRuntime::LearnExactDrawMaterial(g_current_draw);
         return g_current_draw;
       }
       if (g_world_direct_rejected.contains(direct_key))
         return {};
     }
 
-    const float maximum_triangle_ratio =
+    static const float maximum_triangle_ratio =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_TRI_RATIO", 1.35f, 1.0f, 8.0f);
-    const u32 triangle_slop = static_cast<u32>(std::lround(
+    static const u32 triangle_slop = static_cast<u32>(std::lround(
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_TRI_SLOP", 4.0f, 0.0f, 256.0f)));
 
     float best_score = std::numeric_limits<float>::infinity();
@@ -6419,9 +6453,40 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     std::size_t claimed_elsewhere = 0;
     std::size_t considered = 0;
 
+    // MOH_PS3_MESH_MATCH_FAST_CANDIDATES_V1
+    struct FastWorldCandidate
     {
+      std::shared_ptr<StaticMesh> owner;
+      Bounds3 bounds;
+      u32 triangles = 0;
+    };
+
+    const std::string_view fast_world_level_now =
+        MOHFrontline::NativeAssets::GetCurrentLevel();
+    const auto fast_world_generation_now =
+        PS3RemasterAssets::GetIndexGeneration();
+
+    static thread_local bool fast_world_ready = false;
+    static thread_local std::string fast_world_level;
+    static thread_local auto fast_world_generation = fast_world_generation_now;
+    static thread_local std::vector<FastWorldCandidate> fast_world_candidates;
+    static thread_local std::unordered_map<const StaticMesh*, Bounds3> fast_world_bounds;
+
+    if (!fast_world_ready ||
+        std::string_view(fast_world_level) != fast_world_level_now ||
+        fast_world_generation != fast_world_generation_now)
+    {
+      fast_world_ready = true;
+      fast_world_level.assign(fast_world_level_now);
+      fast_world_generation = fast_world_generation_now;
+      fast_world_candidates.clear();
+      fast_world_bounds.clear();
+
       std::unordered_set<const StaticMesh*> seen;
       std::scoped_lock lock(g_msh_cache_mutex);
+      fast_world_candidates.reserve(g_msh_cache.size());
+      fast_world_bounds.reserve(g_msh_cache.size());
+
       for (const auto& [key, holder] : g_msh_cache)
       {
         (void)key;
@@ -6433,16 +6498,61 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
         if (!submesh.vertex_count || submesh.position_uv.size() != submesh.vertex_count ||
             submesh.indices.empty() || (submesh.indices.size() % 3) != 0)
           continue;
-        ++world_candidates;
 
-        const u32 ps3_triangles = static_cast<u32>(submesh.indices.size() / 3);
-        const u32 smaller = std::max(1u, std::min(gc_triangle_count, ps3_triangles));
-        const u32 larger = std::max(gc_triangle_count, ps3_triangles);
-        const u32 triangle_delta = larger - smaller;
-        const float triangle_ratio = static_cast<float>(larger) / static_cast<float>(smaller);
-        if (triangle_delta > triangle_slop && triangle_ratio > maximum_triangle_ratio)
+        const Bounds3 bounds = BoundsFromPS3(submesh);
+        if (!bounds.valid)
           continue;
-        ++topology_compatible;
+
+        const u32 triangles = static_cast<u32>(submesh.indices.size() / 3);
+        fast_world_candidates.push_back({holder, bounds, triangles});
+        fast_world_bounds.emplace(holder.get(), bounds);
+      }
+
+      std::sort(fast_world_candidates.begin(), fast_world_candidates.end(),
+                [](const FastWorldCandidate& a, const FastWorldCandidate& b) {
+                  return a.triangles < b.triangles;
+                });
+    }
+
+    world_candidates = fast_world_candidates.size();
+
+    const u32 ratio_lower =
+        std::max(1u, static_cast<u32>(std::floor(
+                         static_cast<double>(gc_triangle_count) /
+                         static_cast<double>(maximum_triangle_ratio))));
+    const u64 ratio_upper64 = static_cast<u64>(std::ceil(
+        static_cast<double>(gc_triangle_count) *
+        static_cast<double>(maximum_triangle_ratio)));
+    const u32 slop_lower =
+        gc_triangle_count > triangle_slop ? gc_triangle_count - triangle_slop : 1u;
+    const u64 slop_upper64 =
+        static_cast<u64>(gc_triangle_count) + static_cast<u64>(triangle_slop);
+
+    const u32 compatible_lower = std::min(ratio_lower, slop_lower);
+    const u32 compatible_upper = static_cast<u32>(std::min<u64>(
+        std::numeric_limits<u32>::max(), std::max(ratio_upper64, slop_upper64)));
+
+    const auto candidate_first = std::lower_bound(
+        fast_world_candidates.begin(), fast_world_candidates.end(), compatible_lower,
+        [](const FastWorldCandidate& candidate, u32 triangles) {
+          return candidate.triangles < triangles;
+        });
+    const auto candidate_last = std::upper_bound(
+        candidate_first, fast_world_candidates.end(), compatible_upper,
+        [](u32 triangles, const FastWorldCandidate& candidate) {
+          return triangles < candidate.triangles;
+        });
+
+    topology_compatible =
+        static_cast<std::size_t>(std::distance(candidate_first, candidate_last));
+
+    {
+      std::scoped_lock lock(g_msh_cache_mutex);
+      for (auto candidate = candidate_first; candidate != candidate_last; ++candidate)
+      {
+        const auto& holder = candidate->owner;
+        if (!holder)
+          continue;
 
         if (const auto claim = g_world_direct_claims.find(holder.get());
             claim != g_world_direct_claims.end() && claim->second != direct_key)
@@ -6452,11 +6562,12 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
         }
 
         ++considered;
-        const Bounds3 ps3_bounds = BoundsFromPS3(submesh);
+        const Bounds3& ps3_bounds = candidate->bounds;
         const float score = BoundsScore(gc, ps3_bounds);
         const float extent_score = BoundsExtentScore(gc, ps3_bounds);
         if (!std::isfinite(score))
           continue;
+
         if (score < best_score)
         {
           second_score = best_score;
@@ -6580,7 +6691,11 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
             vertex_total += sub.vertex_count;
             if (vertex_total > 65535u)
               break;
-            UnionBounds(&aggregate, BoundsFromPS3(sub));
+            if (const auto cached_bounds = fast_world_bounds.find(member.get());
+                cached_bounds != fast_world_bounds.end())
+              UnionBounds(&aggregate, cached_bounds->second);
+            else
+              UnionBounds(&aggregate, BoundsFromPS3(sub));
 
             const std::size_t range_count = end - first + 1;
             if (range_count < 2 || !aggregate.valid)
@@ -6725,6 +6840,7 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     g_current_draw = learned;
     g_current_draw_transient_world = true;
     g_current_world_direct_key = direct_key;
+    PS3WorldCPTRuntime::LearnExactDrawMaterial(g_current_draw);
     ++g_matches;
 
     static thread_local unsigned match_logs = 0;
