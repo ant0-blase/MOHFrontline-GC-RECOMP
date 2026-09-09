@@ -209,42 +209,27 @@ struct RuntimeTextureHashCacheLine
   u32 width = 0;
   u32 height = 0;
   u32 format = 0;
-  u64 sample = 0;
+  std::array<u8, 128> sample{};
   u64 hash = 0;
   bool valid = false;
 };
 
 inline thread_local std::array<RuntimeTextureHashCacheLine, 1024> runtime_texture_hash_cache{};
 
-inline u64 RuntimeTextureSampleSignature(const u8* data, std::size_t size)
+// Preserve every sampled byte rather than serially hashing 128 bytes on each
+// bind. Full FNV remains the catalog identity; only cache validation changes.
+inline std::array<u8, 128> RuntimeTextureSampleSignature(const u8* data, std::size_t size)
 {
+  std::array<u8, 128> sample{};
   if (!data || !size)
-    return 0;
-
-  constexpr std::size_t windows = 8;
-  constexpr std::size_t bytes_per_window = 16;
-
-  u64 hash = 0xcbf29ce484222325ULL;
-  hash ^= static_cast<u64>(size);
-  hash *= 0x100000001b3ULL;
-
-  for (std::size_t window = 0; window < windows; ++window)
+    return sample;
+  const std::size_t span = size > 16 ? size - 16 : 0;
+  for (std::size_t window = 0; window < 8; ++window)
   {
-    const std::size_t span =
-        size > bytes_per_window ? size - bytes_per_window : 0;
-    const std::size_t base =
-        windows > 1 ? (span * window) / (windows - 1) : 0;
-    const std::size_t count =
-        std::min(bytes_per_window, size - base);
-
-    for (std::size_t i = 0; i < count; ++i)
-    {
-      hash ^= data[base + i];
-      hash *= 0x100000001b3ULL;
-    }
+    const std::size_t base = span * window / 7;
+    std::memcpy(sample.data() + window * 16, data + base, std::min(std::size_t{16}, size - base));
   }
-
-  return hash;
+  return sample;
 }
 
 inline u64 RuntimeTextureHash(const TextureInfo& info)
@@ -258,7 +243,7 @@ inline u64 RuntimeTextureHash(const TextureInfo& info)
   const u32 width = info.GetRawWidth();
   const u32 height = info.GetRawHeight();
   const u32 format = static_cast<u32>(info.GetTextureFormat());
-  const u64 sample = RuntimeTextureSampleSignature(data, size);
+  const auto sample = RuntimeTextureSampleSignature(data, size);
 
   const std::uintptr_t pointer_bits =
       reinterpret_cast<std::uintptr_t>(data);
@@ -269,20 +254,36 @@ inline u64 RuntimeTextureHash(const TextureInfo& info)
   index_key ^= static_cast<u64>(height) << 33;
   index_key ^= static_cast<u64>(format) << 49;
 
-  RuntimeTextureHashCacheLine& line =
-      runtime_texture_hash_cache[index_key & (runtime_texture_hash_cache.size() - 1)];
-
-  if (line.valid &&
-      line.data == data &&
-      line.address == address &&
-      line.size == size &&
-      line.width == width &&
-      line.height == height &&
-      line.format == format &&
-      line.sample == sample)
+  // Addresses/sizes are aligned, so masking their low bits caused systematic
+  // collisions. Fold high bits into the index, then probe a four-way set.
+  index_key ^= index_key >> 30;
+  index_key *= 0xbf58476d1ce4e5b9ULL;
+  index_key ^= index_key >> 27;
+  index_key *= 0x94d049bb133111ebULL;
+  index_key ^= index_key >> 31;
+  constexpr std::size_t ways = 4;
+  constexpr std::size_t sets = runtime_texture_hash_cache.size() / ways;
+  const std::size_t set = index_key & (sets - 1);
+  static thread_local std::array<u8, sets> next_victim{};
+  RuntimeTextureHashCacheLine* empty = nullptr;
+  for (std::size_t way = 0; way < ways; ++way)
   {
-    return line.hash;
+    auto& candidate = runtime_texture_hash_cache[set * ways + way];
+    if (!candidate.valid)
+      empty = &candidate;
+    if (candidate.valid && candidate.data == data && candidate.address == address &&
+        candidate.size == size && candidate.width == width && candidate.height == height &&
+        candidate.format == format)
+    {
+      if (candidate.sample == sample)
+        return candidate.hash;
+      // Reuse this identity's slot when its sampled content changes.
+      empty = &candidate;
+      break;
+    }
   }
+  RuntimeTextureHashCacheLine& line = empty ? *empty :
+      runtime_texture_hash_cache[set * ways + (next_victim[set]++ % ways)];
 
   const u64 hash = FNV1a64(data, size);
   line.data = data;

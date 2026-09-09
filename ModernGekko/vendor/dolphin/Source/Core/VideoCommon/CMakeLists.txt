@@ -139,6 +139,8 @@ add_library(videocommon
   MOHFrontline/Engine/Filesystem/NativeVFS.h
   MOHFrontline/Engine/Audio/NativeAudio.cpp
   MOHFrontline/Engine/Audio/NativeAudio.h
+  MOHFrontline/Engine/Video/NativeVideo.cpp
+  MOHFrontline/Engine/Video/NativeVideo.h
   MOHFrontline/Engine/Renderer/NativeRenderBridge.cpp
   MOHFrontline/Engine/Renderer/NativeRenderBridge.h
   MOHFrontline/Engine/Renderer/NativeHostRenderer.cpp
@@ -292,8 +294,15 @@ else()
   )
 endif()
 
+# MOH native media needs FFmpeg even when Dolphin's top-level FindFFmpeg
+# module did not create FFmpeg::* targets. Arch/distro builds commonly expose
+# the development libraries through pkg-config instead.
+set(MOH_NATIVE_MEDIA_FFMPEG OFF)
 if(FFmpeg_FOUND)
-  target_compile_definitions(videocommon PRIVATE MOH_NATIVE_AUDIO_FFMPEG=1)
+  target_compile_definitions(videocommon PRIVATE
+    MOH_NATIVE_AUDIO_FFMPEG=1
+    MOH_NATIVE_VIDEO_FFMPEG=1
+  )
   target_sources(videocommon PRIVATE
     FrameDumpFFMpeg.cpp
   )
@@ -304,6 +313,7 @@ if(FFmpeg_FOUND)
     FFmpeg::swresample
     FFmpeg::swscale
   )
+  set(MOH_NATIVE_MEDIA_FFMPEG ON)
   if(APPLE)
     target_link_libraries(videocommon PRIVATE
       ${COREMEDIA_LIBRARY}
@@ -312,6 +322,30 @@ if(FFmpeg_FOUND)
       ${AUDIOTOOLBOX_LIBRARY}
     )
   endif()
+else()
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(MOH_NATIVE_FFMPEG QUIET IMPORTED_TARGET
+      libavcodec
+      libavformat
+      libavutil
+      libswresample
+      libswscale
+    )
+    if(MOH_NATIVE_FFMPEG_FOUND)
+      target_compile_definitions(videocommon PRIVATE
+        MOH_NATIVE_AUDIO_FFMPEG=1
+        MOH_NATIVE_VIDEO_FFMPEG=1
+      )
+      target_link_libraries(videocommon PRIVATE PkgConfig::MOH_NATIVE_FFMPEG)
+      set(MOH_NATIVE_MEDIA_FFMPEG ON)
+      message(STATUS "MOH native media: FFmpeg linked through pkg-config")
+    endif()
+  endif()
+endif()
+
+if(NOT MOH_NATIVE_MEDIA_FFMPEG)
+  message(STATUS "MOH native media: FFmpeg unavailable; guest movie fallback stays enabled")
 endif()
 
 if(MSVC)

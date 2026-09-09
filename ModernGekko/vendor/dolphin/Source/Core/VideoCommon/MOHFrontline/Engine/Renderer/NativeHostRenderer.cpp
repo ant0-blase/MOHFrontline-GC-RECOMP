@@ -326,7 +326,7 @@ std::array<u8, 4> ComputeHostLighting(const MaterialProfile& profile,
     rgb = {fallback, fallback, fallback};
   }
 
-  const float exposure = EnvFloat("MOH_NATIVE_RENDER_EXPOSURE", 1.0f, 0.1f, 4.0f);
+  static const float exposure = EnvFloat("MOH_NATIVE_RENDER_EXPOSURE", 1.0f, 0.1f, 4.0f);
   std::array<u8, 4> out{255, 255, 255, 255};
   for (int c = 0; c < 3; ++c)
   {
@@ -338,21 +338,24 @@ std::array<u8, 4> ComputeHostLighting(const MaterialProfile& profile,
 
 Style GetStyle()
 {
-  const char* value = std::getenv("MOH_NATIVE_RENDER_STYLE");
-  if (!value || !*value)
-    return Style::Wireframe;
+  static const Style cached = [] {
+    const char* value = std::getenv("MOH_NATIVE_RENDER_STYLE");
+    if (!value || !*value)
+      return Style::Wireframe;
 
-  const std::string v = Lower(value);
-  if (v == "solid" || v == "flat" || v == "fill")
-    return Style::Solid;
-  if (v == "textured" || v == "texture" || v == "tex")
-    return Style::Textured;
-  if (v == "textured-wire" || v == "textured_wire" || v == "texture-wire" ||
-      v == "tex-wire" || v == "both")
-  {
-    return Style::TexturedWire;
-  }
-  return Style::Wireframe;
+    const std::string v = Lower(value);
+    if (v == "solid" || v == "flat" || v == "fill")
+      return Style::Solid;
+    if (v == "textured" || v == "texture" || v == "tex")
+      return Style::Textured;
+    if (v == "textured-wire" || v == "textured_wire" || v == "texture-wire" ||
+        v == "tex-wire" || v == "both")
+    {
+      return Style::TexturedWire;
+    }
+    return Style::Wireframe;
+  }();
+  return cached;
 }
 
 const char* StyleName(Style style)
@@ -383,18 +386,21 @@ bool WantsTexture(Style style)
 
 std::size_t MaxTrianglesPerDraw()
 {
-  constexpr std::size_t fallback = 32768;
-  const char* value = std::getenv("MOH_NATIVE_RENDER_MAX_TRIS");
-  if (!value || !*value)
-    return fallback;
+  static const std::size_t cached = [] {
+    constexpr std::size_t fallback = 32768;
+    const char* value = std::getenv("MOH_NATIVE_RENDER_MAX_TRIS");
+    if (!value || !*value)
+      return fallback;
 
-  char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(value, &end, 10);
-  if (end == value || parsed == 0)
-    return fallback;
-  const unsigned long long hard_cap =
-      static_cast<unsigned long long>(VertexManagerBase::MAXIBUFFERSIZE / 6u);
-  return static_cast<std::size_t>(std::min(parsed, hard_cap));
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || parsed == 0)
+      return fallback;
+    const unsigned long long hard_cap =
+        static_cast<unsigned long long>(VertexManagerBase::MAXIBUFFERSIZE / 6u);
+    return static_cast<std::size_t>(std::min(parsed, hard_cap));
+  }();
+  return cached;
 }
 
 std::array<float, 3> ModelToGCLocal(const NativeRender::DrawPacket& packet,
@@ -651,25 +657,27 @@ bool EnsurePipelines(State& state, bool use_depth)
   {
     state.logged_ready = true;
     std::fprintf(stderr,
-                 "[moh-native-render] HOST RENDERER v8 ready: PS3 normals + host lighting + "
-                 "material response + stage0 texture -> EFB\n");
+                 "[moh-native-render] HOST RENDERER v9 ready: asset normals + host lighting + "
+                 "material response + source-neutral stage0 texture -> EFB\n");
   }
   return true;
 }
 
 bool Submit(const NativeRender::DrawPacket& packet, void*)
 {
-  if (!EnvSwitch("MOH_NATIVE_RENDER_OVERLAY", true) || packet.vertices.empty() ||
+  static const bool overlay = EnvSwitch("MOH_NATIVE_RENDER_OVERLAY", true);
+  if (!overlay || packet.vertices.empty() ||
       packet.indices.size() < 3 || packet.vertices.size() > 65535)
   {
     return false;
   }
 
   const Style style = GetStyle();
-  const bool use_depth = EnvSwitch(
+  static const bool use_depth = EnvSwitch(
       "MOH_NATIVE_RENDER_DEPTH", NativeRender::GetMode() == NativeRender::Mode::PreferNative);
-  const bool use_lighting = EnvSwitch("MOH_NATIVE_RENDER_LIGHTING", true) && WantsSolid(style);
-  const bool deform_guard = EnvSwitch(
+  static const bool lighting = EnvSwitch("MOH_NATIVE_RENDER_LIGHTING", true);
+  const bool use_lighting = lighting && WantsSolid(style);
+  static const bool deform_guard = EnvSwitch(
       "MOH_NATIVE_RENDER_DEFORM_GUARD", NativeRender::GetMode() == NativeRender::Mode::PreferNative);
   const MaterialProfile material = GetMaterialProfile(packet);
 
@@ -745,14 +753,14 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
     const float valid_ratio = packet.vertices.empty() ? 0.0f :
         static_cast<float>(packet.vertices.size() - invalid_vertices) /
             static_cast<float>(packet.vertices.size());
-    const float minimum = EnvFloat("MOH_NATIVE_RENDER_MIN_VALID_VERTS", 0.82f, 0.25f, 1.0f);
+    static const float minimum = EnvFloat("MOH_NATIVE_RENDER_MIN_VALID_VERTS", 0.82f, 0.25f, 1.0f);
     if (valid_ratio < minimum)
     {
       ++state.guard_fallbacks;
       if (state.guard_fallbacks <= 32)
       {
         std::fprintf(stderr,
-                     "[moh-native-render] v8 DEFORM GUARD -> GX source=%s valid=%.3f "
+                     "[moh-native-render] v9 DEFORM GUARD -> GX source=%s valid=%.3f "
                      "required=%.3f invalid=%zu/%zu\n",
                      packet.source_name.c_str(), valid_ratio, minimum, invalid_vertices,
                      packet.vertices.size());
@@ -813,14 +821,14 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
   {
     const float triangle_ratio =
         static_cast<float>(accepted_triangles) / static_cast<float>(triangle_count);
-    const float minimum = EnvFloat("MOH_NATIVE_RENDER_MIN_VALID_TRIS", 0.88f, 0.25f, 1.0f);
+    static const float minimum = EnvFloat("MOH_NATIVE_RENDER_MIN_VALID_TRIS", 0.88f, 0.25f, 1.0f);
     if (triangle_ratio < minimum)
     {
       ++state.guard_fallbacks;
       if (state.guard_fallbacks <= 32)
       {
         std::fprintf(stderr,
-                     "[moh-native-render] v8 DEFORM GUARD -> GX source=%s tris=%.3f "
+                     "[moh-native-render] v9 DEFORM GUARD -> GX source=%s tris=%.3f "
                      "required=%.3f accepted=%zu/%zu\n",
                      packet.source_name.c_str(), triangle_ratio, minimum, accepted_triangles,
                      triangle_count);
@@ -897,7 +905,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
                  packet.material_name.empty() ? "<none>" : packet.material_name.c_str(),
                  accepted_triangles, StyleName(style), use_depth ? 1 : 0,
                  WantsTexture(style) ? "stage0-current" : "none",
-                 use_lighting ? "PS3-normal/GX-lights" : "off", material.ambient,
+                 use_lighting ? "asset-normal/GX-lights" : "off", material.ambient,
                  material.diffuse, material.specular, material.shininess,
                  static_cast<unsigned long long>(state.guard_fallbacks),
                  static_cast<unsigned long long>(state.submitted_draws));

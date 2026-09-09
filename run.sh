@@ -460,6 +460,9 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   fi
 fi
 
+# Keep mohf_body on the GameCube path, including inherited PS3 settings.
+export MOH_PS3_DMF_BODY_MODEL_SPACE=0
+
 exec "$RUNTIME" \
   --game "$GAME" \
   --module "$MODULE" \

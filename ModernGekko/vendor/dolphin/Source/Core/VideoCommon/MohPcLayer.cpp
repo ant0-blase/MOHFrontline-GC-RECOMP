@@ -1938,6 +1938,7 @@ void SetMovieActive(bool active)
 }
 
 bool IsGameplayActive() { return s.gameplay.load(); }
+bool IsMovieActive() { return s.movie_active.load(); }
 bool IsSettingsOpen() { return s.settings_open.load(); }
 bool IsDebugOpen() { return s.debug_open.load(); }
 

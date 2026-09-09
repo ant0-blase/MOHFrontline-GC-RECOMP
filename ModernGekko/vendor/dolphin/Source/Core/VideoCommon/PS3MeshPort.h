@@ -151,6 +151,7 @@ struct DMFReplacementReadiness
 
 struct PreparedDMFDraw
 {
+  std::size_t gc_material_draws = 0;
   std::string gc_name, material_name, skeleton_name;
   std::vector<u8> palette;
   std::vector<s16> group_map;

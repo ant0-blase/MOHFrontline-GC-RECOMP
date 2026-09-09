@@ -317,8 +317,35 @@ std::size_t LocaleAwareScore(
           Normalize(asset.relative_path));
 }
 
+bool KeepOriginalGCTexture()
+{
+  // Explicit texture policy wins. If absent, inherit NativeVFS so gc-first
+  // really keeps the original GameCube .gsh instead of still mapping to .ssh.
+  const char* value = std::getenv("MOH_NATIVE_TEXTURE_SOURCE");
+  if (!value || !*value)
+    value = std::getenv("MOH_NATIVE_VFS");
+  if (!value || !*value)
+    return false;
+
+  const std::string v = Lower(value);
+  return v == "gc" || v == "gc-first" || v == "gc_first" ||
+         v == "gc-only" || v == "gc_only";
+}
+
 const PS3RemasterAssets::AssetInfo* FindBestAsset(std::string_view guest_name)
 {
+  if (KeepOriginalGCTexture())
+  {
+    static bool logged = false;
+    if (!logged)
+    {
+      logged = true;
+      std::fprintf(stderr,
+                   "[moh-native-texture] source=GC-original: keeping guest .gsh; "
+                   "PS3 .ssh replacement disabled by policy\n");
+    }
+    return nullptr;
+  }
 
   if (!PS3RemasterAssets::IsReady())
     return nullptr;

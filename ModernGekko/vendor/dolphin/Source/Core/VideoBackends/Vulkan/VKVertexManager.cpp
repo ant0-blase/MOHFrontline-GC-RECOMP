@@ -4,6 +4,7 @@
 #include "VideoBackends/Vulkan/VKVertexManager.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include "Common/Align.h"
 #include "Common/CommonTypes.h"
@@ -162,11 +163,12 @@ void VertexManager::ResetBuffer(u32 vertex_stride)
       PanicAlertFmt("Failed to allocate space in streaming buffers for pending draw");
   }
 
-  // Update pointers
-  m_base_buffer_pointer = m_vertex_stream_buffer->GetHostPointer();
-  m_end_buffer_pointer = m_vertex_stream_buffer->GetCurrentHostPointer() + MAXVBUFFERSIZE;
-  m_cur_buffer_pointer = m_vertex_stream_buffer->GetCurrentHostPointer();
-  m_index_generator.Start(reinterpret_cast<u16*>(m_index_stream_buffer->GetCurrentHostPointer()));
+  // Matching and skinning reread decoded vertices. The Vulkan mapping is
+  // allocated for sequential writes and may be uncached/write-combined.
+  // Keep CPU processing in cached memory, then upload the final batch once.
+  // This also makes m_base_buffer_pointer identify this batch, rather than
+  // the beginning of the entire Vulkan ring at a potentially different offset.
+  VertexManagerBase::ResetBuffer(vertex_stride);
 }
 
 void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_indices,
@@ -179,6 +181,10 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
       vertex_stride > 0 ? (m_vertex_stream_buffer->GetCurrentOffset() / vertex_stride) : 0;
   *out_base_index = m_index_stream_buffer->GetCurrentOffset() / sizeof(u16);
 
+  std::memcpy(m_vertex_stream_buffer->GetCurrentHostPointer(), m_base_buffer_pointer,
+              vertex_data_size);
+  std::memcpy(m_index_stream_buffer->GetCurrentHostPointer(), m_cpu_index_buffer.data(),
+              index_data_size);
   m_vertex_stream_buffer->CommitMemory(vertex_data_size);
   m_index_stream_buffer->CommitMemory(index_data_size);
 

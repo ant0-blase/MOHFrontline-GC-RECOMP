@@ -472,12 +472,27 @@ bool RestoreNativeLightState(VertexShaderConstants& constants, const XFMemory& x
 
 bool IsTPKRSXEnabled()
 {
-  return EnvSwitch("MOH_PS3_TPK_RSX", true) && EnvSwitch("MOH_PS3_TPK", true) &&
-         EnvSwitch("MOH_PS3_RSX", true) && EnvSwitch("MOH_PS3_LEVEL_PORT", true);
+  static const bool cached = [] {
+    return EnvSwitch("MOH_PS3_TPK_RSX", true) && EnvSwitch("MOH_PS3_TPK", true) &&
+           EnvSwitch("MOH_PS3_RSX", true) && EnvSwitch("MOH_PS3_LEVEL_PORT", true);
+  }();
+  return cached;
 }
-bool IsMSHEnabled() { return EnvSwitch("MOH_PS3_MSH", true); }
-bool IsDMFEnabled() { return EnvSwitch("MOH_PS3_DMF", true); }
-bool IsSKLEnabled() { return EnvSwitch("MOH_PS3_SKL", true); }
+bool IsMSHEnabled()
+{
+  static const bool enabled = EnvSwitch("MOH_PS3_MSH", true);
+  return enabled;
+}
+bool IsDMFEnabled()
+{
+  static const bool enabled = EnvSwitch("MOH_PS3_DMF", true);
+  return enabled;
+}
+bool IsSKLEnabled()
+{
+  static const bool enabled = EnvSwitch("MOH_PS3_SKL", true);
+  return enabled;
+}
 bool IsLightingEnabled() { return s_lighting_enabled; }
 
 void Initialize()

@@ -13,6 +13,7 @@
 
 #include "Core/HW/DVD/MOHNativeVFSBridge.h"
 #include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
+#include "VideoCommon/MOHFrontline/Engine/Video/NativeVideo.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 
 namespace MOHFrontline::NativeVFS
@@ -258,9 +259,10 @@ File ResolveGC(std::string_view guest_path, PS3AssetPort::Class wanted)
 bool DiscReadCallback(std::string_view guest_path, u64 file_offset, std::span<u8> destination)
 {
   // The guest must keep receiving GameCube-compatible bytes. PS3 resources
-  // are consumed by semantic native loaders (textures/audio/meshes), never
+  // are consumed by semantic native loaders (textures/audio/meshes/video), never
   // injected raw into the original GC loader.
   NativeAudio::NotifyGuestRead(guest_path, file_offset);
+  NativeVideo::NotifyGuestRead(guest_path, file_offset);
 
   if (const char* value = std::getenv("MOH_NATIVE_VFS_DISC"); value && *value)
   {
@@ -313,6 +315,7 @@ void Shutdown()
 {
   DVD::SetMOHNativeVFSReadCallback(nullptr);
   NativeAudio::Stop();
+  NativeVideo::Stop();
 
   std::scoped_lock lock(s_mutex);
   s_gc_roots.clear();

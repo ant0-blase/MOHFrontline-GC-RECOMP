@@ -35,6 +35,7 @@ bool ConsumeVBlankPresentSuppression(u32 xfb_addr);
 void SetGameplayActive(bool active);
 bool IsGameplayActive();
 void SetMovieActive(bool active);
+bool IsMovieActive();
 bool IsSettingsOpen();
 bool IsDebugOpen();
 

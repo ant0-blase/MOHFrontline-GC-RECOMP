@@ -117,6 +117,8 @@ bool DecodeRSXNormal(const u8* vertex, const Attribute& attribute,
 }
 std::mutex g_msh_cache_mutex;
 std::unordered_map<std::string, std::shared_ptr<StaticMesh>> g_msh_cache;
+// Protected by g_msh_cache_mutex, including lazy mesh insertions.
+u64 g_msh_cache_revision = 0;
 struct DisplayListIdentity
 {
   StaticDrawMatch match;
@@ -306,6 +308,34 @@ std::string Lower(std::string text)
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return text;
 }
+
+
+bool PS3RuntimeDebugEnabled()
+{
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("MOH_PS3_DEBUG");
+
+    // Keep compatibility with every command used during v9-v12 development.
+    if (!value || !*value)
+      value =
+          std::getenv("MOH_PS3_DMF_VERBOSE");
+
+    if (!value || !*value)
+      return false;
+
+    const std::string lower =
+        Lower(value);
+
+    return lower == "1" ||
+           lower == "true" ||
+           lower == "yes" ||
+           lower == "on";
+  }();
+
+  return enabled;
+}
+
 
 std::string BaseName(std::string_view path)
 {
@@ -1637,19 +1667,6 @@ std::string WorldDescriptorClaimKey(std::string_view source, std::size_t descrip
   return key;
 }
 
-bool WorldRangeHasForeignClaim(std::string_view source, std::size_t first, std::size_t count,
-                               u64 direct_key)
-{
-  for (std::size_t member = 0; member < count; ++member)
-  {
-    const auto key = WorldDescriptorClaimKey(source, first + member);
-    if (const auto claim = g_world_dynamic_descriptor_claims.find(key);
-        claim != g_world_dynamic_descriptor_claims.end() && claim->second != direct_key)
-      return true;
-  }
-  return false;
-}
-
 std::vector<std::string> WorldRangeDescriptorKeys(std::string_view source, std::size_t first,
                                                   std::size_t count)
 {
@@ -2005,7 +2022,11 @@ void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
   std::scoped_lock lock(g_dmf_cache_mutex);
   if (g_dmf_display_list_candidates.empty())
     return;
-  ++g_dmf_lookups;
+  const bool runtime_debug =
+      PS3RuntimeDebugEnabled();
+
+  if (runtime_debug)
+    ++g_dmf_lookups;
   auto& cached = g_dmf_address_cache[(runtime_address >> 5) % g_dmf_address_cache.size()];
   const OriginalGCDMFDrawCandidate* resolved = nullptr;
   const u32 command_size = static_cast<u32>(commands.size());
@@ -2015,11 +2036,13 @@ void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
     // Authored DMF DLs are immutable. Revalidate resource identity on every hit;
     // morph output uses different DL storage and cannot pass this header check.
     resolved = cached.candidate;
-    ++g_dmf_hits;
+    if (runtime_debug)
+      ++g_dmf_hits;
   }
   else
   {
-    ++g_dmf_misses;
+    if (runtime_debug)
+      ++g_dmf_misses;
     bool topology_fallback = false;
 
     // Normal path: byte-exact authored DL plus a live DMF header at
@@ -2125,9 +2148,7 @@ void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
   g_current_dmf_draw.ps3_group_to_gc = prepared.group_map;
   g_current_dmf_draw.skeleton_name = prepared.skeleton_name;
 
-  static unsigned logs = 0;
-  static const bool verbose = EnvSwitchLocal("MOH_PS3_DMF_VERBOSE", false);
-  if (logs++ < 1 || verbose)
+  if (PS3RuntimeDebugEnabled())
   {
     std::fprintf(stderr,
                  "[moh-ps3-dmf] LIVE EXACT GC DMF: gc=%s ps3=%s material=%u(%s) cluster=%u DL=%08x size=%u palette=%zu mapped_groups=%zu skeleton=%s\n",
@@ -3482,6 +3503,7 @@ void ClearMSHCache()
 {
   std::scoped_lock lock(g_msh_cache_mutex);
   g_msh_cache.clear();
+  ++g_msh_cache_revision;
   g_display_lists.clear();
   g_display_list_candidates.clear();
   g_world_direct_matches.clear();
@@ -3731,6 +3753,7 @@ void PreloadCurrentLevelMSH(std::string_view level)
     g_world_full_level_mesh = std::move(next_world_full_level_mesh);
     g_world_full_level_normals = std::move(next_world_full_level_normals);
     g_msh_cache = std::move(next);
+    ++g_msh_cache_revision;
   }
 
   std::fprintf(stderr,
@@ -4667,6 +4690,7 @@ void RegisterGuestStaticMesh(std::string_view name, u32 address, std::span<const
     g_msh_cache[filename] = mesh;
     g_msh_cache[Lower(asset->filename)] = mesh;
     g_msh_cache[Lower(asset->relative_path)] = mesh;
+    ++g_msh_cache_revision;
   }
 
   std::vector<OriginalGCNode> nodes;
@@ -5339,6 +5363,7 @@ void PrepareDMFDraws()
       const auto count_it = material_draw_counts.find(material_key);
       const std::size_t gc_draws =
           count_it == material_draw_counts.end() ? 0 : count_it->second;
+      prepared->gc_material_draws = gc_draws;
       // A material can contain dozens of authored clusters.  Once the exact
       // per-material cluster ordinal AND its complete GC palette are proven,
       // sibling draw count is no longer an ambiguity.  Keep the old one-draw
@@ -5403,16 +5428,7 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   const auto& ready = draw.prepared->readiness;
   const auto& analysis = draw.prepared->analysis;
 
-  std::size_t gc_material_draws = 0;
-  for (const auto& [signature, candidates] : g_dmf_display_list_candidates)
-  {
-    (void)signature;
-    for (const auto& candidate : candidates)
-      if (candidate.gc_name == draw.gc_name &&
-          candidate.material_index == draw.material_index &&
-          candidate.gc_material_name == draw.gc_material_name)
-        ++gc_material_draws;
-  }
+  const std::size_t gc_material_draws = draw.prepared->gc_material_draws;
 
   const DMFCluster* selected_cluster = nullptr;
   std::size_t ps3_material_cluster_count = 0;
@@ -5459,11 +5475,22 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   // Diagnostic only: this block does not relax a single strict replacement
   // condition.  It reports the complete proof state once per weapon material
   // so M1/Thompson atlas failures can be fixed from one runtime capture.
-  static std::unordered_set<std::string> strict_diag_logged;
+  static std::unordered_set<std::string>
+      strict_diag_logged;
+
+  const bool replacement_debug =
+      PS3RuntimeDebugEnabled();
+
   const std::string strict_diag_key =
-      std::string(draw.gc_name) + "|" + std::to_string(draw.material_index) + "|" +
-      std::string(draw.gc_material_name);
-  if (strict_diag_logged.insert(strict_diag_key).second)
+      replacement_debug ?
+          std::string(draw.gc_name) + "|" +
+              std::to_string(draw.material_index) + "|" +
+              std::string(draw.gc_material_name) :
+          std::string{};
+
+  if (replacement_debug &&
+      strict_diag_logged.insert(
+          strict_diag_key).second)
   {
     const std::size_t cluster_positions = selected_cluster ? selected_cluster->positions.size() : 0;
     const std::size_t cluster_normals = selected_cluster ? selected_cluster->normals.size() : 0;
@@ -5531,26 +5558,51 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
       selected_cluster->positions.size() != selected_cluster->vertex_palette_slots.size())
     return {};
 
-  static std::unordered_set<std::string> matrix_reject_logged;
-  const auto matrix_reject = [&](std::string_view reason, std::size_t vertex, u32 local_slot,
-                                 u32 ps3_group, s32 gc_group) -> SkinnedDrawReplacement {
-    const std::string key = strict_diag_key + "|" + std::string(reason);
-    if (matrix_reject_logged.insert(key).second)
-    {
-      std::fprintf(stderr,
-                   "[moh-ps3-dmf] MATRIX REJECT: gc=%.*s gc_material_index=%u "
-                   "ps3_material_index=%u material=%.*s reason=%.*s "
-                   "vertex=%zu local_slot=%u ps3_group=%u gc_group=%d "
-                   "gc_palette=%zu ps3_palette=%zu group_map=%zu\n",
-                   static_cast<int>(draw.gc_name.size()), draw.gc_name.data(),
-                   draw.material_index, analysis.ps3_material_index,
-                   static_cast<int>(draw.gc_material_name.size()), draw.gc_material_name.data(),
-                   static_cast<int>(reason.size()), reason.data(), vertex, local_slot, ps3_group,
-                   gc_group, draw.gc_palette_groups.size(), selected_cluster->palette_groups.size(),
-                   draw.ps3_group_to_gc.size());
-    }
-    return {};
-  };
+  static std::unordered_set<std::string>
+      matrix_reject_logged;
+
+  const auto matrix_reject =
+      [&](std::string_view reason,
+          std::size_t vertex,
+          u32 local_slot,
+          u32 ps3_group,
+          s32 gc_group)
+          -> SkinnedDrawReplacement
+      {
+        if (replacement_debug)
+        {
+          const std::string key =
+              strict_diag_key + "|" +
+              std::string(reason);
+
+          if (matrix_reject_logged.insert(key).second)
+          {
+            std::fprintf(
+                stderr,
+                "[moh-ps3-dmf] MATRIX REJECT: gc=%.*s gc_material_index=%u "
+                "ps3_material_index=%u material=%.*s reason=%.*s "
+                "vertex=%zu local_slot=%u ps3_group=%u gc_group=%d "
+                "gc_palette=%zu ps3_palette=%zu group_map=%zu\n",
+                static_cast<int>(draw.gc_name.size()),
+                draw.gc_name.data(),
+                draw.material_index,
+                analysis.ps3_material_index,
+                static_cast<int>(draw.gc_material_name.size()),
+                draw.gc_material_name.data(),
+                static_cast<int>(reason.size()),
+                reason.data(),
+                vertex,
+                local_slot,
+                ps3_group,
+                gc_group,
+                draw.gc_palette_groups.size(),
+                selected_cluster->palette_groups.size(),
+                draw.ps3_group_to_gc.size());
+          }
+        }
+
+        return {};
+      };
 
   // PS3 positions are model/bind-space. Use the inverse bind authored in THIS
   // DMF by ref index; do not require a sibling SKL and never estimate offsets.
@@ -5916,23 +5968,25 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
 
           *reason = {};
 
-          static std::unordered_set<
-              std::string>
-              body_gc_bind_logged;
-
-          const std::string log_key =
-              std::string(draw.gc_name) +
-              "|" +
-              std::to_string(gc_group);
-
-          if (body_gc_bind_logged
-                  .insert(log_key)
-                  .second &&
-              body_gc_bind_logged.size() <=
-                  160)
+          if (replacement_debug)
           {
-            std::fprintf(
-                stderr,
+            static std::unordered_set<
+                std::string>
+                body_gc_bind_logged;
+
+            const std::string log_key =
+                std::string(draw.gc_name) +
+                "|" +
+                std::to_string(gc_group);
+
+            if (body_gc_bind_logged
+                    .insert(log_key)
+                    .second &&
+                body_gc_bind_logged.size() <=
+                    160)
+            {
+              std::fprintf(
+                  stderr,
                 "[moh-ps3-skin] "
                 "BODY GC-BIND READY: "
                 "gc=%.*s gc_group=%d "
@@ -5949,8 +6003,9 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
                 ps3_group,
                 gc.bone_a,
                 gc.bone_b,
-                gc.blend_q,
-                rigid_ref >= 0 ? 1 : 0);
+                  gc.blend_q,
+                  rigid_ref >= 0 ? 1 : 0);
+            }
           }
 
           return true;
@@ -6143,6 +6198,9 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
         return true;
       };
 
+  // A palette slot identifies the same authored group throughout this draw.
+  // Validate each distinct slot once, including conflicts with other slots.
+  std::vector<int> validated_matrix_ids(selected_cluster->palette_groups.size(), -1);
   std::vector<u8> matrix_indices(selected_cluster->positions.size());
   std::vector<std::array<float, 12>> model_to_gc_local(draw.gc_palette_groups.size());
   std::vector<std::array<float, 9>> model_to_gc_local_normal(draw.gc_palette_groups.size());
@@ -6154,6 +6212,11 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
     const u16 local_slot = selected_cluster->vertex_palette_slots[vertex];
     if (local_slot >= selected_cluster->palette_groups.size())
       return matrix_reject("local-slot-out-of-range", vertex, local_slot, 0xffffu, -1);
+    if (validated_matrix_ids[local_slot] >= 0)
+    {
+      matrix_indices[vertex] = static_cast<u8>(validated_matrix_ids[local_slot]);
+      continue;
+    }
     const u16 ps3_group = selected_cluster->palette_groups[local_slot];
     if (ps3_group >= draw.ps3_group_to_gc.size())
       return matrix_reject("ps3-group-out-of-range", vertex, local_slot, ps3_group, -1);
@@ -6215,8 +6278,11 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
                                gc_group);
       }
     }
+    validated_matrix_ids[local_slot] = static_cast<int>(matrix_id);
   }
 
+  if (replacement_debug)
+  {
   static std::unordered_set<std::string> logged_ready_draws;
   const std::string log_key =
       std::string(draw.gc_name) + "|" + std::to_string(draw.material_index) + "|" +
@@ -6263,6 +6329,8 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
                    "cluster=%u | inverse(blended bind) positions + transpose(bind) normals\n",
                    static_cast<int>(draw.gc_name.size()), draw.gc_name.data(),
                    draw.gc_material_name.data(), draw.cluster_index);
+  }
+
   }
 
   SkinnedDrawReplacement replacement;
@@ -6466,52 +6534,58 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     const auto fast_world_generation_now =
         PS3RemasterAssets::GetIndexGeneration();
 
+    static thread_local u64 fast_world_revision = 0;
     static thread_local bool fast_world_ready = false;
     static thread_local std::string fast_world_level;
     static thread_local auto fast_world_generation = fast_world_generation_now;
     static thread_local std::vector<FastWorldCandidate> fast_world_candidates;
     static thread_local std::unordered_map<const StaticMesh*, Bounds3> fast_world_bounds;
 
-    if (!fast_world_ready ||
-        std::string_view(fast_world_level) != fast_world_level_now ||
-        fast_world_generation != fast_world_generation_now)
+    // Cache publication and lazy loads can change meshes without changing
+    // the level or the asset index generation.
     {
-      fast_world_ready = true;
-      fast_world_level.assign(fast_world_level_now);
-      fast_world_generation = fast_world_generation_now;
-      fast_world_candidates.clear();
-      fast_world_bounds.clear();
-
-      std::unordered_set<const StaticMesh*> seen;
       std::scoped_lock lock(g_msh_cache_mutex);
-      fast_world_candidates.reserve(g_msh_cache.size());
-      fast_world_bounds.reserve(g_msh_cache.size());
-
-      for (const auto& [key, holder] : g_msh_cache)
+      if (!fast_world_ready || fast_world_revision != g_msh_cache_revision ||
+          std::string_view(fast_world_level) != fast_world_level_now ||
+          fast_world_generation != fast_world_generation_now)
       {
-        (void)key;
-        if (!holder || !seen.insert(holder.get()).second || !IsWorldCPTMesh(*holder) ||
-            holder->submeshes.size() != 1)
-          continue;
+        fast_world_ready = true;
+        fast_world_revision = g_msh_cache_revision;
+        fast_world_level.assign(fast_world_level_now);
+        fast_world_generation = fast_world_generation_now;
+        fast_world_candidates.clear();
+        fast_world_bounds.clear();
 
-        const auto& submesh = holder->submeshes[0];
-        if (!submesh.vertex_count || submesh.position_uv.size() != submesh.vertex_count ||
-            submesh.indices.empty() || (submesh.indices.size() % 3) != 0)
-          continue;
+        std::unordered_set<const StaticMesh*> seen;
+        fast_world_candidates.reserve(g_msh_cache.size());
+        fast_world_bounds.reserve(g_msh_cache.size());
 
-        const Bounds3 bounds = BoundsFromPS3(submesh);
-        if (!bounds.valid)
-          continue;
+        for (const auto& [key, holder] : g_msh_cache)
+        {
+          (void)key;
+          if (!holder || !seen.insert(holder.get()).second || !IsWorldCPTMesh(*holder) ||
+              holder->submeshes.size() != 1)
+            continue;
 
-        const u32 triangles = static_cast<u32>(submesh.indices.size() / 3);
-        fast_world_candidates.push_back({holder, bounds, triangles});
-        fast_world_bounds.emplace(holder.get(), bounds);
+          const auto& submesh = holder->submeshes[0];
+          if (!submesh.vertex_count || submesh.position_uv.size() != submesh.vertex_count ||
+              submesh.indices.empty() || (submesh.indices.size() % 3) != 0)
+            continue;
+
+          const Bounds3 bounds = BoundsFromPS3(submesh);
+          if (!bounds.valid)
+            continue;
+
+          const u32 triangles = static_cast<u32>(submesh.indices.size() / 3);
+          fast_world_candidates.push_back({holder, bounds, triangles});
+          fast_world_bounds.emplace(holder.get(), bounds);
+        }
+
+        std::sort(fast_world_candidates.begin(), fast_world_candidates.end(),
+                  [](const FastWorldCandidate& a, const FastWorldCandidate& b) {
+                    return a.triangles < b.triangles;
+                  });
       }
-
-      std::sort(fast_world_candidates.begin(), fast_world_candidates.end(),
-                [](const FastWorldCandidate& a, const FastWorldCandidate& b) {
-                  return a.triangles < b.triangles;
-                });
     }
 
     world_candidates = fast_world_candidates.size();
@@ -6596,9 +6670,9 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
       }
     }
 
-    const float maximum_direct_score =
+    static const float maximum_direct_score =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_DIRECT_SCORE", 0.025f, 0.00001f, 0.25f);
-    const float minimum_direct_margin =
+    static const float minimum_direct_margin =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_DIRECT_MARGIN", 0.0025f, 0.0f, 0.25f);
     const float margin = std::isfinite(second_score) ? second_score - best_score :
                                                        std::numeric_limits<float>::infinity();
@@ -6610,9 +6684,9 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     // only its local origin. The old BoundsScore penalises that center shift.
     // Use an origin-independent fallback only after the proven absolute matcher
     // fails, and require a clearly unique centered-bounds candidate.
-    const float maximum_local_extent =
+    static const float maximum_local_extent =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_LOCAL_EXTENT", 0.025f, 0.00001f, 0.20f);
-    const float minimum_local_margin =
+    static const float minimum_local_margin =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_LOCAL_MARGIN", 0.010f, 0.0f, 0.25f);
     const float extent_margin = std::isfinite(second_extent_score) ?
         second_extent_score - best_extent_score : std::numeric_limits<float>::infinity();
@@ -6642,108 +6716,163 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
     u32 best_range_triangles = 0;
     std::size_t dynamic_ranges_tested = 0;
 
-    const u32 dynamic_min_triangles = static_cast<u32>(std::lround(
+    static const u32 dynamic_min_triangles = static_cast<u32>(std::lround(
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_RANGE_MIN_TRIS", 96.0f, 12.0f, 4096.0f)));
-    const u32 dynamic_max_members = static_cast<u32>(std::lround(
+    static const u32 dynamic_max_members = static_cast<u32>(std::lround(
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_RANGE_MAX_MEMBERS", 64.0f, 2.0f, 64.0f)));
-    const float dynamic_triangle_ratio =
+    static const float dynamic_triangle_ratio =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_RANGE_TRI_RATIO", 1.20f, 1.0f, 2.0f);
-    const u32 dynamic_triangle_slop = static_cast<u32>(std::lround(
+    static const u32 dynamic_triangle_slop = static_cast<u32>(std::lround(
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_RANGE_TRI_SLOP", 12.0f, 0.0f, 256.0f)));
-    const float dynamic_max_extent =
+    static const float dynamic_max_extent =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_RANGE_EXTENT", 0.040f, 0.00001f, 0.25f);
-    const float dynamic_min_margin =
+    static const float dynamic_min_margin =
         EnvFloatLocal("MOH_PS3_CPT_GEOMETRY_RANGE_MARGIN", 0.006f, 0.0f, 0.25f);
 
     if (!selected_owner && gc_triangle_count >= dynamic_min_triangles)
     {
       std::scoped_lock lock(g_msh_cache_mutex);
-      for (std::size_t sequence_index = 0; sequence_index < g_world_cpt_sequences.size();
-           ++sequence_index)
+      struct DynamicRange
       {
-        const auto& sequence = g_world_cpt_sequences[sequence_index];
-        const auto& members = sequence.meshes;
-        if (members.size() < 2)
-          continue;
-
-        for (std::size_t first = 0; first + 1 < members.size(); ++first)
+        Bounds3 bounds;
+        std::size_t sequence, first, count;
+        u32 triangles, delta, larger;
+      };
+      // Topology and authored bounds do not depend on the current GC positions.
+      // Keep a bounded working set by triangle count; claims and geometric
+      // scores are always evaluated afresh, in the original enumeration order.
+      static thread_local u64 ranges_revision = 0;
+      static thread_local std::unordered_map<u32, std::vector<DynamicRange>> range_cache;
+      static thread_local std::size_t cached_range_count = 0;
+      if (ranges_revision != g_msh_cache_revision || range_cache.size() >= 32 ||
+          cached_range_count > 131072)
+      {
+        range_cache.clear();
+        cached_range_count = 0;
+        ranges_revision = g_msh_cache_revision;
+      }
+      auto [range_it, inserted] = range_cache.try_emplace(gc_triangle_count);
+      auto& ranges = range_it->second;
+      if (inserted)
+      {
+        for (std::size_t sequence_index = 0; sequence_index < g_world_cpt_sequences.size();
+             ++sequence_index)
         {
-          Bounds3 aggregate;
-          std::size_t vertex_total = 0;
-          u32 triangle_total = 0;
-          const std::size_t last =
-              std::min(members.size(), first + static_cast<std::size_t>(dynamic_max_members));
+          const auto& sequence = g_world_cpt_sequences[sequence_index];
+          const auto& members = sequence.meshes;
+          if (members.size() < 2)
+            continue;
 
-          for (std::size_t end = first; end < last; ++end)
+          for (std::size_t first = 0; first + 1 < members.size(); ++first)
           {
-            const auto& member = members[end];
-            if (!member || member->submeshes.size() != 1)
-              break;
-            const auto& sub = member->submeshes[0];
-            if (!sub.vertex_count || sub.position_uv.size() != sub.vertex_count ||
-                sub.indices.empty() || (sub.indices.size() % 3) != 0)
-              break;
+            Bounds3 aggregate;
+            std::size_t vertex_total = 0;
+            u32 triangle_total = 0;
+            const std::size_t last =
+                std::min(members.size(), first + static_cast<std::size_t>(dynamic_max_members));
 
-            const std::size_t member_triangles = sub.indices.size() / 3;
-            if (member_triangles > std::numeric_limits<u32>::max() - triangle_total)
-              break;
-            triangle_total += static_cast<u32>(member_triangles);
-            vertex_total += sub.vertex_count;
-            if (vertex_total > 65535u)
-              break;
-            if (const auto cached_bounds = fast_world_bounds.find(member.get());
-                cached_bounds != fast_world_bounds.end())
-              UnionBounds(&aggregate, cached_bounds->second);
-            else
-              UnionBounds(&aggregate, BoundsFromPS3(sub));
-
-            const std::size_t range_count = end - first + 1;
-            if (range_count < 2 || !aggregate.valid)
-              continue;
-
-            // Triangle count is monotonic while extending a range. Once it is
-            // already too large, every longer range is also too large.
-            const u32 smaller = std::max(1u, std::min(gc_triangle_count, triangle_total));
-            const u32 larger = std::max(gc_triangle_count, triangle_total);
-            const u32 triangle_delta = larger - smaller;
-            const float triangle_ratio =
-                static_cast<float>(larger) / static_cast<float>(smaller);
-            if (triangle_delta > dynamic_triangle_slop &&
-                triangle_ratio > dynamic_triangle_ratio)
+            for (std::size_t end = first; end < last; ++end)
             {
-              if (triangle_total > gc_triangle_count)
+              const auto& member = members[end];
+              if (!member || member->submeshes.size() != 1)
                 break;
-              continue;
-            }
+              const auto& sub = member->submeshes[0];
+              if (!sub.vertex_count || sub.position_uv.size() != sub.vertex_count ||
+                  sub.indices.empty() || (sub.indices.size() % 3) != 0)
+                break;
 
-            if (WorldRangeHasForeignClaim(sequence.source_name, first, range_count, direct_key))
-              continue;
+              const std::size_t member_triangles = sub.indices.size() / 3;
+              if (member_triangles > std::numeric_limits<u32>::max() - triangle_total)
+                break;
+              triangle_total += static_cast<u32>(member_triangles);
+              vertex_total += sub.vertex_count;
+              if (vertex_total > 65535u)
+                break;
+              if (const auto cached_bounds = fast_world_bounds.find(member.get());
+                  cached_bounds != fast_world_bounds.end())
+                UnionBounds(&aggregate, cached_bounds->second);
+              else
+              {
+                // Sequence members need not be entries in g_msh_cache. Cache
+                // those bounds too, instead of rescanning their vertices for
+                // every overlapping range and every unmatched direct batch.
+                const auto bounds = BoundsFromPS3(sub);
+                fast_world_bounds.emplace(member.get(), bounds);
+                UnionBounds(&aggregate, bounds);
+              }
 
-            ++dynamic_ranges_tested;
-            const float extent = BoundsExtentScore(gc, aggregate);
-            if (!std::isfinite(extent))
-              continue;
-            const float topology_error =
-                static_cast<float>(triangle_delta) / static_cast<float>(std::max(1u, larger));
-            const float range_score = extent + topology_error * 0.10f;
+              const std::size_t range_count = end - first + 1;
+              if (range_count < 2 || !aggregate.valid)
+                continue;
 
-            if (range_score < best_range_score)
-            {
-              second_range_score = best_range_score;
-              best_range_score = range_score;
-              best_range_extent = extent;
-              best_range_bounds = aggregate;
-              best_range_source = sequence.source_name;
-              best_range_sequence = sequence_index;
-              best_range_first = first;
-              best_range_count = range_count;
-              best_range_triangles = triangle_total;
-            }
-            else if (range_score < second_range_score)
-            {
-              second_range_score = range_score;
+              // Triangle count is monotonic while extending a range. Once it is
+              // already too large, every longer range is also too large.
+              const u32 smaller = std::max(1u, std::min(gc_triangle_count, triangle_total));
+              const u32 larger = std::max(gc_triangle_count, triangle_total);
+              const u32 triangle_delta = larger - smaller;
+              const float triangle_ratio =
+                  static_cast<float>(larger) / static_cast<float>(smaller);
+              if (triangle_delta > dynamic_triangle_slop &&
+                  triangle_ratio > dynamic_triangle_ratio)
+              {
+                if (triangle_total > gc_triangle_count)
+                  break;
+                continue;
+              }
+
+              ranges.push_back({aggregate, sequence_index, first, range_count,
+                                triangle_total, triangle_delta, larger});
             }
           }
+        }
+        cached_range_count += ranges.size();
+      }
+
+      std::size_t prefix_sequence = std::numeric_limits<std::size_t>::max();
+      std::vector<std::size_t> foreign_claim_prefix;
+      for (const auto& range : ranges)
+      {
+        const auto& sequence = g_world_cpt_sequences[range.sequence];
+        if (prefix_sequence != range.sequence)
+        {
+          prefix_sequence = range.sequence;
+          foreign_claim_prefix.assign(sequence.meshes.size() + 1, 0);
+          // No strings or hashes are needed before the first descriptor claim.
+          if (!g_world_dynamic_descriptor_claims.empty())
+          {
+            for (std::size_t member = 0; member < sequence.meshes.size(); ++member)
+            {
+              const auto claim = g_world_dynamic_descriptor_claims.find(
+                  WorldDescriptorClaimKey(sequence.source_name, member));
+              foreign_claim_prefix[member + 1] = foreign_claim_prefix[member] +
+                  (claim != g_world_dynamic_descriptor_claims.end() && claim->second != direct_key);
+            }
+          }
+        }
+        if (foreign_claim_prefix[range.first + range.count] != foreign_claim_prefix[range.first])
+          continue;
+        ++dynamic_ranges_tested;
+        const float extent = BoundsExtentScore(gc, range.bounds);
+        if (!std::isfinite(extent))
+          continue;
+        const float topology_error =
+            static_cast<float>(range.delta) / static_cast<float>(std::max(1u, range.larger));
+        const float range_score = extent + topology_error * 0.10f;
+        if (range_score < best_range_score)
+        {
+          second_range_score = best_range_score;
+          best_range_score = range_score;
+          best_range_extent = extent;
+          best_range_bounds = range.bounds;
+          best_range_source = sequence.source_name;
+          best_range_sequence = range.sequence;
+          best_range_first = range.first;
+          best_range_count = range.count;
+          best_range_triangles = range.triangles;
+        }
+        else if (range_score < second_range_score)
+        {
+          second_range_score = range_score;
         }
       }
 
@@ -6897,31 +7026,40 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
   std::shared_ptr<StaticMesh> best_owner;
 
   {
-    std::unordered_set<const StaticMesh*> seen;
-    std::scoped_lock lock(g_msh_cache_mutex);
-    for (const auto& [key, holder] : g_msh_cache)
+    // Mesh vertices are immutable while published in g_msh_cache. Rebuild in
+    // map iteration order on every cache mutation to preserve tie handling,
+    // while avoiding a full vertex scan and alias deduplication per GX batch.
+    struct BootstrapCandidate
     {
-      (void)key;
-      if (!holder || !seen.insert(holder.get()).second)
-        continue;
-
-      // Safe bootstrap milestone: one PS3 submesh only. This avoids assigning
-      // one learned display-list identity to several unrelated material batches.
-      if (holder->submeshes.size() != 1)
-        continue;
-
-      const auto& submesh = holder->submeshes[0];
-
-      // IMPORTANT: gc `count` is the expanded GX vertex stream for this draw,
-      // not the number of unique vertices in the source MSH. Triangle strips
-      // and indexed GameCube display lists can therefore produce a completely
-      // different count from the PS3 mesh while still describing the exact
-      // same object-space geometry. Use bounds for identity bootstrap instead.
-      if (submesh.position_uv.size() != submesh.vertex_count ||
-          submesh.indices.empty() || submesh.indices.size() % 3)
-        continue;
-
-      const float score = BoundsScore(gc, BoundsFromPS3(submesh));
+      std::shared_ptr<StaticMesh> owner;
+      Bounds3 bounds;
+    };
+    static thread_local bool candidates_ready = false;
+    static thread_local u64 candidates_revision = 0;
+    static thread_local std::vector<BootstrapCandidate> candidates;
+    std::scoped_lock lock(g_msh_cache_mutex);
+    if (!candidates_ready || candidates_revision != g_msh_cache_revision)
+    {
+      candidates.clear();
+      std::unordered_set<const StaticMesh*> seen;
+      for (const auto& [key, holder] : g_msh_cache)
+      {
+        (void)key;
+        if (!holder || !seen.insert(holder.get()).second || holder->submeshes.size() != 1)
+          continue;
+        const auto& submesh = holder->submeshes[0];
+        if (submesh.position_uv.size() != submesh.vertex_count ||
+            submesh.indices.empty() || submesh.indices.size() % 3)
+          continue;
+        candidates.push_back({holder, BoundsFromPS3(submesh)});
+      }
+      candidates_revision = g_msh_cache_revision;
+      candidates_ready = true;
+    }
+    for (const auto& candidate : candidates)
+    {
+      const auto& holder = candidate.owner;
+      const float score = BoundsScore(gc, candidate.bounds);
       if (!std::isfinite(score))
         continue;
 
@@ -7027,14 +7165,32 @@ StaticDrawMatch MatchStaticDraw(std::span<const u8> gc_vertices, u32 count, u32 
 }
 void NotifyStaticDrawSubmitted()
 {
-  if (!g_current_draw) return;
-  ++g_draws;
-  g_vertices += g_current_draw.submesh->vertex_count;
-  g_indices += g_current_draw.submesh->indices.size();
-  if (g_draw_logged.insert(g_current_draw.mesh->source_name).second)
-    std::fprintf(stderr, "[moh-ps3-msh] FIRST REAL PS3 DRAW: gc_resource=%08x ps3=%s DL=%08x | replacement active; current GX model/view/projection and CSM preserved\n",
-                 g_current_draw.guest_resource, g_current_draw.mesh->source_name.c_str(),
-                 g_current_draw.display_list);
+  if (!g_current_draw)
+    return;
+
+  if (PS3RuntimeDebugEnabled())
+  {
+    ++g_draws;
+    g_vertices +=
+        g_current_draw.submesh->vertex_count;
+    g_indices +=
+        g_current_draw.submesh->indices.size();
+
+    if (g_draw_logged
+            .insert(
+                g_current_draw.mesh->source_name)
+            .second)
+    {
+      std::fprintf(
+          stderr,
+          "[moh-ps3-msh] FIRST REAL PS3 DRAW: "
+          "gc_resource=%08x ps3=%s DL=%08x | replacement active; "
+          "current GX model/view/projection and CSM preserved\n",
+          g_current_draw.guest_resource,
+          g_current_draw.mesh->source_name.c_str(),
+          g_current_draw.display_list);
+    }
+  }
 
   // Direct world matches exist only for the current primitive batch. Do not
   // let one CPT sector leak into the next unrelated GameCube world draw.
@@ -7048,27 +7204,52 @@ void NotifyStaticDrawSubmitted()
 
 void NotifySkinnedDrawSubmitted(const SkinnedDrawReplacement& replacement)
 {
-  const SkinnedDrawMatch draw = g_current_dmf_draw;
-  if (!draw || !replacement || !replacement.cluster)
+  if (!PS3RuntimeDebugEnabled())
+    return;
+
+  const SkinnedDrawMatch draw =
+      g_current_dmf_draw;
+
+  if (!draw ||
+      !replacement ||
+      !replacement.cluster)
     return;
 
   ++g_dmf_draws;
-  g_dmf_vertices += replacement.cluster->positions.size();
-  g_dmf_indices += replacement.cluster->indices.size();
-  const std::string key = std::string(draw.gc_name) + "|" + std::string(draw.gc_material_name);
+
+  g_dmf_vertices +=
+      replacement.cluster->positions.size();
+
+  g_dmf_indices +=
+      replacement.cluster->indices.size();
+
+  const std::string key =
+      std::string(draw.gc_name) + "|" +
+      std::string(draw.gc_material_name);
+
   if (g_dmf_draw_logged.insert(key).second)
   {
-    std::fprintf(stderr,
-                 "[moh-ps3-dmf] FIRST REAL PS3 SKINNED DRAW: gc=%s ps3=%s material=%s vertices=%zu indices=%zu palette=%zu DL=%08x | GX/XF animation palette + current TPK/GX state preserved\n",
-                 draw.gc_name.data(), replacement.owner->source_name.c_str(),
-                 draw.gc_material_name.data(), replacement.cluster->positions.size(),
-                 replacement.cluster->indices.size(), draw.gc_palette_groups.size(),
-                 draw.display_list);
+    std::fprintf(
+        stderr,
+        "[moh-ps3-dmf] FIRST REAL PS3 SKINNED DRAW: "
+        "gc=%s ps3=%s material=%s vertices=%zu indices=%zu "
+        "palette=%zu DL=%08x | GX/XF animation palette + "
+        "current TPK/GX state preserved\n",
+        draw.gc_name.data(),
+        replacement.owner->source_name.c_str(),
+        draw.gc_material_name.data(),
+        replacement.cluster->positions.size(),
+        replacement.cluster->indices.size(),
+        draw.gc_palette_groups.size(),
+        draw.display_list);
   }
 }
 
 void PrintDrawStatistics()
 {
+  if (!PS3RuntimeDebugEnabled())
+    return;
+
   std::fprintf(stderr, "[moh-ps3-perf] dmf_lookup=%llu dmf_cache_hit=%llu dmf_cache_miss=%llu dmf_runtime_triangle_scans=0 dmf_runtime_allocations=0 fifo_backpressure_events=%llu fifo_peak_distance=%u\n",
       static_cast<unsigned long long>(g_dmf_lookups.load()),
       static_cast<unsigned long long>(g_dmf_hits.load()),
@@ -7093,7 +7274,8 @@ bool ParseMSHv8(std::span<const u8> bytes, StaticMesh* out)
 
   const bool ok = MOHFrontline::PS3::MSH::Decode(bytes, out);
   static unsigned logs = 0;
-  if (ok && out && logs++ < 64)
+  if (PS3RuntimeDebugEnabled() &&
+      ok && out && logs++ < 64)
   {
     std::fprintf(stderr, "[moh-ps3-msh] decoded static MSH: submeshes=%zu\n",
                  out->submeshes.size());

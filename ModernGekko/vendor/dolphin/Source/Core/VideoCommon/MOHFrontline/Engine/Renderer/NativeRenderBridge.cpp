@@ -111,16 +111,19 @@ bool BuildSkinned(DrawPacket* out)
 
 Mode GetMode()
 {
-  const char* value = std::getenv("MOH_NATIVE_RENDER");
-  if (!value || !*value)
-    return Mode::Off;
+  static const Mode cached = [] {
+    const char* value = std::getenv("MOH_NATIVE_RENDER");
+    if (!value || !*value)
+      return Mode::Off;
 
-  const std::string v = Lower(value);
-  if (v == "shadow" || v == "capture" || v == "probe")
-    return Mode::Shadow;
-  if (v == "native" || v == "prefer" || v == "prefer-native" || v == "prefer_native")
-    return Mode::PreferNative;
-  return Mode::Off;
+    const std::string v = Lower(value);
+    if (v == "shadow" || v == "capture" || v == "probe")
+      return Mode::Shadow;
+    if (v == "native" || v == "prefer" || v == "prefer-native" || v == "prefer_native")
+      return Mode::PreferNative;
+    return Mode::Off;
+  }();
+  return cached;
 }
 
 const char* ModeName(Mode mode)
@@ -146,10 +149,40 @@ bool HasSubmitter()
   return s_submitter != nullptr;
 }
 
+bool KeepOriginalGCGeometry()
+{
+  static const bool cached = [] {
+    const char* value = std::getenv("MOH_NATIVE_GEOMETRY_SOURCE");
+    if (!value || !*value)
+      value = std::getenv("MOH_NATIVE_VFS");
+    if (!value || !*value)
+      return false;
+
+    const std::string v = Lower(value);
+    return v == "gc" || v == "gc-first" || v == "gc_first" ||
+           v == "gc-only" || v == "gc_only";
+  }();
+  return cached;
+}
+
 bool BuildCurrentDraw(DrawPacket* out)
 {
   if (!out)
     return false;
+
+  // Do not silently substitute PS3 MSH/DMF when GC-original was requested.
+  // The original GX draw is retained as the safe GC geometry path.
+  if (KeepOriginalGCGeometry())
+  {
+    static bool logged = false;
+    if (!logged)
+    {
+      logged = true;
+      std::fprintf(stderr,
+                   "[moh-native-render] geometry source=GC-original: retaining original GX geometry\n");
+    }
+    return false;
+  }
 
   if (BuildStatic(out))
     return true;

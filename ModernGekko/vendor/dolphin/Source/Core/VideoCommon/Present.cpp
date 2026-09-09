@@ -23,6 +23,7 @@
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/OnScreenUI.h"
 #include "VideoCommon/PostProcessing.h"
+#include "VideoCommon/MOHFrontline/Engine/Video/NativeVideo.h"
 #if defined(MODERNGEKKO_MOH_PC_LAYER)
 #include "VideoCommon/MohPcLayer.h"
 #endif
@@ -952,11 +953,13 @@ void Presenter::Present(PresentInfo* present_info)
   g_vertex_manager->Flush();
 
   UpdateDrawRectangle();
+  MOHFrontline::NativeVideo::PrepareFrame();
 
   g_gfx->BeginUtilityDrawing();
   const bool backbuffer_bound = g_gfx->BindBackbuffer({{0.0f, 0.0f, 0.0f, 1.0f}});
 
-  // Render the XFB to the screen.
+  // Render the guest XFB first. It remains the guaranteed fallback for any
+  // movie/container that the native host decoder cannot consume.
   if (backbuffer_bound && m_xfb_entry)
   {
     // Adjust the source rectangle instead of using an oversized viewport to render the XFB.
@@ -965,6 +968,21 @@ void Presenter::Present(PresentInfo* present_info)
     AdjustRectanglesToFitBounds(&render_target_rc, &render_source_rc, m_backbuffer_width,
                                 m_backbuffer_height);
     RenderXFBToScreen(render_target_rc, m_xfb_entry->texture.get(), render_source_rc);
+  }
+
+  // v9 native movie plane. Decode/upload is host-side and source-neutral:
+  // PS3 remaster media and original GameCube media are both candidates. The
+  // original guest VP6/XFB is left underneath as a safe fallback.
+  if (backbuffer_bound)
+  {
+    const auto native_movie = MOHFrontline::NativeVideo::GetPresentFrame();
+    if (native_movie)
+    {
+      const MathUtil::Rectangle<int> movie_source_rc(
+          0, 0, static_cast<int>(native_movie.width), static_cast<int>(native_movie.height));
+      m_post_processor->BlitFromTexture(GetTargetRectangle(), movie_source_rc,
+                                        native_movie.texture);
+    }
   }
 
   if (m_onscreen_ui)
