@@ -253,7 +253,8 @@ std::optional<EncodedMovie> ReadPS3(std::string_view guest_name)
 }
 
 std::mutex s_request_mutex;
-std::string s_pending_guest;
+std::vector<std::string> s_pending_guests;
+std::string s_last_detected_guest;
 
 std::optional<double> RequestedDisplayAspect()
 {
@@ -651,11 +652,32 @@ void NotifyGuestRead(std::string_view guest_name, std::uint64_t file_offset)
     return;
 
   std::scoped_lock lock(s_request_mutex);
-  if (s_pending_guest != guest_name)
+
+  const std::string normalized = Lower(std::string(guest_name));
+  if (!s_last_detected_guest.empty() && Lower(s_last_detected_guest) == normalized)
+    return;
+
+#if defined(MOH_NATIVE_VIDEO_FFMPEG)
+  if (s_decoder && Lower(s_decoder->guest_name) == normalized)
   {
-    s_pending_guest = std::string(guest_name);
-    std::fprintf(stderr, "[moh-native-video] guest movie detected: %s\n", s_pending_guest.c_str());
+    s_last_detected_guest = std::string(guest_name);
+    return;
   }
+#endif
+
+  const bool already_queued =
+      std::any_of(s_pending_guests.begin(), s_pending_guests.end(),
+                  [&](const std::string& queued) { return Lower(queued) == normalized; });
+  s_last_detected_guest = std::string(guest_name);
+  if (already_queued)
+    return;
+
+  if (s_pending_guests.size() >= 16)
+    s_pending_guests.erase(s_pending_guests.begin());
+
+  s_pending_guests.emplace_back(guest_name);
+  std::fprintf(stderr, "[moh-native-video] QUEUE guest=%s depth=%zu\n",
+               s_pending_guests.back().c_str(), s_pending_guests.size());
 }
 
 void PrepareFrame()
@@ -676,24 +698,25 @@ void PrepareFrame()
   }
   return;
 #else
-  if (!MohPcLayer::IsMovieActive())
+  // The guest VP6 flag is a detection signal only. On the static recomp it can
+  // toggle OFF immediately after the source file is opened. Once queued, the
+  // host decoder owns the movie lifetime until EOF.
+  if (!s_decoder)
   {
-    if (s_decoder)
+    std::string pending;
     {
-      std::fprintf(stderr, "[moh-native-video] STOP guest=%s\n", s_decoder->guest_name.c_str());
-      CloseDecoder();
+      std::scoped_lock lock(s_request_mutex);
+      if (!s_pending_guests.empty())
+      {
+        pending = std::move(s_pending_guests.front());
+        s_pending_guests.erase(s_pending_guests.begin());
+      }
     }
-    return;
+
+    if (!pending.empty())
+      (void)TryOpen(pending);
   }
 
-  std::string pending;
-  {
-    std::scoped_lock lock(s_request_mutex);
-    pending = s_pending_guest;
-  }
-
-  if (!pending.empty() && (!s_decoder || s_decoder->guest_name != pending))
-    TryOpen(pending);
   if (!s_decoder)
     return;
 
@@ -702,10 +725,24 @@ void PrepareFrame()
   const std::uint64_t wanted_frame =
       static_cast<std::uint64_t>(std::max(0.0, std::floor(elapsed * fps)));
   unsigned catches = 0;
+  bool finished = false;
   while (s_decoder->decoded_frames <= wanted_frame && catches++ < 12)
   {
     if (!DecodeNextFrame(*s_decoder))
+    {
+      finished = true;
       break;
+    }
+  }
+
+  if (finished)
+  {
+    std::fprintf(stderr, "[moh-native-video] END guest=%s frames=%llu source=%s\n",
+                 s_decoder->guest_name.c_str(),
+                 static_cast<unsigned long long>(s_decoder->decoded_frames),
+                 s_decoder->source_ps3 ? "PS3" : "GC");
+    CloseDecoder();
+    return;
   }
 
   static std::string progress_guest;
@@ -749,7 +786,7 @@ void PrepareFrame()
 PresentFrame GetPresentFrame()
 {
 #if defined(MOH_NATIVE_VIDEO_FFMPEG)
-  if (s_decoder && MohPcLayer::IsMovieActive() && s_decoder->texture)
+  if (s_decoder && s_decoder->texture)
     return {s_decoder->texture.get(), s_decoder->width, s_decoder->height,
             static_cast<float>(s_decoder->display_aspect)};
 #endif
@@ -762,6 +799,7 @@ void Stop()
   CloseDecoder();
 #endif
   std::scoped_lock lock(s_request_mutex);
-  s_pending_guest.clear();
+  s_pending_guests.clear();
+  s_last_detected_guest.clear();
 }
 }  // namespace MOHFrontline::NativeVideo
