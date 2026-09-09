@@ -465,43 +465,32 @@ std::array<float, 3> ModelToGCLocal(const NativeRender::DrawPacket& packet,
   };
 }
 
-std::string GenerateTexturedVertexShader()
+std::string GenerateNativeVertexShader(bool textured)
 {
   ShaderCode code;
-  switch (g_backend_info.api_type)
-  {
-  case APIType::D3D:
-  case APIType::Metal:
-  case APIType::OpenGL:
-  case APIType::Vulkan:
+  code.Write("ATTRIBUTE_LOCATION({:s}) in float4 rawcolor0;\n", ShaderAttrib::Color0);
+  code.Write("ATTRIBUTE_LOCATION({:s}) in float4 rawpos;\n", ShaderAttrib::Position);
+  if (textured)
     code.Write("ATTRIBUTE_LOCATION({:s}) in float3 rawtex0;\n", ShaderAttrib::TexCoord0);
-    code.Write("ATTRIBUTE_LOCATION({:s}) in float4 rawcolor0;\n", ShaderAttrib::Color0);
-    code.Write("ATTRIBUTE_LOCATION({:s}) in float4 rawpos;\n", ShaderAttrib::Position);
-    if (g_backend_info.bSupportsGeometryShaders)
-    {
-      code.Write("VARYING_LOCATION(0) out VertexData {{\n"
-                 "  float3 v_tex0;\n"
-                 "  float4 v_col0;\n"
-                 "}};\n");
-    }
-    else
-    {
-      code.Write("VARYING_LOCATION(0) out float3 v_tex0;\n");
-      code.Write("VARYING_LOCATION(1) out float4 v_col0;\n");
-    }
-    code.Write("#define opos gl_Position\n"
-               "void main()\n"
-               "{{\n"
-               "  v_tex0 = rawtex0;\n"
-               "  v_col0 = rawcolor0;\n"
-               "  opos = float4(rawpos.xyz, 1.0f);\n");
-    if (g_backend_info.api_type == APIType::Vulkan)
-      code.Write("  opos.y = -opos.y;\n");
-    code.Write("}}\n");
-    break;
-  default:
-    break;
+  if (g_backend_info.bSupportsGeometryShaders)
+  {
+    code.Write("VARYING_LOCATION(0) out VertexData {{\n");
+    if (textured)
+      code.Write("  float3 v_tex0;\n");
+    code.Write("  float4 v_col0;\n}};\n");
   }
+  else
+  {
+    if (textured)
+      code.Write("VARYING_LOCATION(0) out float3 v_tex0;\n");
+    code.Write("VARYING_LOCATION({}) out float4 v_col0;\n", textured ? 1 : 0);
+  }
+  code.Write("void main()\n{{\n  v_col0 = rawcolor0;\n  gl_Position = rawpos;\n");
+  if (textured)
+    code.Write("  v_tex0 = rawtex0;\n");
+  if (g_backend_info.api_type == APIType::Vulkan)
+    code.Write("  gl_Position.y = -gl_Position.y;\n");
+  code.Write("}}\n");
   return code.GetBuffer();
 }
 
@@ -539,12 +528,12 @@ std::string GenerateTexturedPixelShader()
   return code.GetBuffer();
 }
 
-float HostDepthNDC(const VertexShaderManager& vertex_shader_manager, const float clip[4])
+float HostDepthClip(const VertexShaderManager& vertex_shader_manager, const float clip[4])
 {
   const auto& correction = vertex_shader_manager.constants.pixelcentercorrection;
-  float z = (clip[3] * correction[3] - clip[2] * correction[2]) / clip[3];
+  float z = clip[3] * correction[3] - clip[2] * correction[2];
   if (!ShaderHostConfig::GetCurrent().backend_clip_control)
-    z = z * 2.0f - 1.0f;
+    z = z * 2.0f - clip[3];
   return z;
 }
 
@@ -600,7 +589,7 @@ bool EnsurePipelines(State& state, bool use_depth, bool preserve_gx_state)
   if (!state.color_vertex_shader)
   {
     state.color_vertex_shader = g_gfx->CreateShaderFromSource(
-        ShaderStage::Vertex, FramebufferShaderGen::GenerateEFBPokeVertexShader(), nullptr,
+        ShaderStage::Vertex, GenerateNativeVertexShader(false), nullptr,
         "MOH PS3 native color vertex shader");
     if (!state.color_vertex_shader)
       return false;
@@ -609,7 +598,7 @@ bool EnsurePipelines(State& state, bool use_depth, bool preserve_gx_state)
   if (!state.textured_vertex_shader)
   {
     state.textured_vertex_shader = g_gfx->CreateShaderFromSource(
-        ShaderStage::Vertex, GenerateTexturedVertexShader(), nullptr,
+        ShaderStage::Vertex, GenerateNativeVertexShader(true), nullptr,
         "MOH PS3 native textured vertex shader");
     if (!state.textured_vertex_shader)
       return false;
@@ -758,17 +747,18 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
     vertex_shader_manager.TransformToClipSpace(local.data(), clip, matrix_index);
 
     if (!std::isfinite(clip[0]) || !std::isfinite(clip[1]) || !std::isfinite(clip[2]) ||
-        !std::isfinite(clip[3]) || clip[3] <= 1.0e-5f)
+        !std::isfinite(clip[3]))
     {
       ++invalid_vertices;
       continue;
     }
 
-    const float x = clip[0] / clip[3];
-    const float y = clip[1] / clip[3];
-    const float z = use_depth ? HostDepthNDC(vertex_shader_manager, clip) : 0.0f;
-    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
-        std::fabs(x) > 10000.0f || std::fabs(y) > 10000.0f || std::fabs(z) > 10000.0f)
+    // Keep homogeneous coordinates: the GPU clips triangles crossing the eye/near
+    // plane and uses W for perspective-correct texture and color interpolation.
+    const float x = clip[0];
+    const float y = clip[1];
+    const float z = use_depth ? HostDepthClip(vertex_shader_manager, clip) : 0.0f;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
     {
       ++invalid_vertices;
       continue;
@@ -777,7 +767,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
     state.vertices[i].position[0] = x;
     state.vertices[i].position[1] = y;
     state.vertices[i].position[2] = z;
-    state.vertices[i].position[3] = 1.0f;
+    state.vertices[i].position[3] = clip[3];
     state.vertices[i].uv0[0] = source.uv0[0];
     state.vertices[i].uv0[1] = source.uv0[1];
     state.vertices[i].uv0[2] = 0.0f;

@@ -7,10 +7,10 @@
 
 namespace MOHFrontline::NativeGCAssets
 {
-// Observe exact host-backed GameCube reads. Frontline compact VIV is decoded
-// natively as C0 FB + BE16 count + repeated BE24 offset/BE24 size/NUL name.
+// Observe exact host-backed GameCube reads. Both compact C0FB/BE24 archives
+// and the BIGF/BE32 archive used by 2_2/comp.viv are indexed natively.
 // Nested MSH/CPT/SKL/DMF/GSH/GFN/etc accesses are reported with their real
-// archive offsets; GFN payloads are additionally validated by the host parser.
+// archive offsets; GFN and CPT/CDB payloads are also decoded/validated on host.
 void ObserveHostRead(const std::filesystem::path& host_path, std::string_view guest_path,
                      std::uint64_t offset, std::size_t bytes);
 void Shutdown();

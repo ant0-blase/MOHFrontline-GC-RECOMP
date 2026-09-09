@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCFont.h"
+#include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCCompartment.h"
+#include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCViv.h"
 #include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
 
 namespace MOHFrontline::NativeGCAssets
@@ -101,19 +103,6 @@ bool IsSemanticAsset(std::string_view ext)
          ext == ".scr" || ext == ".cbs" || ext == ".sin";
 }
 
-std::uint16_t BE16(const unsigned char* p)
-{
-  return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) |
-                                    static_cast<std::uint16_t>(p[1]));
-}
-
-std::uint32_t BE24(const unsigned char* p)
-{
-  return (static_cast<std::uint32_t>(p[0]) << 16) |
-         (static_cast<std::uint32_t>(p[1]) << 8) |
-         static_cast<std::uint32_t>(p[2]);
-}
-
 bool ReadFileRange(const std::filesystem::path& path, std::uint64_t offset,
                    std::uint64_t size, std::vector<unsigned char>* out)
 {
@@ -137,10 +126,6 @@ std::shared_ptr<VivIndex> ParseViv(const std::filesystem::path& path)
   if (ec || file_size < 6 || file_size > 1024ull * 1024ull * 1024ull)
     return {};
 
-  // Frontline GC compact VIV, verified against the disc assets and Dolphin RAM:
-  //   C0 FB | BE16 TOC/end hint | BE16 count
-  //   repeated: BE24 data_offset | BE24 data_size | NUL filename
-  // Offsets are absolute from the beginning of the VIV.
   const std::size_t probe_size = static_cast<std::size_t>(
       std::min<std::uint64_t>(file_size, 4ull * 1024ull * 1024ull));
   std::vector<unsigned char> bytes(probe_size);
@@ -149,48 +134,16 @@ std::shared_ptr<VivIndex> ParseViv(const std::filesystem::path& path)
     return {};
   stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
   bytes.resize(static_cast<std::size_t>(stream.gcount()));
-  if (bytes.size() < 6 || bytes[0] != 0xc0 || bytes[1] != 0xfb)
-    return {};
-
-  const std::uint16_t count = BE16(bytes.data() + 4);
-  if (count == 0 || count > 8192)
+  const auto entries = GCViv::Parse(bytes, file_size);
+  if (!entries)
     return {};
 
   auto index = std::make_shared<VivIndex>();
   index->path = path;
   index->file_size = file_size;
-  index->entries.reserve(count);
-
-  std::size_t pos = 6;
-  for (std::uint16_t i = 0; i < count; ++i)
-  {
-    if (pos + 6 > bytes.size())
-      return {};
-
-    const std::uint64_t offset = BE24(bytes.data() + pos);
-    const std::uint64_t size = BE24(bytes.data() + pos + 3);
-    pos += 6;
-
-    const auto* begin = bytes.data() + pos;
-    const auto* end = bytes.data() + bytes.size();
-    const auto* nul = std::find(begin, end, static_cast<unsigned char>(0));
-    if (nul == end || static_cast<std::size_t>(nul - begin) > 255)
-      return {};
-
-    std::string name(reinterpret_cast<const char*>(begin),
-                     static_cast<std::size_t>(nul - begin));
-    pos += static_cast<std::size_t>(nul - begin) + 1;
-
-    if (offset > file_size || size > file_size - offset)
-      return {};
-
-    Entry entry;
-    entry.name = std::move(name);
-    entry.extension = Extension(entry.name);
-    entry.offset = offset;
-    entry.size = size;
-    index->entries.emplace_back(std::move(entry));
-  }
+  index->entries.reserve(entries->size());
+  for (const auto& entry : *entries)
+    index->entries.push_back({entry.name, Extension(entry.name), entry.offset, entry.size});
 
   std::sort(index->entries.begin(), index->entries.end(),
             [](const Entry& a, const Entry& b) {
@@ -213,7 +166,7 @@ std::shared_ptr<VivIndex> GetViv(const std::filesystem::path& path)
   if (!parsed)
   {
     NativePCStatus::Fallback(NativePCStatus::Domain::VIV, path.generic_string(),
-                             "C0FB/BE24 TOC parse rejected");
+                             "C0FB/BIGF TOC parse rejected");
     return {};
   }
 
@@ -233,7 +186,7 @@ std::shared_ptr<VivIndex> GetViv(const std::filesystem::path& path)
 
   char detail[512]{};
   std::snprintf(detail, sizeof(detail),
-                "C0FB host-indexed entries=%zu MSH=%llu CPT=%llu SKL=%llu DMF=%llu GSH=%llu GFN=%llu",
+                "VIV host-indexed entries=%zu MSH=%llu CPT=%llu SKL=%llu DMF=%llu GSH=%llu GFN=%llu",
                 parsed->entries.size(),
                 static_cast<unsigned long long>(local_counts[".msh"]),
                 static_cast<unsigned long long>(local_counts[".cpt"]),
@@ -264,6 +217,59 @@ void InspectFont(const std::filesystem::path& container, const Entry& entry)
   }
 }
 
+void InspectCompartment(const std::filesystem::path& container, const Entry& entry)
+{
+  if (entry.extension != ".cpt" && entry.extension != ".cdb")
+    return;
+  std::vector<unsigned char> bytes;
+  bool valid = ReadFileRange(container, entry.offset, entry.size, &bytes);
+  std::size_t decoded = 0;
+  if (valid && entry.extension == ".cpt")
+  {
+    const auto cpt = GCCompartment::CPT::Parse(bytes);
+    valid = cpt.has_value();
+    if (cpt)
+    {
+      for (std::uint32_t i = 0; valid && i < cpt->tables[2].count; ++i)
+      {
+        const auto geometry = cpt->Geometry(i);
+        valid = geometry.has_value();
+        if (!geometry)
+          break;
+        for (std::uint32_t j = 0; valid && j < cpt->data.U16(*geometry + 2); ++j)
+        {
+          GCCompartment::Vertex vertex;
+          valid = cpt->DecodeVertex(*geometry, j, &vertex);
+          decoded += valid;
+        }
+      }
+    }
+  }
+  else if (valid)
+  {
+    const auto cdb = GCCompartment::CDB::Parse(bytes);
+    valid = cdb.has_value();
+    if (cdb)
+    {
+      for (std::uint32_t i = 0; valid && i < cdb->triangles.count; ++i)
+      {
+        std::array<std::array<float, 3>, 3> triangle;
+        valid = cdb->DecodeTriangle(i, &triangle);
+        decoded += valid;
+      }
+    }
+  }
+  const std::string detail = valid ?
+      "host file decoder validated " + std::to_string(decoded) +
+          (entry.extension == ".cpt" ? " strip vertices; live draw=static-recomp/GX" :
+                                      " collision triangles; collision execution=static-recomp") :
+      "host CPT/CDB decoder rejected file layout; semantic handling=static-recomp";
+  if (valid)
+    NativePCStatus::Native(NativePCStatus::Domain::AssetCPU, entry.name, detail);
+  else
+    NativePCStatus::Fallback(NativePCStatus::Domain::AssetCPU, entry.name, detail);
+}
+
 void LogAsset(const std::filesystem::path& container, const Entry& entry)
 {
   const std::string key = Lower(container.generic_string() + "::" + entry.name);
@@ -274,7 +280,7 @@ void LogAsset(const std::filesystem::path& container, const Entry& entry)
   }
 
   std::string detail = Kind(entry.extension);
-  detail += " | C0FB offset=0x";
+  detail += " | VIV offset=0x";
   char offset_text[32]{};
   std::snprintf(offset_text, sizeof(offset_text), "%llx",
                 static_cast<unsigned long long>(entry.offset));
@@ -285,6 +291,7 @@ void LogAsset(const std::filesystem::path& container, const Entry& entry)
   NativePCStatus::Native(NativePCStatus::Domain::AssetCPU, entry.name, detail);
 
   InspectFont(container, entry);
+  InspectCompartment(container, entry);
 }
 }  // namespace
 
@@ -316,7 +323,7 @@ void ObserveHostRead(const std::filesystem::path& host_path, std::string_view gu
     return;
 
   const std::uint64_t read_end = std::min<std::uint64_t>(
-      index->file_size, offset + static_cast<std::uint64_t>(bytes));
+      index->file_size, offset + std::min<std::uint64_t>(bytes, index->file_size - offset));
   for (const Entry& entry : index->entries)
   {
     if (entry.size == 0)

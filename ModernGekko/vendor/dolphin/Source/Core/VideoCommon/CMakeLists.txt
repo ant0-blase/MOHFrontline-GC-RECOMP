@@ -139,6 +139,8 @@ add_library(videocommon
   MOHFrontline/Engine/Filesystem/NativeVFS.h
   MOHFrontline/Engine/Filesystem/NativeGCAssets.cpp
   MOHFrontline/Engine/Filesystem/NativeGCAssets.h
+  MOHFrontline/Assets/GC/Formats/GCCompartment.h
+  MOHFrontline/Assets/GC/Formats/GCViv.h
   MOHFrontline/Assets/GC/Formats/GCTexture.cpp
   MOHFrontline/Assets/GC/Formats/GCTexture.h
   MOHFrontline/Assets/GC/Formats/GCFont.cpp

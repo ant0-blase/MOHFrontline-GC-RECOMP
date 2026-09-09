@@ -23,6 +23,8 @@
 #include <vector>
 
 #include "VideoCommon/Assets/CustomTextureData.h"
+#include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCViv.h"
+#include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCCompartment.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3MeshPort.h"
@@ -37,7 +39,7 @@
 // hashes, no pre-generated RSX offsets and no PS3_PORT_CACHE dependency.
 // It builds the mapping from the user's own GameCube + PS3 files at runtime:
 //
-//   GC level.viv::*_ART*.cpt --scan SHPG--> exact GC texture identities
+//   GC {level,comp}.viv::*_ART*.cpt --scan SHPG--> exact GC texture identities
 //   PS3 *_ART*.cpt          --scan RSX records--> descriptors + rsx.viv ranges
 //   runtime decode + image fingerprint matching (master/chunks aggregated)
 //   live TextureInfo exact hash --> PS3 GTF/BC decode --> CustomTextureData
@@ -369,7 +371,7 @@ inline bool ReadFile(const std::filesystem::path& path, std::vector<u8>* out)
                         static_cast<std::streamsize>(out->size())));
 }
 
-inline std::filesystem::path ResolveGCLevelVIV(std::string_view level)
+inline std::filesystem::path ResolveGCLevelVIV(std::string_view level, std::string_view archive = "level.viv")
 {
   const auto underscore = level.find('_');
   if (underscore == std::string_view::npos || underscore == 0)
@@ -378,13 +380,23 @@ inline std::filesystem::path ResolveGCLevelVIV(std::string_view level)
   const std::string mission(level.substr(0, underscore));
   const std::string name(level);
   const std::array<std::filesystem::path, 4> relatives = {{
-      std::filesystem::path("extracted") / "files" / "DATA" / mission / name / "level.viv",
-      std::filesystem::path("extracted") / "files" / "data" / mission / name / "level.viv",
-      std::filesystem::path("extracted") / "DATA" / mission / name / "level.viv",
-      std::filesystem::path("extracted") / "data" / mission / name / "level.viv",
+      std::filesystem::path("extracted") / "files" / "DATA" / mission / name / archive,
+      std::filesystem::path("extracted") / "files" / "data" / mission / name / archive,
+      std::filesystem::path("extracted") / "DATA" / mission / name / archive,
+      std::filesystem::path("extracted") / "data" / mission / name / archive,
   }};
 
   std::vector<std::filesystem::path> candidates;
+  if (const char* value = std::getenv("MOH_GC_FILES"); value && *value)
+  {
+    const std::filesystem::path root(value);
+    candidates.push_back(root / "DATA" / mission / name / archive);
+    candidates.push_back(root / "data" / mission / name / archive);
+    candidates.push_back(root / mission / name / archive);
+    for (const auto& relative : relatives)
+      candidates.push_back(root / relative);
+  }
+
   std::error_code cwd_error;
   auto base = std::filesystem::current_path(cwd_error);
   if (!cwd_error)
@@ -398,16 +410,6 @@ inline std::filesystem::path ResolveGCLevelVIV(std::string_view level)
         break;
       base = parent;
     }
-  }
-
-  if (const char* value = std::getenv("MOH_GC_FILES"); value && *value)
-  {
-    const std::filesystem::path root(value);
-    candidates.push_back(root / "DATA" / mission / name / "level.viv");
-    candidates.push_back(root / "data" / mission / name / "level.viv");
-    candidates.push_back(root / mission / name / "level.viv");
-    for (const auto& relative : relatives)
-      candidates.push_back(root / relative);
   }
 
   if (const char* value = std::getenv("MOH_PS3_FILES"); value && *value)
@@ -433,39 +435,17 @@ inline std::filesystem::path ResolveGCLevelVIV(std::string_view level)
 inline std::vector<Blob> ExtractGCCPTs(std::span<const u8> viv)
 {
   std::vector<Blob> out;
-  if (viv.size() < 6 || viv[0] != 0xC0 || viv[1] != 0xFB)
+  const auto entries = MOHFrontline::GCViv::Parse(viv, viv.size());
+  if (!entries)
     return out;
-
-  const u32 count = BE16(viv.data() + 4);
-  if (!count || count > 8192)
-    return out;
-
-  std::size_t pos = 6;
-  for (u32 i = 0; i < count; ++i)
+  for (const auto& entry : *entries)
   {
-    if (pos + 6 > viv.size())
-      return {};
-    const u32 offset = BE24(viv.data() + pos);
-    const u32 size = BE24(viv.data() + pos + 3);
-    pos += 6;
-
-    const std::size_t begin = pos;
-    while (pos < viv.size() && viv[pos] != 0 && pos - begin <= 255)
-      ++pos;
-    if (pos >= viv.size() || pos - begin > 255)
-      return {};
-
-    std::string name(reinterpret_cast<const char*>(viv.data() + begin), pos - begin);
-    ++pos;
-    const std::string lower = Lower(name);
+    const std::string lower = Lower(entry.name);
     if (!lower.ends_with(".cpt") || lower.find("_art") == std::string::npos)
       continue;
-    if (offset > viv.size() || size > viv.size() - offset)
-      continue;
-
     Blob blob;
     blob.name = lower;
-    blob.data.assign(viv.begin() + offset, viv.begin() + offset + size);
+    blob.data.assign(viv.begin() + entry.offset, viv.begin() + entry.offset + entry.size);
     out.push_back(std::move(blob));
   }
   return out;
@@ -474,42 +454,40 @@ inline std::vector<Blob> ExtractGCCPTs(std::span<const u8> viv)
 inline std::vector<GCTexture> ParseGCCPT(std::span<const u8> cpt)
 {
   std::vector<GCTexture> out;
-  static constexpr std::array<u8, 4> tag = {'S', 'H', 'P', 'G'};
-
-  for (std::size_t pos = 0; pos + 0x40 <= cpt.size();)
+  const auto compartment = MOHFrontline::GCCompartment::CPT::Parse(cpt);
+  if (!compartment)
+    return out;
+  std::unordered_set<std::size_t> seen_shapes;
+  for (unsigned table = 0; table < 2; ++table)
   {
-    const auto it = std::search(cpt.begin() + pos, cpt.end(), tag.begin(), tag.end());
-    if (it == cpt.end())
-      break;
-    const std::size_t shpg = static_cast<std::size_t>(it - cpt.begin());
-    pos = shpg + 4;
-    if (shpg + 0x40 > cpt.size())
-      continue;
-
-    const std::size_t shape = shpg + 0x30;
-    u32 format = 0;
-    if (!GSHTypeToGXFormat(cpt[shape], &format))
-      continue;
-
-    const u32 width = BE16(cpt.data() + shape + 4);
-    const u32 height = BE16(cpt.data() + shape + 6);
-    if (!width || !height || width > 8192 || height > 8192)
-      continue;
-
-    const std::size_t payload_size = GXTextureDataSize(width, height, format);
-    const std::size_t payload = shape + 16;
-    if (!payload_size || payload > cpt.size() || payload_size > cpt.size() - payload)
-      continue;
-
-    GCTexture texture;
-    texture.hash = FNV1a64(cpt.data() + payload, payload_size);
-    texture.width = width;
-    texture.height = height;
-    texture.format = format;
-    texture.source_offset = shpg;
-    texture.payload_offset = payload;
-    texture.payload_size = payload_size;
-    out.push_back(texture);
+    for (u32 index = 0; index < compartment->tables[table].count; ++index)
+    {
+      const auto shape_offset = compartment->Shape(table, index);
+      if (!shape_offset || !seen_shapes.insert(*shape_offset).second)
+        continue;
+      const std::size_t shape = *shape_offset;
+      u32 format = 0;
+      if (!GSHTypeToGXFormat(cpt[shape], &format))
+        continue;
+      const u32 width = BE16(cpt.data() + shape + 4);
+      const u32 height = BE16(cpt.data() + shape + 6);
+      if (!width || !height || width > 8192 || height > 8192)
+        continue;
+      const std::size_t payload_size = GXTextureDataSize(width, height, format);
+      const std::size_t payload = shape + 16;
+      if (!payload_size || payload_size > cpt.size() - payload)
+        continue;
+      GCTexture texture;
+      texture.hash = FNV1a64(cpt.data() + payload, payload_size);
+      texture.width = width;
+      texture.height = height;
+      texture.format = format;
+      texture.source_offset = compartment->data.U32(
+          compartment->tables[table].offset + index * 0x70 + 0x60);
+      texture.payload_offset = payload;
+      texture.payload_size = payload_size;
+      out.push_back(texture);
+    }
   }
   return out;
 }
@@ -858,18 +836,30 @@ inline std::shared_ptr<Catalog> BuildCatalog(std::string level)
   }
   catalog->rsx_path = rsx->relative_path;
 
-  const auto gc_viv_path = ResolveGCLevelVIV(catalog->level);
-  std::vector<u8> gc_viv;
-  if (gc_viv_path.empty() || !ReadFile(gc_viv_path, &gc_viv))
+  std::vector<Blob> gc_blobs;
+  std::string gc_sources_text;
+  for (const std::string_view archive : {"level.viv", "comp.viv"})
+  {
+    const auto path = ResolveGCLevelVIV(catalog->level, archive);
+    std::vector<u8> bytes;
+    if (path.empty() || !ReadFile(path, &bytes))
+      continue;
+    if (!gc_sources_text.empty())
+      gc_sources_text += ";";
+    gc_sources_text += path.string();
+    auto blobs = ExtractGCCPTs(bytes);
+    for (auto& blob : blobs)
+      gc_blobs.push_back(std::move(blob));
+  }
+  if (gc_blobs.empty())
   {
     std::fprintf(stderr,
-                 "[moh-ps3-cpt] GC level.viv missing for level=%s "
+                 "[moh-ps3-cpt] no GC CPT in level.viv/comp.viv for level=%s "
                  "(set MOH_GC_FILES if needed) -> GC fallback\n",
                  catalog->level.c_str());
     return catalog;
   }
 
-  auto gc_blobs = ExtractGCCPTs(gc_viv);
   catalog->gc_chunks = gc_blobs.size();
   std::vector<GCSource> gc_sources;
   std::unordered_set<u64> seen_gc_sources;
@@ -1060,7 +1050,7 @@ inline std::shared_ptr<Catalog> BuildCatalog(std::string level)
                "PS3-records=%zu PS3-fp=%zu mapped=%zu source=%s\n",
                catalog->level.c_str(), catalog->gc_chunks, catalog->ps3_chunks,
                catalog->gc_textures, gc_sources.size(), catalog->ps3_records,
-               ps3_sources.size(), catalog->entries.size(), gc_viv_path.string().c_str());
+               ps3_sources.size(), catalog->entries.size(), gc_sources_text.c_str());
   return catalog;
 }
 
