@@ -384,6 +384,52 @@ bool IsHardDisabledPS3DMFMaterial(std::string_view name)
   return name == "mohf_body";
 }
 
+// v12.10:
+//
+// The PS3 animated character geometry is deliberately disabled as a whole.
+//
+// Previous releases blocked only material=mohf_body. Character DMFs such as
+// bm14.dmf still contain gr1/gr2/gr3/etc and those independently matched
+// materials could therefore enter the PS3 skinned/native renderer.
+//
+// Keep the original retail GameCube geometry/XF animation for the complete
+// character resource. The PS3 texture/material layer remains independent.
+bool IsHardDisabledPS3DMFResource(std::string_view name)
+{
+  const std::string canonical =
+      CanonicalDMFName(name);
+
+  if (!canonical.ends_with(".dmf"))
+    return false;
+
+  // UHM = human/character mesh family.
+  if (canonical.rfind("uhm", 0) == 0)
+    return true;
+
+  // BMxx and BMxx_* are character models:
+  //
+  //   bm01.dmf
+  //   bm14.dmf
+  //   bm37_20l.dmf
+  //
+  // This does NOT match:
+  //
+  //   m1_weapon.dmf
+  //   th_weapon.dmf
+  //   colt_weapon.dmf
+  //   mp40_weapondsgs.dmf
+  //   ...
+  return canonical.size() >= 4 &&
+         canonical[0] == 'b' &&
+         canonical[1] == 'm' &&
+         std::isdigit(
+             static_cast<unsigned char>(
+                 canonical[2])) &&
+         std::isdigit(
+             static_cast<unsigned char>(
+                 canonical[3]));
+}
+
 // Retail GC skinned DMF display lists use a seven-byte vertex reference:
 // matrix index + position/normal/UV indices. The game may copy/reindex those
 // references for animated first-person weapons, which destroys the byte hash
@@ -575,6 +621,7 @@ void EnsureDMFPaletteFlowPartition(const SkinnedDrawMatch& draw)
   if (!draw || !draw.owner || !draw.owner->decoded ||
       draw.gc_material_name.empty() || draw.gc_palette_groups.empty() ||
       draw.ps3_group_to_gc.empty() || IsSupportedPlayerWeaponDMF(draw.gc_name) ||
+      IsHardDisabledPS3DMFResource(draw.gc_name) ||
       IsHardDisabledPS3DMFMaterial(draw.gc_material_name))
   {
     return;
@@ -2269,6 +2316,14 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
       gc_bytes.size() < 0x50)
     return;
 
+  // v12.10:
+  // No character PS3 geometry means no character skin-map computation.
+  if (IsHardDisabledPS3DMFResource(
+          pair->ps3->source_name))
+  {
+    return;
+  }
+
   const u32 gc_group_count = BE32(gc_bytes.data() + 0x20);
   const u32 gc_group_offset = BE32(gc_bytes.data() + 0x24);
   if (!gc_group_count || gc_group_count > 4096 || gc_group_offset > gc_bytes.size() ||
@@ -3054,9 +3109,18 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
           gc_material_name = Lower(FixedString(
               bytes + gc_texture_table + static_cast<std::size_t>(gc_texture_index) * 16, 16));
         }
-        // v12.9: large PS3 character bodies are intentionally kept GC.
-        // Skip them before parsing/hashing/indexing any authored DL.
-        if (IsHardDisabledPS3DMFMaterial(gc_material_name))
+        // v12.10:
+        // Character geometry is GameCube-only. Skip before:
+        //
+        //   CountGCDMFTriangles()
+        //   DL hashing
+        //   prefix hashing
+        //   candidate allocation
+        //   PreparedDMFDraw creation
+        //
+        // This both closes the geometry leak and removes useless work.
+        if (IsHardDisabledPS3DMFResource(filename) ||
+            IsHardDisabledPS3DMFMaterial(gc_material_name))
           continue;
 
         const u32 draw_count = BE32(mat + 44);
@@ -5075,6 +5139,7 @@ SkinnedDrawReplacement BuildCurrentSkinnedReplacement()
   static const bool blended_groups = EnvSwitchLocal("MOH_PS3_DMF_BLEND_GROUPS", true);
   const auto& draw = g_current_dmf_draw;
   if (!replace || !draw.prepared || !draw.owner || !draw.owner->decoded ||
+      IsHardDisabledPS3DMFResource(draw.gc_name) ||
       IsHardDisabledPS3DMFMaterial(draw.gc_material_name) ||
       (!generic_exact && !IsSupportedPlayerWeaponDMF(draw.gc_name)))
     return {};

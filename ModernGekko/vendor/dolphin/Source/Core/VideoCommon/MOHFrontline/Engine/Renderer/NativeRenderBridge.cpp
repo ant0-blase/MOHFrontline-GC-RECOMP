@@ -24,6 +24,42 @@ std::string Lower(std::string value)
   return value;
 }
 
+bool IsBlockedCharacterDMF(std::string_view name)
+{
+  std::string filename =
+      Lower(std::string(name));
+
+  const auto slash =
+      filename.find_last_of("/\\:");
+
+  if (slash != std::string::npos)
+    filename.erase(0, slash + 1);
+
+  if (filename.ends_with(".dmt"))
+  {
+    filename.replace(
+        filename.size() - 4,
+        4,
+        ".dmf");
+  }
+
+  if (!filename.ends_with(".dmf"))
+    return false;
+
+  if (filename.rfind("uhm", 0) == 0)
+    return true;
+
+  return filename.size() >= 4 &&
+         filename[0] == 'b' &&
+         filename[1] == 'm' &&
+         std::isdigit(
+             static_cast<unsigned char>(
+                 filename[2])) &&
+         std::isdigit(
+             static_cast<unsigned char>(
+                 filename[3]));
+}
+
 bool BuildStatic(DrawPacket* out)
 {
   const auto& current = PS3MeshPort::CurrentStaticDraw();
@@ -74,7 +110,19 @@ bool BuildSkinned(DrawPacket* out)
   if (!context)
     return false;
 
-  const auto replacement = PS3MeshPort::BuildCurrentSkinnedReplacement();
+  // v12.10:
+  // Never submit PS3 animated character geometry to the host renderer.
+  //
+  // The original GX draw is therefore retained. Textures/materials are
+  // handled by their own replacement layer and are not disabled here.
+  if (context.gc_material_name == "mohf_body" ||
+      IsBlockedCharacterDMF(context.gc_name))
+  {
+    return false;
+  }
+
+  const auto replacement =
+      PS3MeshPort::BuildCurrentSkinnedReplacement();
   if (!replacement || !replacement.cluster)
     return false;
 

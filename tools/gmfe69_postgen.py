@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from gmfe69_particle_wpar_postgen import apply_gmfe69_particle_wpar_postgen
+from gmfe69_pc_native_postgen import apply_gmfe69_pc_native_postgen
 
 # MOH_GMFE69_FINAL_DEFINITIVE_OPTIMIZATIONS
 
@@ -1025,6 +1026,11 @@ def apply_gmfe69_generated_postgen(generated: Path) -> None:
     # skip GXRuntime's generic MEM1 address probe for ELF-verified WPAR stores.
     # This retains the current GPFifo/CommandProcessor overflow backpressure.
     apply_gmfe69_particle_wpar_postgen(generated)
+
+    # MOH_GMFE69_PC_NATIVE_WIRE_V1
+    # ELF-verified host-native hot functions + host frame timing.
+    # Logs distinguish PC Natif from recomp PPC Fallback.
+    apply_gmfe69_pc_native_postgen(generated)
 
     particle = _find_chunk_for_pc(chunks, 0x8007E198)
     if not particle:
