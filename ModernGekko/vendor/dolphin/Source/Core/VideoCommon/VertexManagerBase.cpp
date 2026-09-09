@@ -42,6 +42,7 @@
 #include "VideoCommon/PixelShaderGen.h"
 #include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
+#include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/NativeHostRenderer.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/NativeRenderBridge.h"
 #include "VideoCommon/PixelShaderManager.h"
@@ -902,24 +903,48 @@ void VertexManagerBase::Flush()
     // Same with GPU texture decoding, which uses compute shaders.
     g_texture_cache->BindTextures(used_textures, samplers);
 
+    bool gc_native_submitted = false;
     if (!skip)
     {
-      UpdatePipelineConfig();
-      UpdatePipelineObject();
-      if (m_current_pipeline_object)
+      const auto native_mode = MOHFrontline::NativeRender::GetMode();
+      if (native_mode == MOHFrontline::NativeRender::Mode::PreferNative &&
+          MOHFrontline::NativeRender::KeepOriginalGCGeometry() &&
+          MOHFrontline::NativeHostRenderer::GameCubeBatchTakeoverEnabled())
       {
-        const AbstractPipeline* pipeline_object = m_current_pipeline_object;
-        if (!custom_pixel_shader_contents.shaders.empty())
+        if (NativeVertexFormat* format = VertexLoaderManager::GetCurrentVertexFormat())
         {
-          if (const auto custom_pipeline =
-                  GetCustomPipeline(custom_pixel_shader_contents, m_current_pipeline_config,
-                                    m_current_uber_pipeline_config, m_current_pipeline_object))
-          {
-            pipeline_object = custom_pipeline;
-          }
+          gc_native_submitted = MOHFrontline::NativeHostRenderer::SubmitGameCubeDecodedBatch(
+              m_base_buffer_pointer, m_index_generator.GetNumVerts(),
+              m_index_generator.GetIndexBuffer(), num_indices,
+              format->GetVertexDeclaration(), m_current_primitive_type);
         }
-        RenderDrawCall(pixel_shader_manager, geometry_shader_manager, custom_pixel_shader_contents,
-                       custom_pixel_shader_uniforms, m_current_primitive_type, pipeline_object);
+        else
+        {
+          MOHFrontline::NativePCStatus::Fallback(
+              MOHFrontline::NativePCStatus::Domain::Render, "GC/GX batch",
+              "missing decoded vertex format -> GX");
+        }
+      }
+
+      if (!gc_native_submitted)
+      {
+        UpdatePipelineConfig();
+        UpdatePipelineObject();
+        if (m_current_pipeline_object)
+        {
+          const AbstractPipeline* pipeline_object = m_current_pipeline_object;
+          if (!custom_pixel_shader_contents.shaders.empty())
+          {
+            if (const auto custom_pipeline =
+                    GetCustomPipeline(custom_pixel_shader_contents, m_current_pipeline_config,
+                                      m_current_uber_pipeline_config, m_current_pipeline_object))
+            {
+              pipeline_object = custom_pipeline;
+            }
+          }
+          RenderDrawCall(pixel_shader_manager, geometry_shader_manager, custom_pixel_shader_contents,
+                         custom_pixel_shader_uniforms, m_current_primitive_type, pipeline_object);
+        }
       }
     }
 

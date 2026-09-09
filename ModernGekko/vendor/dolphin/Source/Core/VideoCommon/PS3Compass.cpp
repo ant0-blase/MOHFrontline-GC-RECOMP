@@ -4,7 +4,9 @@
 #include "VideoCommon/PS3MeshPort.h"
 #include "VideoCommon/PS3WorldCPT.h"
 #include "VideoCommon/PS3WorldCPTRuntime.h"
+#include "VideoCommon/MOHFrontline/Assets/GC/Formats/GCTexture.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.h"
+#include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
 
 #include <algorithm>
@@ -39,6 +41,8 @@
 
 namespace PS3Compass
 {
+namespace NativePCStatus = MOHFrontline::NativePCStatus;
+
 namespace
 {
 std::shared_ptr<VideoCommon::CustomTextureData>
@@ -4873,6 +4877,27 @@ int NameIndex(std::string_view name)
 
   UpdateLevelScopeFromGuestName(name);
 
+  // GC-native mode: the original GSH name is already the exact semantic
+  // identity. Register it here and decode the later GX upload on the host;
+  // never run PS3 fuzzy/name matching when the remaster is not selected.
+  if (KeepOriginalGCTexture() && Filename(name).ends_with(".gsh"))
+  {
+    const std::string key = "gc-native:" + Normalize(std::string(name));
+    std::scoped_lock lock(mutex);
+    if (const auto it = resource_ids.find(key); it != resource_ids.end())
+      return it->second;
+    const int id = next_resource_id++;
+    Resource resource;
+    resource.filename = Filename(name);
+    resource.relative_path = key;
+    resource.attempted = true;
+    resources.emplace(id, std::move(resource));
+    resource_ids.emplace(key, id);
+    NativePCStatus::Native(NativePCStatus::Domain::Texture, name,
+                           "GSH identity registered; waiting for exact GX upload");
+    return id;
+  }
+
   const std::string sky_path = PS3NamedSky::RelativePath(name);
   const PS3RemasterAssets::AssetInfo* asset = nullptr;
   if (!sky_path.empty())
@@ -5105,7 +5130,30 @@ void Register(int index, u32 address, u32 width, u32 height, u32 format, std::ve
     uploaded_named_sky.erase(address & 0x1FFFFFFF);
   }
 
-  auto decoded = DecodeResource(&resource_it->second);
+  const bool gc_native = resource_it->second.relative_path.rfind("gc-native:", 0) == 0;
+  std::shared_ptr<VideoCommon::CustomTextureData> decoded;
+  if (gc_native)
+  {
+    // Keep the original Dolphin GX texture as the visual authority by default.
+    // The host decoder can be enabled explicitly once a format is being tested.
+    if (!MOHFrontline::GCTexture::ReplacementEnabled())
+      return;
+
+    decoded = MOHFrontline::GCTexture::DecodeUpload(
+        width, height, format, original, palette_format, palette);
+    resource_it->second.decoded = decoded;
+    resource_it->second.attempted = true;
+    if (!decoded)
+    {
+      NativePCStatus::Fallback(NativePCStatus::Domain::Texture,
+                               resource_it->second.filename,
+                               "unsupported/corrupt GX upload -> TextureCache GX decoder");
+    }
+  }
+  else
+  {
+    decoded = DecodeResource(&resource_it->second);
+  }
   if (!decoded)
     return;
 
@@ -5123,31 +5171,48 @@ void Register(int index, u32 address, u32 width, u32 height, u32 format, std::ve
     registration.palette_hash = Common::GetHash64(palette.data(), palette.size(), 0);
 
   registrations[registration.address] = std::move(registration);
+  if (gc_native)
+  {
+    char detail[192]{};
+    std::snprintf(detail, sizeof(detail),
+                  "host GX decode %ux%u fmt=%u bytes=%zu palette_fmt=%u palette=%zu",
+                  width, height, format, original.size(), palette_format, palette.size());
+    NativePCStatus::Native(NativePCStatus::Domain::Texture,
+                           resource_it->second.filename, detail);
+  }
 }
 
 std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
 {
-  if (!MohPcLayer::IsPS3TextureReplacementEnabled())
-    return nullptr;
-
-
   if (info.IsFromTmem())
     return nullptr;
 
   const u32 address = info.GetRawAddress();
 
   bool has_exact_registration = false;
+  bool exact_gc_native = false;
 
   {
     std::scoped_lock lock(mutex);
-
-    has_exact_registration =
-        registrations.find(address) !=
-        registrations.end();
+    const auto registration = registrations.find(address);
+    has_exact_registration = registration != registrations.end();
+    if (has_exact_registration)
+    {
+      if (const auto resource = resources.find(registration->second.resource_id);
+          resource != resources.end())
+      {
+        exact_gc_native = resource->second.relative_path.rfind("gc-native:", 0) == 0;
+      }
+    }
   }
+
+  if (!exact_gc_native && !MohPcLayer::IsPS3TextureReplacementEnabled())
+    return nullptr;
 
   if (!has_exact_registration)
   {
+    if (!MohPcLayer::IsPS3TextureReplacementEnabled())
+      return nullptr;
     {
       std::scoped_lock lock(mutex);
       if (named_sky_addresses.contains(address))

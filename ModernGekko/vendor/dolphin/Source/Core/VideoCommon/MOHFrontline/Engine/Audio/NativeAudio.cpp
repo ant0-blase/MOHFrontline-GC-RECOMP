@@ -16,6 +16,7 @@
 #include "AudioCommon/SoundStream.h"
 #include "Common/Swap.h"
 #include "Core/System.h"
+#include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
 
 #if defined(MOH_NATIVE_AUDIO_FFMPEG)
 extern "C"
@@ -54,7 +55,7 @@ bool IsStreamCandidate(std::string_view guest_name)
   if (dot == std::string::npos)
     return false;
   const std::string_view ext(name.data() + dot, name.size() - dot);
-  return ext == ".asf" || ext == ".asfx" || ext == ".mus" || ext == ".musx" ||
+  return ext == ".mpc" || ext == ".asf" || ext == ".asfx" || ext == ".mus" || ext == ".musx" ||
          ext == ".ast" || ext == ".astx" || ext == ".wav";
 }
 
@@ -66,6 +67,38 @@ u16 LE16(const u8* p)
 u32 LE32(const u8* p)
 {
   return u32(p[0]) | (u32(p[1]) << 8) | (u32(p[2]) << 16) | (u32(p[3]) << 24);
+}
+
+bool ExtractMPCNativeAudio(std::span<const u8> bytes, std::vector<u8>* out,
+                           std::size_t* packets)
+{
+  if (!out || bytes.size() < 8)
+    return false;
+  out->clear();
+  std::size_t count = 0;
+  std::size_t p = 0;
+  while (p + 8 <= bytes.size())
+  {
+    const u8* chunk = bytes.data() + p;
+    const u32 size = LE32(chunk + 4);
+    if (size < 8 || size > bytes.size() - p)
+      return false;
+
+    const bool audio = std::memcmp(chunk, "SCHl", 4) == 0 ||
+                       std::memcmp(chunk, "SCCl", 4) == 0 ||
+                       std::memcmp(chunk, "SCDl", 4) == 0 ||
+                       std::memcmp(chunk, "SCEl", 4) == 0;
+    if (audio)
+    {
+      out->insert(out->end(), chunk, chunk + size);
+      if (std::memcmp(chunk, "SCDl", 4) == 0)
+        ++count;
+    }
+    p += size;
+  }
+  if (packets)
+    *packets = count;
+  return count != 0 && !out->empty();
 }
 
 bool EnvSwitch(const char* name, bool fallback)
@@ -1072,6 +1105,9 @@ Format Detect(std::span<const u8> bytes)
        (std::memcmp(bytes.data(), "SCDl", 4) == 0)))
     return Format::EAStream;
 
+  if (bytes.size() >= 8 && std::memcmp(bytes.data(), "MPCh", 4) == 0)
+    return Format::EAMovie;
+
   if (bytes.size() >= 2 && bytes[0] == 'A' && bytes[1] == 'B')
   {
     if (bytes.size() >= 0x20)
@@ -1088,6 +1124,7 @@ const char* FormatName(Format format)
   {
   case Format::WavePCM: return "RIFF/WAVE PCM";
   case Format::EAStream: return "EA SCHl/SCDl";
+  case Format::EAMovie: return "EA MPC (MPCh+SCx)";
   case Format::AEMSBank: return "AEMS bank";
   case Format::AEMSStream: return "AEMS stream";
   default: return "unknown";
@@ -1129,11 +1166,38 @@ bool Decode(const Asset& asset, PCMBuffer* out)
     return DecodeWave(asset.bytes, out);
 
   case Format::EAStream:
-#if defined(MOH_NATIVE_AUDIO_FFMPEG)
-    if (DecodeEAStreamFFmpeg(asset.bytes, out))
+    // Frontline's GC/PS3 SCHl/SCDl R1 streams are understood directly by the
+    // host decoder. Avoid probing FFmpeg first and falling through predictable
+    // "invalid number of samples" errors on every bank/music load.
+    if (DecodeEAStreamNativeR1(asset.bytes, out))
       return true;
+#if defined(MOH_NATIVE_AUDIO_FFMPEG)
+    return DecodeEAStreamFFmpeg(asset.bytes, out);
+#else
+    return false;
 #endif
-    return DecodeEAStreamNativeR1(asset.bytes, out);
+
+  case Format::EAMovie:
+  {
+    std::vector<u8> audio;
+    std::size_t packets = 0;
+    if (!ExtractMPCNativeAudio(asset.bytes, &audio, &packets))
+      return false;
+    if (DecodeEAStreamNativeR1(audio, out))
+    {
+      static unsigned logs = 0;
+      if (logs++ < 16)
+        std::fprintf(stderr,
+                     "[NATIVE-PC] AUDIO     MPC demux: SCDl packets=%zu bytes=%zu -> native EA R1\n",
+                     packets, audio.size());
+      return true;
+    }
+#if defined(MOH_NATIVE_AUDIO_FFMPEG)
+    return DecodeEAStreamFFmpeg(audio, out);
+#else
+    return false;
+#endif
+  }
 
   // AEMS/ABK banks still need their event/module lookup layer. Never decode
   // the bank container itself as if it were a single PCM stream.
@@ -1223,12 +1287,18 @@ void Pump()
                    "[moh-native-audio] HOST STREAM START: %s frames=%zu rate=%u source=%s\n",
                    s_current_guest.c_str(), s_stream_pcm.Frames(), s_stream_pcm.sample_rate,
                    asset.file.IsPS3() ? "PS3" : "GC-host");
+      NativePCStatus::Native(
+          NativePCStatus::Domain::Audio, s_current_guest,
+          asset.file.IsPS3() ? "host PCM stream source=PS3" :
+                               "host PCM stream source=GC");
     }
     else
     {
       std::fprintf(stderr,
                    "[moh-native-audio] native stream unavailable: %s -> guest GC audio continues\n",
                    s_current_guest.c_str());
+      NativePCStatus::Fallback(NativePCStatus::Domain::Audio, s_current_guest,
+                               "guest/DSP audio path continues");
     }
   }
 

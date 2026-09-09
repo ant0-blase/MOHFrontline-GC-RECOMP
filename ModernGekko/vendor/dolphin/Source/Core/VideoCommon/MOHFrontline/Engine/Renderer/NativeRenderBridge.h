@@ -21,12 +21,15 @@ struct Vertex
   std::array<float, 3> position{};
   std::array<float, 3> normal{};
   std::array<float, 2> uv0{};
+  std::array<u8, 4> color{255, 255, 255, 255};
   u8 matrix_index = 0;
 };
 
 struct DrawPacket
 {
   bool skinned = false;
+  bool has_texture = true;
+  bool use_vertex_color = false;
   std::string source_name;
   std::string material_name;
   std::vector<Vertex> vertices;
@@ -44,6 +47,8 @@ const char* ModeName(Mode mode);
 
 void SetSubmitter(Submitter submitter, void* userdata = nullptr);
 bool HasSubmitter();
+
+bool KeepOriginalGCGeometry();
 
 // Builds a host-neutral packet from the exact PS3 MSH/DMF draw currently
 // associated with the GC renderer. Returns false for ordinary/unmatched GC

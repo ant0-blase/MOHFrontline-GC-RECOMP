@@ -12,8 +12,10 @@
 #include <unordered_set>
 
 #include "Core/HW/DVD/MOHNativeVFSBridge.h"
+#include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeGCAssets.h"
 #include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
 #include "VideoCommon/MOHFrontline/Engine/Video/NativeVideo.h"
+#include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 
 namespace MOHFrontline::NativeVFS
@@ -273,11 +275,21 @@ bool DiscReadCallback(std::string_view guest_path, u64 file_offset, std::span<u8
 
   const File file = ResolveGC(guest_path, PS3AssetPort::Class::Unknown);
   if (!file || !file.IsGC())
+  {
+    NativePCStatus::Fallback(NativePCStatus::Domain::FileIO, guest_path,
+                             "host miss -> ModernGekko DVD/disc path");
     return false;
+  }
 
   if (!ReadRange(file, file_offset, destination))
+  {
+    NativePCStatus::Fallback(NativePCStatus::Domain::FileIO, guest_path,
+                             "host read rejected -> ModernGekko DVD/disc path");
     return false;
+  }
 
+  NativePCStatus::Native(NativePCStatus::Domain::FileIO, guest_path, file.resolved_path);
+  NativeGCAssets::ObserveHostRead(file.host_path, guest_path, file_offset, destination.size());
   static std::uint64_t hits = 0;
   const std::uint64_t hit = ++hits;
   if (hit <= 256 || (hit % 1024) == 0)
@@ -299,6 +311,7 @@ void Initialize()
   if (s_initialized)
     return;
 
+  NativePCStatus::Initialize();
   s_gc_roots = BuildRoots();
   s_gc_path_cache.clear();
   s_initialized = true;
@@ -316,6 +329,8 @@ void Shutdown()
   DVD::SetMOHNativeVFSReadCallback(nullptr);
   NativeAudio::Stop();
   NativeVideo::Stop();
+  NativeGCAssets::Shutdown();
+  NativePCStatus::Summary();
 
   std::scoped_lock lock(s_mutex);
   s_gc_roots.clear();
@@ -463,6 +478,12 @@ std::vector<u8> Read(const File& file)
 
   if (!stream && !bytes.empty())
     return {};
+
+  if (file.IsGC())
+  {
+    NativePCStatus::Native(NativePCStatus::Domain::FileIO, file.guest_path, file.resolved_path);
+    NativeGCAssets::ObserveHostRead(file.host_path, file.guest_path, 0, bytes.size());
+  }
   return bytes;
 }
 

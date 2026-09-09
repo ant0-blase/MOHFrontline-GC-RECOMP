@@ -3,6 +3,8 @@
 
 #include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeVFS.h"
+#include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
+#include "VideoCommon/MOHFrontline/Engine/Video/NativeVideo.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3FontParser.h"
 
@@ -1145,7 +1147,24 @@ std::optional<ControlState> InputOverride(std::string_view group, std::string_vi
     double pc = 0.0;
     const u32 buttons = s.mouse_buttons.load();
     if (control == GCPad::A_BUTTON)
-      pc = ActionDown(Action::Use) || MobileDown(MobileAction::Use) || (!s.gameplay.load() && (buttons & 1u));
+    {
+      pc = ActionDown(Action::Use) || MobileDown(MobileAction::Use) ||
+           (!s.gameplay.load() && (buttons & 1u));
+
+      // The host decoder owns presentation after the guest opens an MPC/MPCX.
+      // On skip, still return A to the guest, but also terminate native video
+      // and native movie audio. Rising-edge gating avoids repeated stops while
+      // A is held.
+      const bool a_down = pc > 0.5 || (keep_pad && original > 0.5);
+      static bool last_a_down = false;
+      if (a_down && !last_a_down && MOHFrontline::NativeVideo::IsPlaying())
+      {
+        std::fprintf(stderr, "[moh-native-video] A pressed -> native movie skip requested\n");
+        MOHFrontline::NativeVideo::RequestSkip();
+        MOHFrontline::NativeAudio::Stop();
+      }
+      last_a_down = a_down;
+    }
     else if (control == GCPad::B_BUTTON)
       pc = ActionDown(Action::Melee) || MobileDown(MobileAction::Melee) || (!s.gameplay.load() && (buttons & 2u));
     else if (control == GCPad::X_BUTTON)
@@ -1731,6 +1750,19 @@ void Initialize()
   s.original_fast_texture_sampling = Config::Get(Config::GFX_HACK_FAST_TEXTURE_SAMPLING);
   LoadSettings();
   SyncFromEnvironment();
+  const auto native_policy = MOHFrontline::NativeVFS::GetPolicy();
+  const bool original_gc_fonts =
+      !PS3RemasterAssets::IsReady() ||
+      native_policy == MOHFrontline::NativeVFS::Policy::GCOnly ||
+      native_policy == MOHFrontline::NativeVFS::Policy::GCFirst;
+  if (original_gc_fonts)
+  {
+    // Do not route an original .gfn into the SFN/PS3 bridge. The statically
+    // recompiled CFont path consumes FNTG directly and the native GC texture
+    // bridge handles its GX atlas upload.
+    s_ps3_font_replace_enabled.store(false, std::memory_order_relaxed);
+    std::fprintf(stderr, "[NATIVE-PC] FONT      original GC FNTG/GFN path selected; PS3 SFN bridge OFF\n");
+  }
   auto* config = Pad::GetConfig();
   if (config && config->GetController(0))
   {

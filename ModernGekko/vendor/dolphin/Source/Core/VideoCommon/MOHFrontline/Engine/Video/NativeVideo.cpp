@@ -1,6 +1,7 @@
 #include "VideoCommon/MOHFrontline/Engine/Video/NativeVideo.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "VideoCommon/AbstractTexture.h"
 #include "VideoCommon/MohPcLayer.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeVFS.h"
+#include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
 #include "VideoCommon/PS3AssetPort.h"
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/TextureConfig.h"
@@ -227,6 +230,42 @@ struct EncodedMovie
   bool ps3 = false;
 };
 
+u32 MPCLE32(const u8* p)
+{
+  return u32(p[0]) | (u32(p[1]) << 8) | (u32(p[2]) << 16) | (u32(p[3]) << 24);
+}
+
+bool ExtractGCMPCVideo(std::span<const u8> bytes, std::vector<u8>* out,
+                       std::size_t* chunks)
+{
+  if (!out || bytes.size() < 8)
+    return false;
+  out->clear();
+  std::size_t count = 0;
+  std::size_t p = 0;
+  while (p + 8 <= bytes.size())
+  {
+    const u8* chunk = bytes.data() + p;
+    const u32 size = MPCLE32(chunk + 4);
+    if (size < 8 || size > bytes.size() - p)
+      return false;
+
+    if (std::memcmp(chunk, "MPCh", 4) == 0)
+    {
+      // MPCh is an EA container chunk. The payload is MPEG-2 elementary
+      // stream data. Passing the whole MPC to libavformat made it stop after
+      // three frames; concatenating these payloads reproduces Dolphin's full
+      // 90/121/2398-frame startup movies from the supplied dumps/assets.
+      out->insert(out->end(), chunk + 8, chunk + size);
+      ++count;
+    }
+    p += size;
+  }
+  if (chunks)
+    *chunks = count;
+  return count != 0 && !out->empty();
+}
+
 std::optional<EncodedMovie> ReadGC(std::string_view guest_name)
 {
   const NativeVFS::File file =
@@ -237,7 +276,26 @@ std::optional<EncodedMovie> ReadGC(std::string_view guest_name)
   auto bytes = NativeVFS::Read(file);
   if (bytes.empty())
     return std::nullopt;
-  return EncodedMovie{std::move(bytes), NativeVFS::Describe(file), false};
+
+  std::string description = NativeVFS::Describe(file);
+  if (Filename(guest_name).ends_with(".mpc"))
+  {
+    std::vector<u8> elementary;
+    std::size_t chunks = 0;
+    if (!ExtractGCMPCVideo(bytes, &elementary, &chunks))
+    {
+      NativePCStatus::Fallback(NativePCStatus::Domain::Video, guest_name,
+                               "GC MPC MPCh demux rejected -> guest movie path");
+      return std::nullopt;
+    }
+    char detail[160]{};
+    std::snprintf(detail, sizeof(detail), "GC MPC host demux MPCh=%zu elementary=%zu bytes",
+                  chunks, elementary.size());
+    NativePCStatus::Native(NativePCStatus::Domain::Video, guest_name, detail);
+    description += ":MPCh-native";
+    bytes = std::move(elementary);
+  }
+  return EncodedMovie{std::move(bytes), std::move(description), false};
 }
 
 std::optional<EncodedMovie> ReadPS3(std::string_view guest_name)
@@ -349,6 +407,11 @@ struct Decoder
 };
 
 std::unique_ptr<Decoder> s_decoder;
+std::atomic<bool> s_host_movie_active{false};
+std::atomic<bool> s_skip_requested{false};
+// Protected by s_request_mutex. Prevents the same guest movie from being
+// re-queued by trailing DVD reads after the user skipped it.
+std::string s_skipped_guest;
 
 int ReadPacket(void* opaque, u8* buffer, int buffer_size)
 {
@@ -391,6 +454,7 @@ std::int64_t SeekPacket(void* opaque, std::int64_t offset, int whence)
 void CloseDecoder()
 {
   s_decoder.reset();
+  s_host_movie_active.store(false, std::memory_order_release);
 }
 
 double ResolveDisplayAspect(Decoder& decoder)
@@ -591,12 +655,16 @@ bool OpenEncoded(std::string_view guest_name, EncodedMovie movie)
   // Probing/codec startup can be noticeable for large MPCX/Bink files.  Do not
   // count that time as playback time or the first Present will skip frames.
   s_decoder->started = Clock::now();
+  s_host_movie_active.store(true, std::memory_order_release);
 
   std::fprintf(stderr,
                "[moh-native-video] START guest=%s source=%s codec=%s %ux%u fps=%.3f dar=%.4f bytes=%zu\n",
                s_decoder->guest_name.c_str(), s_decoder->source_description.c_str(), codec->name,
                s_decoder->width, s_decoder->height, s_decoder->fps, s_decoder->display_aspect,
                s_decoder->encoded.size());
+  NativePCStatus::Native(NativePCStatus::Domain::Video, s_decoder->guest_name,
+                         s_decoder->source_ps3 ? "FFmpeg host presentation source=PS3" :
+                                                "FFmpeg host presentation source=GC");
   return true;
 }
 
@@ -638,6 +706,8 @@ bool TryOpen(std::string_view guest_name)
                    "[moh-native-video] native decode unavailable guest=%.*s -> guest VP6/GC fallback\n",
                    static_cast<int>(guest_name.size()), guest_name.data());
     }
+    NativePCStatus::Fallback(NativePCStatus::Domain::Video, guest_name,
+                             "guest VP6/XFB presentation");
   }
   return opened;
 }
@@ -654,6 +724,15 @@ void NotifyGuestRead(std::string_view guest_name, std::uint64_t file_offset)
   std::scoped_lock lock(s_request_mutex);
 
   const std::string normalized = Lower(std::string(guest_name));
+  // A skipped movie may continue generating small trailing reads while the
+  // guest transitions to the shell. Ignore only that exact movie; a new
+  // movie name automatically releases the suppression.
+  if (!s_skipped_guest.empty())
+  {
+    if (normalized == s_skipped_guest)
+      return;
+    s_skipped_guest.clear();
+  }
   if (!s_last_detected_guest.empty() && Lower(s_last_detected_guest) == normalized)
     return;
 
@@ -698,6 +777,26 @@ void PrepareFrame()
   }
   return;
 #else
+  // Input/UI threads only set an atomic request. Decoder/GPU ownership stays
+  // here on the presenter thread.
+  if (s_skip_requested.exchange(false, std::memory_order_acq_rel))
+  {
+    std::string skipped;
+    if (s_decoder)
+      skipped = s_decoder->guest_name;
+    {
+      std::scoped_lock lock(s_request_mutex);
+      if (!skipped.empty())
+        s_skipped_guest = Lower(skipped);
+      s_pending_guests.clear();
+    }
+    if (!skipped.empty())
+      std::fprintf(stderr, "[moh-native-video] SKIP guest=%s -> host decoder closed\n",
+                   skipped.c_str());
+    CloseDecoder();
+    return;
+  }
+
   // The guest VP6 flag is a detection signal only. On the static recomp it can
   // toggle OFF immediately after the source file is opened. Once queued, the
   // host decoder owns the movie lifetime until EOF.
@@ -793,13 +892,26 @@ PresentFrame GetPresentFrame()
   return {};
 }
 
+bool IsPlaying()
+{
+  return s_host_movie_active.load(std::memory_order_acquire);
+}
+
+void RequestSkip()
+{
+  if (IsPlaying())
+    s_skip_requested.store(true, std::memory_order_release);
+}
+
 void Stop()
 {
+  s_skip_requested.store(false, std::memory_order_release);
 #if defined(MOH_NATIVE_VIDEO_FFMPEG)
   CloseDecoder();
 #endif
   std::scoped_lock lock(s_request_mutex);
   s_pending_guests.clear();
   s_last_detected_guest.clear();
+  s_skipped_guest.clear();
 }
 }  // namespace MOHFrontline::NativeVideo

@@ -137,6 +137,13 @@ add_library(videocommon
   PS3AssetPort.cpp
   MOHFrontline/Engine/Filesystem/NativeVFS.cpp
   MOHFrontline/Engine/Filesystem/NativeVFS.h
+  MOHFrontline/Engine/Filesystem/NativeGCAssets.cpp
+  MOHFrontline/Engine/Filesystem/NativeGCAssets.h
+  MOHFrontline/Assets/GC/Formats/GCTexture.cpp
+  MOHFrontline/Assets/GC/Formats/GCTexture.h
+  MOHFrontline/Assets/GC/Formats/GCFont.cpp
+  MOHFrontline/Assets/GC/Formats/GCFont.h
+  MOHFrontline/Engine/NativePCStatus.h
   MOHFrontline/Engine/Audio/NativeAudio.cpp
   MOHFrontline/Engine/Audio/NativeAudio.h
   MOHFrontline/Engine/Video/NativeVideo.cpp

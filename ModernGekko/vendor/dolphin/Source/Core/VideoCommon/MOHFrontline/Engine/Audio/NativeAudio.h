@@ -16,6 +16,7 @@ enum class Format
   Unknown,
   WavePCM,
   EAStream,
+  EAMovie,
   AEMSBank,
   AEMSStream,
 };
@@ -49,7 +50,8 @@ const char* FormatName(Format format);
 
 // Real host-side decoding:
 // - uncompressed RIFF/WAVE: built-in;
-// - EA SCHl/SCDl ADPCM R1: FFmpeg when Dolphin found FFmpeg at configure time;
+// - EA SCHl/SCDl ADPCM R1: native host decoder first, FFmpeg fallback;
+// - Frontline GC MPC: native EA chunk demux, SCDl audio to the same R1 decoder;
 // - AEMS/ABK banks: fallback until their event/module lookup is natively mapped.
 bool Decode(const Asset& asset, PCMBuffer* out);
 

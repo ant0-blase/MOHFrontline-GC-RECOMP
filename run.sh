@@ -292,6 +292,44 @@ else
   export MOH_PS3_ASSETS=0
 fi
 
+# ---------------------------------------------------------------------------
+# Native-PC asset takeover.
+#
+# The statically recompiled game code remains the semantic parser for original
+# GameCube formats (MSH/CPT/SKL/DMF/GSH/GFN/SCR/CBS/SIN/etc.), but all file I/O
+# is served from the host tree and eligible GX output is rasterized by the
+# host renderer instead of the original ModernGekko GX draw.  Audio/video use
+# their host decoders.  ModernGekko remains the compatibility shell/fallback
+# and every remaining fallback is reported explicitly in the runtime log.
+# ---------------------------------------------------------------------------
+if [[ "${MOH_NATIVE_PC_ASSETS:-1}" != "0" ]]; then
+  export MOH_GC_FILES="${MOH_GC_FILES:-$GAME/files}"
+  export MOH_NATIVE_VFS_DISC="${MOH_NATIVE_VFS_DISC:-1}"
+  export MOH_NATIVE_AUDIO="${MOH_NATIVE_AUDIO:-1}"
+  export MOH_NATIVE_AUDIO_AUTOPLAY="${MOH_NATIVE_AUDIO_AUTOPLAY:-1}"
+  export MOH_NATIVE_VIDEO="${MOH_NATIVE_VIDEO:-1}"
+  export MOH_NATIVE_RENDER="${MOH_NATIVE_RENDER:-prefer-native}"
+  export MOH_NATIVE_RENDER_OVERLAY="${MOH_NATIVE_RENDER_OVERLAY:-1}"
+  export MOH_NATIVE_RENDER_STYLE="${MOH_NATIVE_RENDER_STYLE:-textured}"
+  export MOH_NATIVE_RENDER_DEPTH="${MOH_NATIVE_RENDER_DEPTH:-1}"
+  export MOH_NATIVE_RENDER_LIGHTING="${MOH_NATIVE_RENDER_LIGHTING:-1}"
+  export MOH_NATIVE_RENDER_DEFORM_GUARD="${MOH_NATIVE_RENDER_DEFORM_GUARD:-1}"
+
+  if [[ "$PS3_ASSETS" == "1" ]]; then
+    export MOH_NATIVE_VFS="${MOH_NATIVE_VFS:-auto}"
+    export MOH_NATIVE_VIDEO_SOURCE="${MOH_NATIVE_VIDEO_SOURCE:-ps3-first}"
+    export MOH_NATIVE_GEOMETRY_SOURCE="${MOH_NATIVE_GEOMETRY_SOURCE:-ps3-first}"
+    export MOH_NATIVE_TEXTURE_SOURCE="${MOH_NATIVE_TEXTURE_SOURCE:-ps3-first}"
+  else
+    export MOH_NATIVE_VFS="${MOH_NATIVE_VFS:-gc-first}"
+    export MOH_NATIVE_VIDEO_SOURCE="${MOH_NATIVE_VIDEO_SOURCE:-gc-only}"
+    export MOH_NATIVE_GEOMETRY_SOURCE="${MOH_NATIVE_GEOMETRY_SOURCE:-gc-only}"
+    export MOH_NATIVE_TEXTURE_SOURCE="${MOH_NATIVE_TEXTURE_SOURCE:-gc-only}"
+  fi
+
+  echo "[NATIVE-PC] launch profile ON: static-recomp CPU + host VFS/VIV/audio/video/render; ModernGekko=fallback shell"
+fi
+
 # FOV: an explicit value is the final horizontal FOV on the selected aspect.
 case "${FOV,,}" in
   default|original)

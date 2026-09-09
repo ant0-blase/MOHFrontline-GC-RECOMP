@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <initializer_list>
@@ -25,6 +26,7 @@
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/FramebufferShaderGen.h"
+#include "VideoCommon/MOHFrontline/Engine/NativePCStatus.h"
 #include "VideoCommon/MOHFrontline/Engine/Renderer/NativeRenderBridge.h"
 #include "VideoCommon/NativeVertexFormat.h"
 #include "VideoCommon/PS3MeshPort.h"
@@ -70,6 +72,9 @@ struct State
   FramebufferState framebuffer_state{};
   DepthState depth_state{};
   bool depth_state_valid = false;
+  RasterizationState rasterization_state{};
+  BlendingState blending_state{};
+  bool gx_state_valid = false;
   const AbstractShader* color_pixel_shader = nullptr;
   std::vector<OverlayVertex> vertices;
   std::vector<u16> triangle_indices;
@@ -221,6 +226,9 @@ std::array<float, 3> ModelNormalToGCLocal(const NativeRender::DrawPacket& packet
                                           const NativeRender::Vertex& vertex)
 {
   std::array<float, 3> normal = Normalize3(vertex.normal);
+  if (packet.source_name.rfind("GC-", 0) == 0)
+    return normal;
+
   if (!packet.skinned)
     return normal;
 
@@ -427,6 +435,9 @@ std::array<float, 3> ModelToGCLocal(const NativeRender::DrawPacket& packet,
 {
   std::array<float, 3> position = vertex.position;
 
+  if (packet.source_name.rfind("GC-", 0) == 0)
+    return position;
+
   if (!packet.skinned)
   {
     const auto& current = PS3MeshPort::CurrentStaticDraw();
@@ -537,7 +548,7 @@ float HostDepthNDC(const VertexShaderManager& vertex_shader_manager, const float
   return z;
 }
 
-bool EnsurePipelines(State& state, bool use_depth)
+bool EnsurePipelines(State& state, bool use_depth, bool preserve_gx_state)
 {
   if (!g_gfx || !g_vertex_manager || !g_framebuffer_manager || !g_shader_cache)
     return false;
@@ -640,16 +651,28 @@ bool EnsurePipelines(State& state, bool use_depth)
   if (use_depth)
     depth_state.Generate(bpmem);
 
+  RasterizationState rasterization_state =
+      RenderState::GetNoCullRasterizationState(PrimitiveType::Triangles);
+  BlendingState blending_state = RenderState::GetNoBlendingBlendState();
+  if (preserve_gx_state)
+  {
+    rasterization_state.Generate(bpmem, PrimitiveType::Triangles);
+    blending_state.Generate(bpmem);
+  }
+
   const bool depth_changed = !state.depth_state_valid || state.depth_state.hex != depth_state.hex;
-  if (!state.solid_pipeline || !state.textured_pipeline || common_changed || depth_changed)
+  const bool gx_state_changed =
+      !state.gx_state_valid || state.rasterization_state.hex != rasterization_state.hex ||
+      state.blending_state.hex != blending_state.hex;
+  if (!state.solid_pipeline || !state.textured_pipeline || common_changed || depth_changed ||
+      gx_state_changed)
   {
     AbstractPipelineConfig config{};
     config.vertex_format = state.vertex_format.get();
     config.geometry_shader = nullptr;
-    config.rasterization_state =
-        RenderState::GetNoCullRasterizationState(PrimitiveType::Triangles);
+    config.rasterization_state = rasterization_state;
     config.depth_state = depth_state;
-    config.blending_state = RenderState::GetNoBlendingBlendState();
+    config.blending_state = blending_state;
     config.framebuffer_state = framebuffer_state;
     config.usage = AbstractPipelineUsage::Utility;
 
@@ -667,6 +690,9 @@ bool EnsurePipelines(State& state, bool use_depth)
 
     state.depth_state = depth_state;
     state.depth_state_valid = true;
+    state.rasterization_state = rasterization_state;
+    state.blending_state = blending_state;
+    state.gx_state_valid = true;
   }
 
   state.framebuffer_state = framebuffer_state;
@@ -695,7 +721,10 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
   static const bool use_depth = EnvSwitch(
       "MOH_NATIVE_RENDER_DEPTH", NativeRender::GetMode() == NativeRender::Mode::PreferNative);
   static const bool lighting = EnvSwitch("MOH_NATIVE_RENDER_LIGHTING", true);
-  const bool use_lighting = lighting && WantsSolid(style);
+  const bool source_gc = packet.source_name.rfind("GC-", 0) == 0;
+  const bool source_gc_2d = packet.source_name.rfind("GC-2D", 0) == 0;
+  const bool use_lighting = lighting && WantsSolid(style) && !source_gc_2d;
+  const bool use_texture = WantsTexture(style) && packet.has_texture;
   static const bool deform_guard = EnvSwitch(
       "MOH_NATIVE_RENDER_DEFORM_GUARD", NativeRender::GetMode() == NativeRender::Mode::PreferNative);
   const MaterialProfile material = GetMaterialProfile(packet);
@@ -703,7 +732,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
   if (!s_state)
     s_state = std::make_unique<State>();
   State& state = *s_state;
-  if (!EnsurePipelines(state, use_depth))
+  if (!EnsurePipelines(state, use_depth, source_gc))
     return false;
 
   state.vertices.resize(packet.vertices.size());
@@ -758,16 +787,25 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
       const std::array<float, 3> local_normal = ModelNormalToGCLocal(packet, source);
       const std::array<float, 3> view_position = GCLocalToView(local, matrix_index);
       const std::array<float, 3> view_normal = GCLocalNormalToView(local_normal, matrix_index);
-      state.vertices[i].color = ComputeHostLighting(material, view_position, view_normal);
+      auto color = ComputeHostLighting(material, view_position, view_normal);
+      if (packet.use_vertex_color)
+      {
+        for (int c = 0; c < 3; ++c)
+          color[c] = static_cast<u8>((static_cast<unsigned>(color[c]) * source.color[c]) / 255u);
+        color[3] = source.color[3];
+      }
+      state.vertices[i].color = color;
     }
     else
     {
-      state.vertices[i].color = {255, 255, 255, 255};
+      state.vertices[i].color = packet.use_vertex_color ? source.color :
+          std::array<u8, 4>{255, 255, 255, 255};
     }
     state.valid_vertices[i] = 1;
   }
 
-  if (deform_guard && NativeRender::GetMode() == NativeRender::Mode::PreferNative)
+  if (deform_guard && !source_gc &&
+      NativeRender::GetMode() == NativeRender::Mode::PreferNative)
   {
     const float valid_ratio = packet.vertices.empty() ? 0.0f :
         static_cast<float>(packet.vertices.size() - invalid_vertices) /
@@ -835,7 +873,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
     return false;
   }
 
-  if (deform_guard && NativeRender::GetMode() == NativeRender::Mode::PreferNative &&
+  if (deform_guard && !source_gc && NativeRender::GetMode() == NativeRender::Mode::PreferNative &&
       triangle_count != 0)
   {
     const float triangle_ratio =
@@ -867,7 +905,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
         state.triangle_indices.data(), static_cast<u32>(state.triangle_indices.size()), &base_vertex,
         &base_index);
 
-    if (WantsTexture(style))
+    if (use_texture)
     {
       // TextureCacheBase already bound the current GX stage-0 texture before
       // DrawCurrentBatch().  When PS3MaterialCatalog/TextureCache replaced that
@@ -923,7 +961,7 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
                  packet.skinned ? "DMF" : "MSH", packet.source_name.c_str(),
                  packet.material_name.empty() ? "<none>" : packet.material_name.c_str(),
                  accepted_triangles, StyleName(style), use_depth ? 1 : 0,
-                 WantsTexture(style) ? "stage0-current" : "none",
+                 use_texture ? "stage0-current" : "none",
                  use_lighting ? "asset-normal/GX-lights" : "off", material.ambient,
                  material.diffuse, material.specular, material.shininess,
                  static_cast<unsigned long long>(state.guard_fallbacks),
@@ -932,7 +970,143 @@ bool Submit(const NativeRender::DrawPacket& packet, void*)
 
   return true;
 }
+
+float ReadDecodedScalar(const u8* vertex, const AttributeFormat& attr, int component)
+{
+  if (!vertex || !attr.enable || component < 0 || component >= attr.components)
+    return 0.0f;
+
+  const u8* p = vertex + attr.offset + component * GetElementSize(attr.type);
+  switch (attr.type)
+  {
+  case ComponentFormat::UByte:
+    return static_cast<float>(*p);
+  case ComponentFormat::Byte:
+  {
+    s8 value = 0;
+    std::memcpy(&value, p, sizeof(value));
+    return static_cast<float>(value);
+  }
+  case ComponentFormat::UShort:
+  {
+    u16 value = 0;
+    std::memcpy(&value, p, sizeof(value));
+    return static_cast<float>(value);
+  }
+  case ComponentFormat::Short:
+  {
+    s16 value = 0;
+    std::memcpy(&value, p, sizeof(value));
+    return static_cast<float>(value);
+  }
+  case ComponentFormat::Float:
+  case ComponentFormat::InvalidFloat5:
+  case ComponentFormat::InvalidFloat6:
+  case ComponentFormat::InvalidFloat7:
+  {
+    float value = 0.0f;
+    std::memcpy(&value, p, sizeof(value));
+    return value;
+  }
+  default:
+    return 0.0f;
+  }
+}
+
+std::array<u8, 4> ReadDecodedColor(const u8* vertex, const AttributeFormat& attr)
+{
+  if (!vertex || !attr.enable)
+    return {255, 255, 255, 255};
+  if (attr.type == ComponentFormat::UByte && attr.components >= 4)
+  {
+    std::array<u8, 4> result{};
+    std::memcpy(result.data(), vertex + attr.offset, 4);
+    return result;
+  }
+  std::array<u8, 4> result{255, 255, 255, 255};
+  for (int c = 0; c < std::min(attr.components, 4); ++c)
+  {
+    const float value = ReadDecodedScalar(vertex, attr, c);
+    result[c] = static_cast<u8>(std::clamp(value, 0.0f, 255.0f));
+  }
+  return result;
+}
+
+bool ConvertDecodedGXTriangles(PrimitiveType primitive, const u16* indices, u32 num_indices,
+                               u32 num_vertices, std::vector<u32>* out)
+{
+  if (!indices || !out || num_indices < 3)
+    return false;
+  out->clear();
+
+  const auto valid = [num_vertices](u16 index) {
+    return index != 0xffffu && static_cast<u32>(index) < num_vertices;
+  };
+
+  if (primitive == PrimitiveType::Triangles)
+  {
+    out->reserve(num_indices);
+    for (u32 i = 0; i + 2 < num_indices; i += 3)
+    {
+      const u16 a = indices[i + 0];
+      const u16 b = indices[i + 1];
+      const u16 c = indices[i + 2];
+      if (!valid(a) || !valid(b) || !valid(c) || a == b || b == c || a == c)
+        continue;
+      out->push_back(a);
+      out->push_back(b);
+      out->push_back(c);
+    }
+    return !out->empty();
+  }
+
+  if (primitive != PrimitiveType::TriangleStrip)
+    return false;
+
+  u16 a = 0xffffu;
+  u16 b = 0xffffu;
+  unsigned have = 0;
+  bool flip = false;
+  for (u32 i = 0; i < num_indices; ++i)
+  {
+    const u16 c = indices[i];
+    if (c == 0xffffu)
+    {
+      a = b = 0xffffu;
+      have = 0;
+      flip = false;
+      continue;
+    }
+    if (have == 0) { a = c; have = 1; continue; }
+    if (have == 1) { b = c; have = 2; continue; }
+
+    if (valid(a) && valid(b) && valid(c) && a != b && b != c && a != c)
+    {
+      if (flip)
+      {
+        out->push_back(b);
+        out->push_back(a);
+      }
+      else
+      {
+        out->push_back(a);
+        out->push_back(b);
+      }
+      out->push_back(c);
+    }
+    a = b;
+    b = c;
+    flip = !flip;
+  }
+  return !out->empty();
+}
 }  // namespace
+
+bool GameCubeBatchTakeoverEnabled()
+{
+  static const bool enabled = EnvSwitch("MOH_NATIVE_GC_RENDER", false);
+  return enabled;
+}
 
 void Initialize()
 {
@@ -943,5 +1117,95 @@ void Shutdown()
 {
   NativeRender::SetSubmitter(nullptr, nullptr);
   s_state.reset();
+}
+
+bool SubmitGameCubeDecodedBatch(const u8* vertex_data, u32 num_vertices,
+                                const u16* indices, u32 num_indices,
+                                const PortableVertexDeclaration& declaration,
+                                PrimitiveType primitive)
+{
+  if (NativeRender::GetMode() != NativeRender::Mode::PreferNative ||
+      !NativeRender::KeepOriginalGCGeometry() || !vertex_data || !indices ||
+      num_vertices == 0 || num_vertices > 65535 || declaration.stride <= 0 ||
+      !declaration.position.enable)
+  {
+    return false;
+  }
+
+  NativeRender::DrawPacket packet;
+  packet.skinned = declaration.posmtx.enable;
+  packet.has_texture = declaration.texcoords[0].enable;
+  packet.use_vertex_color = declaration.colors[0].enable;
+  packet.source_name =
+      xfmem.projection.type == ProjectionType::Orthographic ?
+      "GC-2D/GX-decoded" : "GC-3D/GX-decoded";
+  packet.material_name = declaration.texcoords[0].enable ? "GC-stage0" : "GC-untextured";
+  packet.vertices.resize(num_vertices);
+
+  if (packet.skinned)
+  {
+    // NativeRender's skinned bridge expects matrix_index/3 to address a
+    // model->GC-local matrix. Original GX vertices are already GC-local, so
+    // identity transforms let us reuse the exact live per-vertex XF matrix.
+    packet.model_to_gc_local.resize(22);
+    for (auto& matrix : packet.model_to_gc_local)
+      matrix = {1.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, 0.0f};
+  }
+
+  for (u32 i = 0; i < num_vertices; ++i)
+  {
+    const u8* source = vertex_data + static_cast<std::size_t>(i) * declaration.stride;
+    auto& vertex = packet.vertices[i];
+    vertex.position[0] = ReadDecodedScalar(source, declaration.position, 0);
+    vertex.position[1] = ReadDecodedScalar(source, declaration.position, 1);
+    vertex.position[2] =
+        declaration.position.components >= 3 ?
+        ReadDecodedScalar(source, declaration.position, 2) : 0.0f;
+
+    if (declaration.normals[0].enable && declaration.normals[0].components >= 3)
+    {
+      vertex.normal[0] = ReadDecodedScalar(source, declaration.normals[0], 0);
+      vertex.normal[1] = ReadDecodedScalar(source, declaration.normals[0], 1);
+      vertex.normal[2] = ReadDecodedScalar(source, declaration.normals[0], 2);
+    }
+    else
+    {
+      vertex.normal = {0.0f, 0.0f, 1.0f};
+    }
+
+    if (declaration.texcoords[0].enable && declaration.texcoords[0].components >= 2)
+    {
+      vertex.uv0[0] = ReadDecodedScalar(source, declaration.texcoords[0], 0);
+      vertex.uv0[1] = ReadDecodedScalar(source, declaration.texcoords[0], 1);
+    }
+
+    if (declaration.colors[0].enable)
+      vertex.color = ReadDecodedColor(source, declaration.colors[0]);
+
+    if (declaration.posmtx.enable)
+    {
+      const float matrix = ReadDecodedScalar(source, declaration.posmtx, 0);
+      vertex.matrix_index = std::isfinite(matrix) ?
+          static_cast<u8>(std::clamp(static_cast<int>(std::lround(matrix)), 0, 63)) : 0;
+    }
+  }
+
+  if (!ConvertDecodedGXTriangles(primitive, indices, num_indices, num_vertices, &packet.indices))
+  {
+    NativePCStatus::Fallback(NativePCStatus::Domain::Render, packet.source_name,
+                             "line/point/unsupported primitive -> GX");
+    return false;
+  }
+
+  const bool accepted = Submit(packet, nullptr);
+  if (accepted)
+    NativePCStatus::Native(NativePCStatus::Domain::Render, packet.source_name,
+                           "MSH/CPT/SKL/DMF/etc decoded by static-recomp -> host GPU draw");
+  else
+    NativePCStatus::Fallback(NativePCStatus::Domain::Render, packet.source_name,
+                             "host renderer rejected -> GX draw");
+  return accepted;
 }
 }  // namespace MOHFrontline::NativeHostRenderer
