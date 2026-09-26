@@ -11,11 +11,92 @@ Linux · PowerPC → native C recompilation · Vulkan · Wayland · Multi-image 
 </div>
 
 <p align="center">
-  <img src="assets/mission_widescreen_fov_100.png" alt="Medal of Honor Frontline running in widescreen with custom FOV" width="90%">
+  <a href="#visual-comparison">GC vs enhanced recompilation</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#live-pc-settings">Live PC settings</a> ·
+  <a href="#runtime-enhancement-options">Launcher options</a>
+</p>
+
+<p align="center">
+  <a href="assets/enhanced/windmill.png"><img src="assets/enhanced/windmill.png" alt="Enhanced GameCube recompilation with PS3 assets, 16:10 widescreen and 105° FOV" width="100%"></a>
+  <br>
+  <em>GameCube recompilation · PS3 textures & fonts · 1920×1200 / 16:10 · 105° FOV</em>
 </p>
 
 > [!IMPORTANT]
-> This repository does **not** contain the original game ISO or extracted copyrighted game data. You must provide your own legally obtained USA GameCube copy of **Medal of Honor: Frontline** with disc ID **`GMFE69`**.
+> This repository does **not** contain the original game ISO, extracted game data, or **PS3 textures, fonts or other PS3 assets**. You must provide your own legally obtained USA GameCube copy of **Medal of Honor: Frontline** (**`GMFE69`**) and your own legally obtained PS3 assets to use the optional remaster layer.
+
+## Visual comparison
+
+**Original GC presentation → enhanced native recompilation with PS3 assets.** Both columns show the GameCube project: “PS3 assets” means the optional textures and fonts used by the recompilation, not the game running on a PS3.
+
+<table>
+  <tr>
+    <th width="50%">GC — original presentation</th>
+    <th width="50%">Recompilation — PS3 assets + PC enhancements</th>
+  </tr>
+  <tr>
+    <td><a href="assets/main-menu.png"><img src="assets/main-menu.png" alt="Original GameCube menu without widescreen enhancements" width="100%"></a></td>
+    <td><a href="assets/enhanced/main-menu.png"><img src="assets/enhanced/main-menu.png" alt="Enhanced menu with PS3 textures and fonts" width="100%"></a></td>
+  </tr>
+  <tr>
+    <td><a href="assets/mission_gameplay.png"><img src="assets/mission_gameplay.png" alt="GameCube countryside with original assets and field of view" width="100%"></a></td>
+    <td><a href="assets/enhanced/countryside.png"><img src="assets/enhanced/countryside.png" alt="Enhanced countryside with PS3 assets, 16:10 widescreen and 105 degree field of view" width="100%"></a></td>
+  </tr>
+  <tr>
+    <td>Original GC textures and fonts, original aspect ratio and FOV; no widescreen patch.</td>
+    <td>PS3 textures and fonts, 16:10 widescreen at 1920×1200, 105° FOV and enhanced graphics.</td>
+  </tr>
+</table>
+
+The older GC captures and new enhanced captures use different viewpoints and capture sizes. They illustrate the overall presentation; they are not a frame-matched comparison of individual effects. Click any image to open it at full size.
+
+### Enhanced capture settings
+
+| Setting | Enhanced presentation |
+|---|---|
+| Output / aspect ratio | **1920×1200 · 16:10 widescreen** |
+| Horizontal field of view | **105°** |
+| Remaster assets | **PS3 textures + PS3 fonts** |
+| Internal resolution / filtering | **5× internal resolution + 16× anisotropic filtering** |
+| Bloom | Enabled |
+| Enhanced screen-space lighting | Enabled |
+| Ambient Occlusion | Enabled |
+| Contact Shadows | Enabled |
+| Sharpening | Enabled |
+
+### Enhanced gameplay gallery
+
+<table>
+  <tr>
+    <td><a href="assets/enhanced/stonework.png"><img src="assets/enhanced/stonework.png" alt="Enhanced stonework textures" width="100%"></a></td>
+    <td><a href="assets/enhanced/country-road.png"><img src="assets/enhanced/country-road.png" alt="Widescreen country road" width="100%"></a></td>
+  </tr>
+  <tr>
+    <td><a href="assets/enhanced/landscape.png"><img src="assets/enhanced/landscape.png" alt="Enhanced countryside lighting and landscape" width="100%"></a></td>
+    <td><a href="assets/enhanced/windmill.png"><img src="assets/enhanced/windmill.png" alt="Windmill landscape at 105 degree FOV" width="100%"></a></td>
+  </tr>
+</table>
+
+### Live PC settings
+
+Press **Ctrl+F10** or <kbd>`</kbd> to open the in-game PC settings menu. Changes apply live, so you can adjust the presentation while playing.
+
+<details>
+<summary><strong>View the graphics settings used in the enhanced captures</strong></summary>
+
+<table>
+  <tr>
+    <td><a href="assets/enhanced/pc-graphics.png"><img src="assets/enhanced/pc-graphics.png" alt="Live PC graphics settings" width="100%"></a></td>
+    <td><a href="assets/enhanced/pc-enhanced-graphics.png"><img src="assets/enhanced/pc-enhanced-graphics.png" alt="Bloom, screen-space lighting, ambient occlusion, contact shadows and sharpening settings" width="100%"></a></td>
+  </tr>
+  <tr>
+    <td><a href="assets/enhanced/pc-settings.png"><img src="assets/enhanced/pc-settings.png" alt="Additional live PC settings" width="100%"></a></td>
+    <td><a href="assets/enhanced/pc-resolution.png"><img src="assets/enhanced/pc-resolution.png" alt="PC resolution selection" width="100%"></a></td>
+  </tr>
+</table>
+
+</details>
 
 ## Overview
 
@@ -50,23 +131,6 @@ The boot and stub images overlap in guest address space but contain different co
 
 The project is usable for development and gameplay testing, but it is still an **experimental recompilation**, not a finished compatibility release.
 
-## Screenshots
-
-<table>
-  <tr>
-    <td><img src="assets/ea.png" alt="EA intro"></td>
-    <td><img src="assets/main-menu.png" alt="Main menu"></td>
-  </tr>
-  <tr>
-    <td><img src="assets/select-mission.png" alt="Mission selection"></td>
-    <td><img src="assets/loading_1_1.png" alt="Mission loading"></td>
-  </tr>
-  <tr>
-    <td><img src="assets/mission_1_1_gameplay.png" alt="Gameplay"></td>
-    <td><img src="assets/mission_widescreen_fov_100.png" alt="Widescreen gameplay"></td>
-  </tr>
-</table>
-
 ## Highlights
 
 - **One native module for every executable image** used by GMFE69.
@@ -83,16 +147,16 @@ Detailed optimization notes live in [`docs/GMFE69_OPTIMIZATIONS.md`](docs/GMFE69
 
 ---
 
-# Quick start
+## Quick start
 
-## 1. Clone
+### 1. Clone
 
 ```bash
 git clone <your-repository-url>
 cd MOHFrontline-GC-RECOMP
 ```
 
-## 2. Install build dependencies
+### 2. Install build dependencies
 
 The project currently targets **64-bit Linux**. You need at least:
 
@@ -115,7 +179,7 @@ sudo pacman -S --needed \
 
 ModernGekko/Dolphin may request additional development packages depending on your distribution and enabled host features. X11 is disabled by default in this project.
 
-## 3. Add your own game
+### 3. Add your own game
 
 Put your legally obtained **USA GMFE69** ISO in:
 
@@ -147,7 +211,7 @@ extracted/
 
 The build validates the six-character disc ID and refuses unsupported releases.
 
-## 4. Build
+### 4. Build
 
 ```bash
 chmod +x build.sh run.sh tools/*.sh tools/*.py
@@ -180,7 +244,7 @@ module/symbols/
 
 These directories are intentionally ignored by Git.
 
-## 5. Run
+### 5. Run
 
 Original game behavior:
 
@@ -194,16 +258,26 @@ Widescreen:
 ./run.sh --aspect 16:9
 ```
 
-16:10:
+Enhanced 16:10 presentation with PS3 assets and 105° FOV:
 
 ```bash
-./run.sh --aspect 16:10
+./run.sh --aspect 1920x1200 --fov 105 --ps3-assets --enhanced-graphics
+```
+
+`--aspect 1920x1200` sets the **16:10 aspect ratio**, not the output resolution. In the live PC menu (**Ctrl+F10** or <kbd>`</kbd>), select **1920×1200**, **5× internal resolution** and **16× AF**, then configure the effects listed in [Enhanced capture settings](#enhanced-capture-settings).
+
+The optional PS3 layer reads your locally supplied assets from `HD/PS3_FILES`, or a directory passed with `--ps3-files /path/to/PS3_FILES`. These assets are **not distributed in this repository**.
+
+GC baseline with original aspect/FOV and no PS3 asset layer or enhanced post-processing:
+
+```bash
+./run.sh --aspect default --fov default --no-ps3-assets --original-graphics
 ```
 
 Ultrawide + custom FOV:
 
 ```bash
-./run.sh --aspect 21:9 --fov 100
+./run.sh --aspect 21:9 --fov 105
 ```
 
 Custom frame target:
@@ -211,13 +285,12 @@ Custom frame target:
 ```bash
 ./run.sh --fps 60
 ./run.sh --fps 120
-./run.sh --fps 144
 ```
 
 Everything together:
 
 ```bash
-./run.sh --aspect 3440x1440 --fov 100 --fps 144
+./run.sh --aspect 3440x1440 --fov 105 --fps 120
 ```
 
 Show launcher options:
@@ -243,8 +316,11 @@ With no MOH-specific options, `run.sh` preserves the original FOV, aspect-ratio 
 | `--aspect 32:9` | Super-ultrawide |
 | `--aspect WIDTHxHEIGHT` | Arbitrary aspect ratio |
 | `--fov N` | Final horizontal FOV, `20 <= N < 179` |
-| `--fps N` | Target frame rate from 1 to 1000 |
-| `--fps unlimited` | Remove the explicit target limiter |
+| `--fps N` | Target frame rate from 1 to 120 |
+| `--fps 0` | Remove the explicit target limiter |
+| `--ps3-assets` / `--no-ps3-assets` | Enable / disable locally supplied PS3 assets |
+| `--ps3-files PATH` | Set the local PS3 asset directory |
+| `--enhanced-graphics` / `--original-graphics` | Enable / disable enhanced post-processing |
 
 For exact `auto` aspect detection under a pure Wayland session you can provide the output size yourself:
 
@@ -425,7 +501,7 @@ The permanent post-generator means the GMFE69-specific generated-code optimizati
 
 This project is an independent reverse-engineering/static-recompilation effort and is not affiliated with or endorsed by Electronic Arts, Nintendo, the original developers, or other rightsholders.
 
-No original game ISO, DOL, ELF or extracted copyrighted game data is distributed in this repository. Users must provide their own legally obtained copy.
+No original game ISO, DOL, ELF, extracted copyrighted game data, **PS3 textures, PS3 fonts or other PS3 assets** are distributed in this repository. Users must provide their own legally obtained game copies and assets. The screenshots demonstrate the optional PS3 asset layer; the assets themselves are not included.
 
 ## License
 
