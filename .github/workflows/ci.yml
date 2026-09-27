@@ -282,8 +282,14 @@ jobs:
           & build/portable-smoke/toolchain/cmake/bin/cmake.exe `
             --build build/portable-smoke-build --parallel 2
           if ($LASTEXITCODE -ne 0) { throw "portable DLL smoke link failed" }
-          $dll = Get-ChildItem build/portable-smoke-build -Filter moh_portable_link_smoke.dll -Recurse | Select-Object -First 1
-          if (!$dll) { throw "portable DLL smoke test did not produce a DLL" }
+          $dll = Get-ChildItem build/portable-smoke-build -Filter "*moh_portable_link_smoke.dll" -Recurse |
+            Select-Object -First 1
+          if (!$dll) {
+            Write-Host "Portable smoke build outputs:"
+            Get-ChildItem build/portable-smoke-build -File -Recurse |
+              Select-Object -ExpandProperty FullName
+            throw "portable DLL smoke test did not produce a DLL"
+          }
           Write-Host "portable DLL link OK: $($dll.FullName)"
   launcher-windows:
     name: Launcher · Windows x86_64
