@@ -6,6 +6,29 @@ This project is experimental. Release notes describe the state of the recompilat
 
 ## [Unreleased]
 
+## [v0.0.2] - 2026-09-27
+
+Windows input and PS3 remaster asset hotfix release.
+
+### Windows input
+
+- Fixed the standalone Win32 mouse event path so the PC settings/ImGui overlay receives cursor position, mouse buttons and wheel input correctly.
+- Kept Raw Input available for gameplay camera/look while separating it from absolute UI pointer input.
+- Expanded Win32 keyboard translation for navigation, modifiers and function keys used by the standalone runtime.
+- Fixes the Windows behavior where the settings UI could be opened but could not be clicked and where keyboard/mouse input was only partially functional.
+
+### PS3 remaster assets
+
+- Preserved per-level path scope for package-backed PS3 assets instead of flattening lookups that lost the current level context.
+- Added GameCube `level.viv` access through NativeVFS/encounter-nod for MSH and DMF signature pairing.
+- Direct ISO/GCM/RVZ/etc. launches can now provide the original GC level data needed to resolve corresponding PS3 mesh/material assets without requiring a fully extracted GameCube filesystem.
+- Improves lookup of PS3 textures, MSH, DMF and related level-scoped remaster data when using either `PS3_FILES` or a finalized PS3 `.pkg`.
+
+### Release
+
+- Rebuilds the portable Windows and Linux packages from the corrected runtime.
+- No retail GameCube data or PS3 remaster assets are included.
+
 ## [v0.0.1] - 2026-09-27
 
 First public pre-alpha release of the native PC recompilation of the USA GameCube release of **Medal of Honor: Frontline** (`GMFE69`).
