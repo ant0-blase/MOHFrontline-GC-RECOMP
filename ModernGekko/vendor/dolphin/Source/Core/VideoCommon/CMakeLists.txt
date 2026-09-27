@@ -129,6 +129,8 @@ add_library(videocommon
   MohPcLayer.h
   PS3RemasterAssets.cpp
   PS3RemasterAssets.h
+  PS3PkgReader.cpp
+  PS3PkgReader.h
   MOHFrontline/Engine/Filesystem/NativeAssetResolver.cpp
   MOHFrontline/Assets/PS3/Formats/TPK.cpp
   MOHFrontline/Engine/Renderer/Materials/PS3MaterialCatalog.cpp
@@ -281,6 +283,7 @@ PUBLIC
   glslang::glslang
 PRIVATE
   fmt::fmt
+  MbedTLS::mbedtls
   spng::spng
   xxhash::xxhash
   imgui
