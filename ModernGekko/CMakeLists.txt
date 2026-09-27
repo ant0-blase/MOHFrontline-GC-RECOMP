@@ -129,13 +129,20 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     set(LINUX_LOCAL_DEV ON CACHE BOOL "" FORCE)
     set(DISTRIBUTOR "ModernGekko" CACHE STRING "" FORCE)
     add_subdirectory(vendor/dolphin EXCLUDE_FROM_ALL)
+    set(_moderngekko_cpu_exception_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/src/core/cpu_exception.c")
     target_sources(core PRIVATE
-        vendor/dolphin/GXRuntime/src/core/cpu_exception.c)
-    # Dolphin's core target uses a C++ PCH. GXRuntime's exception shim is C,
-    # so MSVC must compile it without inheriting that C++ precompiled header.
+        "${_moderngekko_cpu_exception_source}")
+    # Dolphin's core target owns a C++ PCH. Source-file properties are
+    # directory-scoped in CMake, so apply them in the directory where the
+    # 'core' target was created as well. /Y- is the MSVC hard stop that
+    # prevents this C translation unit from consuming dolphin.pch.
     set_source_files_properties(
-        vendor/dolphin/GXRuntime/src/core/cpu_exception.c
-        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+        "${_moderngekko_cpu_exception_source}"
+        TARGET_DIRECTORY core
+        PROPERTIES
+            SKIP_PRECOMPILE_HEADERS ON
+            COMPILE_OPTIONS "$<$<C_COMPILER_ID:MSVC>:/Y->")
     target_include_directories(core PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
     if(MODERNGEKKO_FRONTEND_SDK)
