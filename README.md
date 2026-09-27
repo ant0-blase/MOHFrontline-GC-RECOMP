@@ -152,34 +152,64 @@ Detailed optimization notes live in [`docs/GMFE69_OPTIMIZATIONS.md`](docs/GMFE69
 
 ## Recompilation launcher
 
-The repository now includes a **standalone MOHFrontline-Recompiled launcher** for Windows and Linux. It is separate from the generic ModernGekko frontend and exists only to manage this recompilation.
+The release ships a dedicated **MOHFrontline-Recompiled launcher** for Windows and Linux. It is separate from the generic ModernGekko/Dolphin frontend and only orchestrates this recompilation.
 
-It provides:
+### Portable release — no development toolchain required
 
-- GMFE69 ISO selection;
-- one-click preparation/build of the recompilation;
-- direct game launch;
-- PS3 `PS3_FILES` folder selection;
-- PS3 asset and enhanced-graphics toggles;
-- shortcuts to the user, logs and extracted-game folders.
+The normal end-user path is:
 
-Build it with:
+1. download the Windows or Linux release archive;
+2. extract it to a writable directory;
+3. start `MOHFrontline-Launcher.exe` on Windows or `MOHFrontline-Launcher` on Linux;
+4. select your legally obtained USA **GMFE69** disc image;
+5. press **Prepare / Build recompilation**;
+6. press **PLAY**.
 
-```bash
-./scripts/build-launcher.sh
+The release bundles the build environment required to generate the game-derived native module locally:
+
+- CMake;
+- Ninja;
+- Zig;
+- Python;
+- DolRecomp;
+- encounter/nod;
+- the prebuilt ModernGekko runtime;
+- the standalone launcher and disc-cache helper.
+
+No Visual Studio, LLVM/Clang, Python, CMake or Ninja installation is required for the release package.
+
+Supported disc-image containers through **encounter/nod**:
+
+```text
+ISO / GCM
+RVZ
+WIA
+WBFS
+CISO
+GCZ
+TGC
+NFS
 ```
 
-or on Windows:
+The original disc is **not fully extracted**. The launcher creates only a small local AOT cache containing the GameCube system metadata and executable containers required by DolRecomp. At runtime the original ISO/RVZ/etc. remains the mounted game source.
 
-```powershell
-.\scripts\build-launcher.ps1
+```text
+disc image
+   │
+   ├── encounter/nod ──► minimal DOL/ELF/FST AOT cache ──► DolRecomp ──► gGMFE69_recomp
+   │
+   └── direct disc mount ──────────────────────────────────────────────► runtime
 ```
 
-The binary is written to `launcher/bin/`.
+ModernGekko also contains a native nod-backed `DiscSource` / FST VFS for its native/legacy DI path. It can perform logical DI reads and file-by-path reads directly from compressed images without materializing the retail filesystem.
+
+The launcher also provides PS3 `PS3_FILES` selection, PS3/enhanced-graphics toggles, and shortcuts to the user, logs and AOT-cache folders.
 
 > The launcher does not contain or download the original game or PS3 assets. You provide your own legally obtained files.
 
-## Quick start
+## Developer build
+
+The following section is for contributors building the runtime itself from source. Release users do **not** need these dependencies.
 
 ### 1. Clone
 
@@ -190,7 +220,7 @@ cd MOHFrontline-GC-RECOMP
 
 ### 2. Install build dependencies
 
-The project currently targets **64-bit Linux**. You need at least:
+For a source/developer build on **64-bit Linux**, you need at least:
 
 - CMake 3.20+
 - Ninja
