@@ -41,6 +41,21 @@ jobs:
       - name: Validate Python tools
         run: python3 -m compileall -q tools
 
+      - name: Validate minimal portable payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          python3 tools/stage_portable_payload.py --source "$PWD" --destination "$tmp"
+          test -f "$tmp/scripts/build-portable.sh"
+          test -f "$tmp/scripts/build-portable.ps1"
+          test -f "$tmp/tools/build_all_exec_module.py"
+          test -f "$tmp/multi-module-template/CMakeLists.txt"
+          test -f "$tmp/ModernGekko/vendor/dolphin/GXRuntime/src/core/cpu.c"
+          test -f "$tmp/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompABI.h"
+          test ! -e "$tmp/ModernGekko/vendor/dolphin/Externals"
+          test ! -e "$tmp/ModernGekko/vendor/dolphin/Source/Core/VideoCommon"
+
   core-tests-linux:
     name: Core tests · Linux
     runs-on: ubuntu-24.04
