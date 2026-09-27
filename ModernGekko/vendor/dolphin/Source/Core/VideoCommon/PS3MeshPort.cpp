@@ -5,6 +5,7 @@
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeAssetResolver.h"
+#include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeVFS.h"
 #include "VideoCommon/MOHFrontline/Engine/World/WorldLevelRuntime.h"
 #include <atomic>
 #include "VideoCommon/PS3AssetPort.h"
@@ -2094,53 +2095,46 @@ u32 ReadBE24Local(const u8* p)
   return (u32(p[0]) << 16) | (u32(p[1]) << 8) | u32(p[2]);
 }
 
+bool ReadOriginalGCLevelArchive(std::string_view level, std::vector<u8>* archive,
+                                std::string* source)
+{
+  if (!archive || level.empty())
+    return false;
+
+  const std::string campaign(1, level.front());
+  const std::string guest_path =
+      "DATA/" + campaign + "/" + std::string(level) + "/level.viv";
+  const auto file = MOHFrontline::NativeVFS::ResolveGameCube(
+      guest_path, PS3AssetPort::Class::Container);
+  if (!file || file.size < 6 || file.size > 128u * 1024u * 1024u)
+    return false;
+
+  std::vector<u8> bytes = MOHFrontline::NativeVFS::Read(file);
+  if (bytes.size() < 6 || bytes.size() != file.size ||
+      bytes[0] != 0xC0 || bytes[1] != 0xFB)
+    return false;
+
+  *archive = std::move(bytes);
+  if (source)
+    *source = file.resolved_path;
+  return true;
+}
+
 void IndexOriginalGCLevelMSHSignatures(std::string_view level)
 {
   g_display_list_candidates.clear();
   if (level.empty())
     return;
 
-  const std::string campaign(1, level.front());
-  const std::array<std::filesystem::path, 3> candidates{
-      std::filesystem::current_path() / "extracted" / "files" / "DATA" / campaign /
-          std::string(level) / "level.viv",
-      std::filesystem::current_path() / "extracted" / "files" / "data" / campaign /
-          std::string(level) / "level.viv",
-      std::filesystem::current_path() / "extracted" / "DATA" / campaign /
-          std::string(level) / "level.viv"};
-
-  std::filesystem::path archive_path;
-  for (const auto& candidate : candidates)
-  {
-    if (std::filesystem::is_regular_file(candidate))
-    {
-      archive_path = candidate;
-      break;
-    }
-  }
-
-  if (archive_path.empty())
+  std::vector<u8> archive;
+  std::string archive_source;
+  if (!ReadOriginalGCLevelArchive(level, &archive, &archive_source))
   {
     std::fprintf(stderr,
-                 "[moh-ps3-msh] GC all-MSH index MISS: level=%.*s original level.viv not found under extracted/files/DATA\n",
+                 "[moh-ps3-msh] GC all-MSH index MISS: level=%.*s level.viv unavailable through NativeVFS/nod\n",
                  static_cast<int>(level.size()), level.data());
     return;
   }
-
-  std::ifstream file(archive_path, std::ios::binary | std::ios::ate);
-  if (!file)
-    return;
-  const std::streamoff end = file.tellg();
-  if (end < 6 || end > static_cast<std::streamoff>(128 * 1024 * 1024))
-    return;
-
-  std::vector<u8> archive(static_cast<std::size_t>(end));
-  file.seekg(0, std::ios::beg);
-  if (!file.read(reinterpret_cast<char*>(archive.data()),
-                 static_cast<std::streamsize>(archive.size())))
-    return;
-  if (archive[0] != 0xC0 || archive[1] != 0xFB)
-    return;
 
   const u32 header_size = ((u32(archive[2]) << 8) | u32(archive[3])) + 4u;
   const u32 entry_count = (u32(archive[4]) << 8) | u32(archive[5]);
@@ -2263,7 +2257,7 @@ void IndexOriginalGCLevelMSHSignatures(std::string_view level)
 
   std::fprintf(stderr,
                "[moh-ps3-msh] GC all-MSH signature index ready: level=%.*s archive=%s msh=%zu full=%zu partial=%zu gc_nodes=%zu mapped_nodes=%zu signature_keys=%zu collision_keys=%zu collision_candidates=%zu missing_ps3=%zu rejected=%zu\n",
-               static_cast<int>(level.size()), level.data(), archive_path.string().c_str(), msh_entries,
+               static_cast<int>(level.size()), level.data(), archive_source.c_str(), msh_entries,
                full_models, partial_models, gc_nodes, mapped_nodes, g_display_list_candidates.size(),
                collision_keys, collision_candidates, missing_ps3, rejected);
 }
@@ -3002,35 +2996,15 @@ void IndexOriginalGCLevelDMFPairs(std::string_view level)
   if (level.empty())
     return;
 
-  const std::string campaign(1, level.front());
-  const std::array<std::filesystem::path, 3> candidates{
-      std::filesystem::current_path() / "extracted" / "files" / "DATA" / campaign /
-          std::string(level) / "level.viv",
-      std::filesystem::current_path() / "extracted" / "files" / "data" / campaign /
-          std::string(level) / "level.viv",
-      std::filesystem::current_path() / "extracted" / "DATA" / campaign /
-          std::string(level) / "level.viv"};
-  std::filesystem::path archive_path;
-  for (const auto& candidate : candidates)
-    if (std::filesystem::is_regular_file(candidate))
-    {
-      archive_path = candidate;
-      break;
-    }
-  if (archive_path.empty())
+  std::vector<u8> archive;
+  std::string archive_source;
+  if (!ReadOriginalGCLevelArchive(level, &archive, &archive_source))
+  {
+    std::fprintf(stderr,
+                 "[moh-ps3-dmf] GC pair index MISS: level=%.*s level.viv unavailable through NativeVFS/nod\n",
+                 static_cast<int>(level.size()), level.data());
     return;
-
-  std::ifstream file(archive_path, std::ios::binary | std::ios::ate);
-  if (!file)
-    return;
-  const std::streamoff end = file.tellg();
-  if (end < 6 || end > static_cast<std::streamoff>(128 * 1024 * 1024))
-    return;
-  std::vector<u8> archive(static_cast<std::size_t>(end));
-  file.seekg(0, std::ios::beg);
-  if (!file.read(reinterpret_cast<char*>(archive.data()), static_cast<std::streamsize>(archive.size())) ||
-      archive[0] != 0xC0 || archive[1] != 0xFB)
-    return;
+  }
 
   const u32 header_size = ((u32(archive[2]) << 8) | u32(archive[3])) + 4u;
   const u32 entry_count = (u32(archive[4]) << 8) | u32(archive[5]);
