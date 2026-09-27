@@ -202,13 +202,20 @@ jobs:
           $runner = Get-ChildItem build/release-runtime-windows -Filter moderngekko-run.exe -Recurse | Select-Object -First 1
           foreach ($item in @($launcher,$discCache,$dol,$runner)) { if (!$item) { throw "missing release binary" } }
 
-          Copy-Item $launcher.FullName $stage/MOHFrontline-Launcher.exe
-          Copy-Item $discCache.FullName $stage/MOHFrontline-DiscCache.exe
-          Copy-Item $dol.FullName $stage/toolchain/bin/dolrecomp.exe
-          New-Item -ItemType Directory -Force $stage/runtime, $stage/module, $stage/user, $stage/disc-cache | Out-Null
-          Copy-Item $runner.FullName $stage/runtime/moderngekko-run.exe
-          if (Test-Path (Join-Path $runner.DirectoryName "Sys")) { Copy-Item -Recurse (Join-Path $runner.DirectoryName "Sys") $stage/runtime/Sys }
-          Get-ChildItem $runner.DirectoryName -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination $stage/runtime
+          $runtimeDir = Join-Path $stage "runtime"
+          $moduleDir = Join-Path $stage "module"
+          $userDir = Join-Path $stage "user"
+          $discCacheDir = Join-Path $stage "disc-cache"
+          New-Item -ItemType Directory -Force $runtimeDir, $moduleDir, $userDir, $discCacheDir | Out-Null
+
+          Copy-Item $launcher.FullName (Join-Path $stage "MOHFrontline-Launcher.exe")
+          Copy-Item $discCache.FullName (Join-Path $stage "MOHFrontline-DiscCache.exe")
+          Copy-Item $dol.FullName (Join-Path $stage "toolchain\bin\dolrecomp.exe")
+          Copy-Item $runner.FullName (Join-Path $runtimeDir "moderngekko-run.exe")
+          $sysDir = Join-Path $runner.DirectoryName "Sys"
+          if (Test-Path $sysDir) { Copy-Item -Recurse $sysDir (Join-Path $runtimeDir "Sys") }
+          Get-ChildItem $runner.DirectoryName -Filter *.dll -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $runtimeDir
 
           @(
             "Medal of Honor: Frontline - GameCube Static Recompilation",
@@ -219,7 +226,7 @@ jobs:
             "No retail game data or PS3 assets are included.",
             "Launch MOHFrontline-Launcher.exe and select your legally obtained GMFE69 disc image.",
             "Supported image containers: ISO/GCM, RVZ, WIA, WBFS, CISO, GCZ, TGC and NFS."
-          ) | Set-Content $stage/RELEASE.txt
+          ) | Set-Content (Join-Path $stage "RELEASE.txt")
 
           if (Test-Path $zip) { Remove-Item -Force $zip }
           Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
