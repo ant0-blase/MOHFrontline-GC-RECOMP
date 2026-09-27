@@ -45,11 +45,13 @@ private:
   bool CreateRenderWindow();
   void UpdateWindowPosition();
   void UpdateMouseCapture();
+  void UpdateImGuiMouseButton(unsigned button, bool down);
   void ProcessEvents();
   static u32 TranslateKey(WPARAM key);
 
   HWND m_hwnd{};
   bool m_mouse_captured = false;
+  u32 m_imgui_mouse_buttons = 0;
 
   int m_window_x = Config::Get(Config::MAIN_RENDER_WINDOW_XPOS);
   int m_window_y = Config::Get(Config::MAIN_RENDER_WINDOW_YPOS);
@@ -209,6 +211,21 @@ void PlatformWin32::UpdateMouseCapture()
   }
 }
 
+void PlatformWin32::UpdateImGuiMouseButton(unsigned button, bool down)
+{
+  if (button >= 3)
+    return;
+
+  const u32 bit = 1u << button;
+  if (down)
+    m_imgui_mouse_buttons |= bit;
+  else
+    m_imgui_mouse_buttons &= ~bit;
+
+  if (g_presenter)
+    g_presenter->SetMousePress(m_imgui_mouse_buttons);
+}
+
 u32 PlatformWin32::TranslateKey(WPARAM key)
 {
   if (key >= 'A' && key <= 'Z')
@@ -217,14 +234,43 @@ u32 PlatformWin32::TranslateKey(WPARAM key)
     return static_cast<u32>(key);
   switch (key)
   {
-  case VK_ESCAPE: return 0xff1b;
+  case VK_BACK: return 0xff08;
   case VK_TAB: return 0xff09;
+  case VK_RETURN: return 0xff0d;
+  case VK_ESCAPE: return 0xff1b;
   case VK_SPACE: return 0x20;
+  case VK_HOME: return 0xff50;
+  case VK_LEFT: return 0xff51;
+  case VK_UP: return 0xff52;
+  case VK_RIGHT: return 0xff53;
+  case VK_DOWN: return 0xff54;
+  case VK_PRIOR: return 0xff55;
+  case VK_NEXT: return 0xff56;
+  case VK_END: return 0xff57;
+  case VK_INSERT: return 0xff63;
+  case VK_DELETE: return 0xffff;
+  case VK_LSHIFT: return 0xffe1;
+  case VK_RSHIFT: return 0xffe2;
+  case VK_SHIFT: return 0xffe1;
   case VK_LCONTROL: return 0xffe3;
   case VK_RCONTROL: return 0xffe4;
   case VK_CONTROL: return 0xffe3;
-  case VK_HOME: return 0xff50;
-  case VK_OEM_3: return static_cast<u32>('`');
+  case VK_LMENU: return 0xffe9;
+  case VK_RMENU: return 0xffea;
+  case VK_MENU: return 0xffe9;
+  case VK_F1: return 0xffbe;
+  case VK_F2: return 0xffbf;
+  case VK_F3: return 0xffc0;
+  case VK_F4: return 0xffc1;
+  case VK_F5: return 0xffc2;
+  case VK_F6: return 0xffc3;
+  case VK_F7: return 0xffc4;
+  case VK_F8: return 0xffc5;
+  case VK_F9: return 0xffc6;
+  case VK_F10: return 0xffc7;
+  case VK_F11: return 0xffc8;
+  case VK_F12: return 0xffc9;
+  case VK_OEM_3: return 0x60;
   default: return 0;
   }
 }
@@ -314,7 +360,38 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
 
   case WM_MOUSEMOVE:
     if (platform && !MohPcLayer::WantsRelativeMouse())
-      MohPcLayer::PointerAbsolute(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+    {
+      const float x = static_cast<float>(GET_X_LPARAM(lParam));
+      const float y = static_cast<float>(GET_Y_LPARAM(lParam));
+      MohPcLayer::PointerAbsolute(x, y);
+      if (g_presenter)
+        g_presenter->SetMousePos(x, y);
+    }
+    break;
+
+  case WM_LBUTTONDOWN:
+    if (platform)
+      platform->UpdateImGuiMouseButton(0, true);
+    break;
+  case WM_LBUTTONUP:
+    if (platform)
+      platform->UpdateImGuiMouseButton(0, false);
+    break;
+  case WM_RBUTTONDOWN:
+    if (platform)
+      platform->UpdateImGuiMouseButton(1, true);
+    break;
+  case WM_RBUTTONUP:
+    if (platform)
+      platform->UpdateImGuiMouseButton(1, false);
+    break;
+  case WM_MBUTTONDOWN:
+    if (platform)
+      platform->UpdateImGuiMouseButton(2, true);
+    break;
+  case WM_MBUTTONUP:
+    if (platform)
+      platform->UpdateImGuiMouseButton(2, false);
     break;
 
   case WM_KEYDOWN:
@@ -351,6 +428,9 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
   case WM_KILLFOCUS:
     if (platform)
     {
+      platform->m_imgui_mouse_buttons = 0;
+      if (g_presenter)
+        g_presenter->SetMousePress(0);
       platform->m_mouse_captured = true;
       platform->UpdateMouseCapture();
     }
