@@ -79,6 +79,7 @@ int main() {
       error.find("0x80004000") == std::string::npos)
     return 1;
 
+  input.close();
   fs::remove_all(root);
   return 0;
 }

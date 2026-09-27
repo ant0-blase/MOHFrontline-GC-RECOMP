@@ -55,8 +55,8 @@ static void test_timebase_loop(void) {
     check(insts[0].op == PPC_OP_MFTB, "decode timebase read");
     check(!c_function_cfg_can_loop_directly(&cfg, insts, BASE, 1),
           "yield before repeating a timebase read");
-    check(cfg.materialize_pc[0] && cfg.materialize_pc[1],
-          "materialize PC around timebase loop");
+    check(cfg.materialize_pc[0] && !cfg.materialize_pc[1],
+          "materialize PC for timebase helper but elide transparent branch");
     c_function_cfg_destroy(&cfg);
 }
 

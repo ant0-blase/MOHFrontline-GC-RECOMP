@@ -318,6 +318,10 @@ int main() {
   if (moderngekko::frontend::LoadConfig(directory, false))
     return 23;
 
+  input.close();
+  custom_input.close();
+  before_input.close();
+  after_input.close();
   fs::remove_all(directory);
   return 0;
 }
