@@ -95,7 +95,7 @@ Settings LoadSettings(const fs::path& root)
     const std::string value = line.substr(split + 1);
     if (key == "iso")
       settings.iso = value;
-    else if (key == "ps3_files" && !value.empty())
+    else if ((key == "ps3_files" || key == "ps3_source") && !value.empty())
       settings.ps3_files = value;
     else if (key == "ps3_assets")
       settings.ps3_assets = value == "1" || value == "true";
@@ -122,7 +122,7 @@ bool SaveSettings(const fs::path& root, const Settings& settings, std::string* e
     return false;
   }
   output << "iso=" << settings.iso.string() << '\n'
-         << "ps3_files=" << settings.ps3_files.string() << '\n'
+         << "ps3_source=" << settings.ps3_files.string() << '\n'
          << "ps3_assets=" << (settings.ps3_assets ? 1 : 0) << '\n'
          << "enhanced_graphics=" << (settings.enhanced_graphics ? 1 : 0) << '\n';
   return static_cast<bool>(output);
@@ -255,7 +255,7 @@ int main(int argc, char** argv)
 
   std::error_code ec;
   fs::create_directories(root / "user", ec);
-  fs::create_directories(settings.ps3_files, ec);
+  fs::create_directories(root / "HD" / "PS3_FILES", ec);
 
   if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
     return 1;
@@ -290,6 +290,7 @@ int main(int argc, char** argv)
 
   DialogState iso_dialog;
   DialogState ps3_dialog;
+  DialogState ps3_pkg_dialog;
   SDL_Process* build_process = nullptr;
   SDL_Process* game_process = nullptr;
   std::string status = ReadyText(root, settings);
@@ -336,6 +337,23 @@ int main(int argc, char** argv)
       {
         error = std::move(ps3_dialog.error);
         ps3_dialog.error.clear();
+      }
+    }
+    {
+      std::lock_guard lock(ps3_pkg_dialog.mutex);
+      if (ps3_pkg_dialog.selected)
+      {
+        settings.ps3_files = std::move(*ps3_pkg_dialog.selected);
+        ps3_pkg_dialog.selected.reset();
+        settings.ps3_assets = true;
+        settings.enhanced_graphics = true;
+        error.clear();
+        SaveSettings(root, settings, &error);
+      }
+      if (!ps3_pkg_dialog.error.empty())
+      {
+        error = std::move(ps3_pkg_dialog.error);
+        ps3_pkg_dialog.error.clear();
       }
     }
 
@@ -393,14 +411,32 @@ int main(int argc, char** argv)
 
     ImGui::Spacing();
     ImGui::TextUnformatted("PS3 remaster assets");
+    ImGui::TextDisabled("Use an extracted PS3_FILES folder or mount the retail PS3 PKG directly.");
     ImGui::TextWrapped("%s", settings.ps3_files.string().c_str());
 
     if (ImGui::Button("Choose PS3_FILES folder"))
       SDL_ShowOpenFolderDialog(FileDialogCallback, &ps3_dialog, window,
-                               settings.ps3_files.string().c_str(), false);
+                               fs::is_directory(settings.ps3_files)
+                                   ? settings.ps3_files.string().c_str()
+                                   : (root / "HD" / "PS3_FILES").string().c_str(),
+                               false);
     ImGui::SameLine();
-    if (ImGui::Button("Open PS3 assets"))
-      OpenFolder(settings.ps3_files, &error);
+    if (ImGui::Button("Choose PS3 PKG"))
+    {
+      static constexpr SDL_DialogFileFilter pkg_filters[] = {
+          {"PlayStation 3 package", "pkg"}};
+      SDL_ShowOpenFileDialog(FileDialogCallback, &ps3_pkg_dialog, window,
+                             pkg_filters, static_cast<int>(std::size(pkg_filters)),
+                             nullptr, false);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Open PS3 source"))
+    {
+      const fs::path open_path = fs::is_regular_file(settings.ps3_files)
+                                     ? settings.ps3_files.parent_path()
+                                     : settings.ps3_files;
+      OpenFolder(open_path.empty() ? root / "HD" : open_path, &error);
+    }
 
     if (ImGui::Checkbox("Enable PS3 assets", &settings.ps3_assets))
     {

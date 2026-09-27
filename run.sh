@@ -62,9 +62,9 @@ MOH Frontline PC enhancements:
   --original-graphics         Force preservation/original post-processing
   --fps-ads                   Enable modern FPS aim-down-sight presentation
   --original-aim              Keep original Frontline aiming presentation
-  --ps3-assets                Enable HD/PS3_FILES remaster asset layer
+  --ps3-assets                Enable PS3 remaster asset layer
   --no-ps3-assets             Disable PS3 remaster assets
-  --ps3-files <directory>     Override PS3 asset directory
+  --ps3-files <path>          PS3_FILES directory or finalized retail PS3 .pkg
                               Default: HD/PS3_FILES
   --no-pc-input               Disable the keyboard/mouse FPS layer
   --moh-help                  Show this help and exit
@@ -265,7 +265,7 @@ unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_WEAPON_FOV_DEGREES \
       MOH_UI_SAFE MOH_MOUSE_SENSITIVITY MOH_MOUSE_SENSITIVITY_X MOH_MOUSE_SENSITIVITY_Y \
       MOH_MOUSE_ADS_SENSITIVITY MOH_HUD_SCALE MOH_HUD_SAFE_WIDTH MOH_ADAPTIVE_PROFILE \
       MOH_ENHANCED_GRAPHICS MOH_FPS_ADS MOH_ADS_WORLD_FOV MOH_ADS_WEAPON_FOV \
-      MOH_PS3_ASSETS MOH_PS3_FILES MOH_PS3_DMF_BODY_MODEL_SPACE \
+      MOH_PS3_ASSETS MOH_PS3_FILES MOH_PS3_PKG MOH_PS3_DMF_BODY_MODEL_SPACE \
       2>/dev/null || true
 
 # ---------------------------------------------------------------
@@ -275,8 +275,10 @@ unset MOH_CAMERA_PATCH MOH_TIMING_PATCH MOH_FOV_DEGREES MOH_WEAPON_FOV_DEGREES \
 # file. Raw resources remain completely separate from extracted/.
 # ---------------------------------------------------------------
 if [[ "$PS3_ASSETS" == "auto" ]]; then
-  if [[ -d "$PS3_FILES" ]] && \
-     find "$PS3_FILES" -type f -print -quit 2>/dev/null | grep -q .; then
+  if [[ -f "$PS3_FILES" && "${PS3_FILES,,}" == *.pkg ]]; then
+    PS3_ASSETS=1
+  elif [[ -d "$PS3_FILES" ]] && \
+       find "$PS3_FILES" -type f -print -quit 2>/dev/null | grep -q .; then
     PS3_ASSETS=1
   else
     PS3_ASSETS=0
@@ -284,13 +286,19 @@ if [[ "$PS3_ASSETS" == "auto" ]]; then
 fi
 
 if [[ "$PS3_ASSETS" == "1" ]]; then
-  if [[ ! -d "$PS3_FILES" ]]; then
-    echo "error: PS3 asset directory does not exist: $PS3_FILES" >&2
+  if [[ -f "$PS3_FILES" && "${PS3_FILES,,}" == *.pkg ]]; then
+    export MOH_PS3_ASSETS=1
+    export MOH_PS3_PKG="$(realpath "$PS3_FILES")"
+    unset MOH_PS3_FILES 2>/dev/null || true
+    echo "PS3 remaster PKG (extraction-less): $MOH_PS3_PKG"
+  elif [[ -d "$PS3_FILES" ]]; then
+    export MOH_PS3_ASSETS=1
+    export MOH_PS3_FILES="$PS3_FILES"
+    unset MOH_PS3_PKG 2>/dev/null || true
+  else
+    echo "error: PS3 asset source must be a PS3_FILES directory or .pkg: $PS3_FILES" >&2
     exit 2
   fi
-
-  export MOH_PS3_ASSETS=1
-  export MOH_PS3_FILES="$PS3_FILES"
 
   # The remaster assets are intended to be used together with the
   # remaster presentation shader unless the user explicitly selected
@@ -488,7 +496,7 @@ if [[ -n "${MOH_CAMERA_PATCH:-}" || -n "${MOH_TIMING_PATCH:-}" ||
 fi
 
 if [[ "$PS3_ASSETS" == "1" ]]; then
-  echo "PS3 remaster assets: $PS3_FILES"
+  echo "PS3 remaster asset source: $PS3_FILES"
 fi
 
 # ModernGekko/Dolphin loads post-process shaders from <user-dir>/Shaders first.

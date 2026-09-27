@@ -25,14 +25,37 @@ if ((Get-Item $Game).PSIsContainer -and !(Test-Path (Join-Path $Game "sys\main.d
 }
 New-Item -ItemType Directory -Force -Path $User | Out-Null
 
-if (!$Ps3Files) { $Ps3Files = Join-Path $Root "HD\PS3_FILES" }
-New-Item -ItemType Directory -Force -Path $Ps3Files | Out-Null
+if (!$Ps3Files) {
+    $Ps3Files = Join-Path $Root "HD\PS3_FILES"
+    New-Item -ItemType Directory -Force -Path $Ps3Files | Out-Null
+}
+
+$Ps3SourceExists = Test-Path $Ps3Files
+$Ps3SourceItem = if ($Ps3SourceExists) { Get-Item $Ps3Files } else { $null }
+$Ps3IsPkg = $Ps3SourceItem -and !$Ps3SourceItem.PSIsContainer -and
+    $Ps3SourceItem.Extension.Equals(".pkg", [StringComparison]::OrdinalIgnoreCase)
+$Ps3DirectoryHasFiles = $Ps3SourceItem -and $Ps3SourceItem.PSIsContainer -and
+    [bool](Get-ChildItem $Ps3Files -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
 
 $env:MOH_PC_SETTINGS_PATH = Join-Path $User "moh_pc_settings.ini"
 $env:MOH_PC_INPUT = "1"
 $env:MODERNGEKKO_SKIP_ASSET_HASH = "1"
-$env:MOH_PS3_FILES = $Ps3Files
-$env:MOH_PS3_ASSETS = if ($NoPs3Assets) { "0" } elseif ($Ps3Assets) { "1" } else { if ((Get-ChildItem $Ps3Files -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) { "1" } else { "0" } }
+$env:MOH_PS3_ASSETS = if ($NoPs3Assets) { "0" } elseif ($Ps3Assets) { "1" } else {
+    if ($Ps3IsPkg -or $Ps3DirectoryHasFiles) { "1" } else { "0" }
+}
+
+Remove-Item Env:MOH_PS3_FILES -ErrorAction SilentlyContinue
+Remove-Item Env:MOH_PS3_PKG -ErrorAction SilentlyContinue
+if ($env:MOH_PS3_ASSETS -eq "1") {
+    if ($Ps3IsPkg) {
+        $env:MOH_PS3_PKG = (Resolve-Path $Ps3Files).Path
+        Write-Host "PS3 remaster PKG (extraction-less): $env:MOH_PS3_PKG"
+    } elseif ($Ps3SourceItem -and $Ps3SourceItem.PSIsContainer) {
+        $env:MOH_PS3_FILES = (Resolve-Path $Ps3Files).Path
+    } else {
+        throw "PS3 asset source must be a PS3_FILES directory or finalized .pkg: $Ps3Files"
+    }
+}
 $env:MOH_ENHANCED_GRAPHICS = if ($OriginalGraphics) { "0" } elseif ($EnhancedGraphics) { "1" } else { $env:MOH_PS3_ASSETS }
 $env:MOH_PS3_FONTS = "1"
 $env:MOH_PS3_FONT_RENDER = "1"
