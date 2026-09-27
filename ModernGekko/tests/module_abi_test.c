@@ -43,8 +43,8 @@ int main(void)
     };
     CPUState state = {0};
 
-    COMPILE_ASSERT(module_abi_version_is_four,
-                   MODERNGEKKO_MODULE_ABI_VERSION == 4u);
+    COMPILE_ASSERT(module_abi_version_is_five,
+                   MODERNGEKKO_MODULE_ABI_VERSION == 5u);
     COMPILE_ASSERT(cpu_abi_version_is_four,
                    MODERNGEKKO_CPU_ABI_VERSION == 4u);
 #if UINTPTR_MAX == UINT64_MAX

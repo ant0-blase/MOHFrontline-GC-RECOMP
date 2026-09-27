@@ -22,6 +22,12 @@ set(SDL_TESTS OFF CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+if(UNIX AND NOT APPLE)
+  # XTest is not used by the standalone recompilation launcher. Keeping it
+  # disabled avoids pulling an unnecessary libXtst development dependency
+  # into portable/CI builds while preserving normal X11 window/input support.
+  set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory("${SDL_ROOT}" "${CMAKE_BINARY_DIR}/_deps/sdl3" EXCLUDE_FROM_ALL)
 
 add_executable(MOHFrontline-Launcher

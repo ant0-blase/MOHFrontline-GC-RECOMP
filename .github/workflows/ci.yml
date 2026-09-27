@@ -16,9 +16,9 @@ concurrency:
 jobs:
   hygiene:
     name: Repository checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify no retail game data is tracked
         shell: bash
@@ -43,9 +43,9 @@ jobs:
 
   core-tests-linux:
     name: Core tests · Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -67,7 +67,10 @@ jobs:
     name: Core tests · Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Enable Win32 long paths for Git
+        shell: pwsh
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v5
       - name: Validate PowerShell scripts
         shell: pwsh
         run: |
@@ -98,9 +101,9 @@ jobs:
 
   launcher-linux:
     name: Launcher · Linux x86_64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install launcher dependencies
         run: |
           sudo apt-get update
@@ -128,7 +131,10 @@ jobs:
     name: Launcher · Windows x86_64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Enable Win32 long paths for Git
+        shell: pwsh
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v5
       - name: Configure standalone launcher
         shell: pwsh
         run: |

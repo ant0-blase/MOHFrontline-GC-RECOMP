@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
@@ -41,9 +41,9 @@ jobs:
   linux:
     name: Package · Linux x86_64
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install launcher dependencies
         run: |
           sudo apt-get update
@@ -88,7 +88,10 @@ jobs:
     needs: validate
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Enable Win32 long paths for Git
+        shell: pwsh
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v5
       - name: Configure launcher
         shell: pwsh
         run: |
@@ -103,14 +106,17 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $name = "MOHFrontline-GC-RECOMP-$env:VERSION-Windows-x86_64"
-          $stage = Join-Path "dist" $name
-          New-Item -ItemType Directory -Force dist | Out-Null
-          git archive --format=zip --output dist/source.zip HEAD
-          Expand-Archive dist/source.zip -DestinationPath $stage -Force
-          Remove-Item dist/source.zip
+          New-Item -ItemType Directory -Force dist, dist/add | Out-Null
+          $zip = "dist/$name.zip"
+
+          # Keep the source tree inside the ZIP without expanding its very long
+          # SPIRV-Cross reference paths onto the Windows filesystem.
+          git archive --format=zip --output $zip HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
+
           $launcher = Get-ChildItem launcher/bin -Filter MOHFrontline-Launcher.exe -Recurse | Select-Object -First 1
           if (!$launcher) { throw "MOHFrontline-Launcher.exe was not produced" }
-          Copy-Item $launcher.FullName (Join-Path $stage "MOHFrontline-Launcher.exe")
+          Copy-Item $launcher.FullName dist/add/MOHFrontline-Launcher.exe
           @(
             "Medal of Honor: Frontline - GameCube Static Recompilation",
             "Release: $env:VERSION",
@@ -118,9 +124,17 @@ jobs:
             "",
             "No retail game data or PS3 assets are included.",
             "Start MOHFrontline-Launcher.exe and select your own legally obtained GMFE69 ISO."
-          ) | Set-Content (Join-Path $stage "RELEASE.txt")
-          $zip = "dist/$name.zip"
-          Compress-Archive -Path "$stage/*" -DestinationPath $zip -CompressionLevel Optimal
+          ) | Set-Content dist/add/RELEASE.txt
+
+          $zipAbsolute = (Resolve-Path $zip).Path
+          Push-Location dist/add
+          try {
+            7z a -tzip $zipAbsolute MOHFrontline-Launcher.exe RELEASE.txt | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "7z failed to append release files" }
+          } finally {
+            Pop-Location
+          }
+
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $name.zip" | Set-Content "$zip.sha256"
       - uses: actions/upload-artifact@v4
@@ -134,9 +148,9 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [validate, linux, windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
