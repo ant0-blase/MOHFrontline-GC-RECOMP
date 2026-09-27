@@ -65,7 +65,7 @@ jobs:
 
   core-tests-windows:
     name: Core tests · Windows
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Enable Win32 long paths for Git
         shell: pwsh
@@ -129,7 +129,7 @@ jobs:
 
   launcher-windows:
     name: Launcher · Windows x86_64
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Enable Win32 long paths for Git
         shell: pwsh

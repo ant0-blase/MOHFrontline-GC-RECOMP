@@ -86,7 +86,7 @@ jobs:
   windows:
     name: Package · Windows x86_64
     needs: validate
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Enable Win32 long paths for Git
         shell: pwsh
