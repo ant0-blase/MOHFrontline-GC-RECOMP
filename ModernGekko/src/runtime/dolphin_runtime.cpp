@@ -483,19 +483,21 @@ RuntimeRunResult Runtime::Run() {
   std::unique_ptr<BootParameters> boot;
   {
     std::lock_guard lock(s_runtime_mutex);
+    const std::filesystem::path boot_source =
+        m_impl->metadata.direct_disc_image ? m_impl->metadata.source_image
+                                           : m_impl->metadata.main_dol;
     if (s_boot_session_data)
       boot = BootParameters::GenerateFromFile(
-          m_impl->metadata.main_dol.string(), std::move(*s_boot_session_data));
+          boot_source.string(), std::move(*s_boot_session_data));
     else
-      boot =
-          BootParameters::GenerateFromFile(m_impl->metadata.main_dol.string());
+      boot = BootParameters::GenerateFromFile(boot_source.string());
     s_boot_session_data.reset();
   }
   if (!boot) {
     m_impl->running = false;
     return {RuntimeExitReason::BootFailed,
             RuntimeError{RuntimeErrorCode::BootFailed,
-                         "Dolphin rejected the extracted disc"}};
+                         "Dolphin rejected the selected game source"}};
   }
   m_impl->state_hook =
       Core::AddOnStateChangedCallback([this](Core::State state) {
@@ -507,7 +509,7 @@ RuntimeRunResult Runtime::Run() {
     m_impl->running = false;
     return {RuntimeExitReason::BootFailed,
             RuntimeError{RuntimeErrorCode::BootFailed,
-                         "Dolphin could not boot sys/main.dol"}};
+                         "Dolphin could not boot the selected game source"}};
   }
   m_impl->booted = true;
   std::jthread title_thread;

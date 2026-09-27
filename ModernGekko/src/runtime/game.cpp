@@ -10,6 +10,10 @@
 #include <sstream>
 #include <vector>
 
+#ifdef MODERNGEKKO_HAVE_NOD
+#include <nod.h>
+#endif
+
 namespace moderngekko
 {
 namespace
@@ -146,8 +150,127 @@ GameInspectResult InspectGame(const std::filesystem::path& input_root)
 {
   std::error_code ec;
   const auto root = std::filesystem::weakly_canonical(input_root, ec);
-  if (ec || !std::filesystem::is_directory(root))
-    return {{}, "game root is not a readable directory"};
+  if (ec)
+    return {{}, "game source is not readable"};
+
+#ifdef MODERNGEKKO_HAVE_NOD
+  if (std::filesystem::is_regular_file(root))
+  {
+    const auto u8 = root.u8string();
+    const std::string utf8(u8.begin(), u8.end());
+    NodDiscOptions options{};
+    options.preloader_threads = 0u;
+    NodHandle* disc = nullptr;
+    if (nod_disc_open(utf8.c_str(), &options, &disc) != NOD_RESULT_OK || !disc)
+      return {{}, "nod could not open the disc image"};
+
+    const auto free_disc = [&]() { nod_free(disc); };
+    NodDiscHeader header{};
+    constexpr std::array<std::uint8_t, 4> gc_magic{0xc2u, 0x33u, 0x9fu, 0x3du};
+    if (nod_disc_header(disc, &header) != NOD_RESULT_OK ||
+        !std::equal(gc_magic.begin(), gc_magic.end(), header.gcn_magic))
+    {
+      free_disc();
+      return {{}, "disc image is not a GameCube image"};
+    }
+
+    NodDiscMeta disc_meta{};
+    std::string format = "unknown";
+    if (nod_disc_meta(disc, &disc_meta) == NOD_RESULT_OK)
+    {
+      switch (disc_meta.format)
+      {
+      case NOD_FORMAT_ISO: format = "ISO"; break;
+      case NOD_FORMAT_CISO: format = "CISO"; break;
+      case NOD_FORMAT_GCZ: format = "GCZ"; break;
+      case NOD_FORMAT_NFS: format = "NFS"; break;
+      case NOD_FORMAT_RVZ: format = "RVZ"; break;
+      case NOD_FORMAT_WBFS: format = "WBFS"; break;
+      case NOD_FORMAT_WIA: format = "WIA"; break;
+      case NOD_FORMAT_TGC: format = "TGC"; break;
+      }
+    }
+
+    NodPartitionOptions partition_options{};
+    NodHandle* partition = nullptr;
+    if (nod_disc_open_partition_kind(disc, NOD_PARTITION_KIND_DATA,
+                                     &partition_options, &partition) != NOD_RESULT_OK ||
+        !partition)
+    {
+      free_disc();
+      return {{}, "nod could not open the GameCube data partition"};
+    }
+
+    NodPartitionMeta meta{};
+    if (nod_partition_meta(partition, &meta) != NOD_RESULT_OK ||
+        !meta.raw_dol.data || meta.raw_dol.size < 0x100u ||
+        !meta.raw_boot.data || meta.raw_boot.size < 0x60u)
+    {
+      nod_free(partition);
+      free_disc();
+      return {{}, "nod returned incomplete GameCube metadata"};
+    }
+
+    const auto* dol_data = static_cast<const std::uint8_t*>(meta.raw_dol.data);
+    std::vector<std::uint8_t> dol(dol_data, dol_data + meta.raw_dol.size);
+    const std::uint32_t entry_point = ReadBE32(dol.data() + 0xe0);
+    bool entry_is_executable = false;
+    for (std::size_t section = 0; section < 7; ++section)
+    {
+      const std::uint32_t offset = ReadBE32(dol.data() + section * 4);
+      const std::uint32_t address = ReadBE32(dol.data() + 0x48 + section * 4);
+      const std::uint32_t size = ReadBE32(dol.data() + 0x90 + section * 4);
+      if (size == 0)
+        continue;
+      if (offset == 0 || address == 0 ||
+          static_cast<std::uint64_t>(offset) + size > dol.size())
+      {
+        nod_free(partition);
+        free_disc();
+        return {{}, "malformed DOL section table"};
+      }
+      if (entry_point >= address &&
+          static_cast<std::uint64_t>(entry_point) <
+              static_cast<std::uint64_t>(address) + size)
+        entry_is_executable = true;
+    }
+    if (!entry_is_executable)
+    {
+      nod_free(partition);
+      free_disc();
+      return {{}, "DOL entry point is outside its text sections"};
+    }
+
+    const auto* boot = static_cast<const std::uint8_t*>(meta.raw_boot.data);
+    std::string id(reinterpret_cast<const char*>(boot), 6);
+    std::string name(reinterpret_cast<const char*>(boot + 0x20),
+                     std::min<std::size_t>(0x40u, meta.raw_boot.size - 0x20u));
+    if (const auto terminator = name.find('\0'); terminator != std::string::npos)
+      name.resize(terminator);
+    while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+      name.pop_back();
+    if (name.empty())
+      name = id;
+
+    GameMetadata metadata;
+    metadata.root = root.parent_path();
+    metadata.source_image = root;
+    metadata.direct_disc_image = true;
+    metadata.disc_format = std::move(format);
+    metadata.game_name = std::move(name);
+    metadata.disc_id = std::move(id);
+    metadata.platform = GamePlatform::GameCube;
+    metadata.entry_point = entry_point;
+    metadata.dol_sha256 = Sha256(std::move(dol));
+
+    nod_free(partition);
+    free_disc();
+    return {std::move(metadata), {}};
+  }
+#endif
+
+  if (!std::filesystem::is_directory(root))
+    return {{}, "game source is neither an extracted directory nor a supported disc image"};
   const auto dol_path = root / "sys" / "main.dol";
   const auto boot_path = root / "sys" / "boot.bin";
   const auto rel_path = root / "files" / "_Main.rel";

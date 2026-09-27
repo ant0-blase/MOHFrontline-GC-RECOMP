@@ -31,7 +31,7 @@ void HandleStopSignal(int) { s_stop_requested = 1; }
 
 void Usage() {
   std::cerr << "usage: " MODERNGEKKO_RUNNER_NAME
-               " [--game <extracted-root>] [--module <path>]\n"
+               " [--game <extracted-root-or-disc-image>] [--module <path>]\n"
                "       [--user-dir <path>] [--title <text>]\n"
                "       [--graphics <backend>] [--audio <backend>]\n"
                "       [--mods <directory>] [--no-mods]\n"
@@ -238,7 +238,16 @@ int RunMain(int argc, char **argv) {
     std::cout << "controller configuration: " << controller_message << '\n';
   }
 
+  const auto inspected = moderngekko::InspectGame(config.game_root);
+  if (!inspected) {
+    std::cerr << "invalid game: " << inspected.error << '\n';
+    return 2;
+  }
 #ifdef MODERNGEKKO_DOL_PATCH_MANIFEST
+  if (inspected.metadata->direct_disc_image) {
+    std::cerr << "DOL patch manifests require an extracted game directory\n";
+    return 2;
+  }
   bool dol_changed = false;
   std::string dol_patch_error;
   if (!moderngekko::frontend::ApplyDolPatchManifest(
@@ -251,11 +260,6 @@ int RunMain(int argc, char **argv) {
   if (dol_changed)
     std::cout << "Applied native DOL patches\n";
 #endif
-  const auto inspected = moderngekko::InspectGame(config.game_root);
-  if (!inspected) {
-    std::cerr << "invalid game: " << inspected.error << '\n';
-    return 2;
-  }
 
 #ifdef MODERNGEKKO_REQUIRED_DISC_ID
   if (inspected.metadata->disc_id != MODERNGEKKO_REQUIRED_DISC_ID) {

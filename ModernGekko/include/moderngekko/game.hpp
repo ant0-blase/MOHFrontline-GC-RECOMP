@@ -18,6 +18,9 @@ struct GameMetadata
   std::filesystem::path root;
   std::filesystem::path main_dol;
   std::filesystem::path main_rel;
+  std::filesystem::path source_image;
+  bool direct_disc_image = false;
+  std::string disc_format;
   std::string game_name;
   std::string disc_id;
   GamePlatform platform = GamePlatform::GameCube;
