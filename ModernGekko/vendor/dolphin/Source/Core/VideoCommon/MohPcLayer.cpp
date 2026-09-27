@@ -166,12 +166,12 @@ struct State
   std::atomic<int> menu_right{0};
   std::atomic<double> last_abs_x{-1.0};
   std::atomic<double> last_abs_y{-1.0};
-  std::atomic<int> window_width{1280};
-  std::atomic<int> window_height{720};
+  std::atomic<int> window_width{1920};
+  std::atomic<int> window_height{1200};
   std::atomic<int> capture_action{-1};
   std::atomic<int> fire_button{0};
   std::atomic<int> aim_button{1};
-  std::atomic<int> internal_resolution{3};
+  std::atomic<int> internal_resolution{5};
   std::atomic<int> anisotropy{16};
   std::atomic<int> msaa{1};
   std::atomic<int> texture_filter{0}; // 0 default, 1 nearest, 2 linear
@@ -180,7 +180,7 @@ struct State
 
   // Reversible post-processing stack.  Off means Dolphin receives the exact
   // same post-process selection that was active before the MOHF PC layer.
-  std::atomic<bool> enhanced_graphics{false};
+  std::atomic<bool> enhanced_graphics{true};
   std::atomic<int> enhanced_preset{1}; // 0 custom/original, 1 enhanced, 2 remastered
   std::atomic<bool> gfx_bloom{true};
   std::atomic<float> gfx_bloom_intensity{0.55f};
@@ -233,13 +233,13 @@ struct State
   // 0 = lock OFF; 1..120 = exact gameplay FPS / VI Hz target.
   std::atomic<int> requested_fps{60};
   std::atomic<bool> vi_skip{true};
-  std::atomic<bool> fov_override{false};
-  std::atomic<float> fov{90.0f};
+  std::atomic<bool> fov_override{true};
+  std::atomic<float> fov{105.0f};
   std::atomic<bool> weapon_follow{true};
   std::atomic<float> weapon_fov{100.0f};
-  std::atomic<int> aspect_mode{0}; // 0 original,1 auto,2 16:10,3 16:9,4 21:9,5 32:9,6 custom
+  std::atomic<int> aspect_mode{2}; // 0 original,1 auto,2 16:10,3 16:9,4 21:9,5 32:9,6 custom
   std::atomic<int> aspect_num{16};
-  std::atomic<int> aspect_den{9};
+  std::atomic<int> aspect_den{10};
   std::atomic<bool> debug_open{false};
   std::atomic<float> mobile_move_x{0.0f};
   std::atomic<float> mobile_move_y{0.0f};
