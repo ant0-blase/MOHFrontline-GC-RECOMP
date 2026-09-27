@@ -1404,9 +1404,6 @@ bool RunScenePostProcessOnGpu()
   if (!g_gfx->SupportsUtilityDrawing())
     return false;
 
-  auto* presenter_post =
-      g_presenter->GetPostProcessor();
-
   AbstractTexture* efb =
       g_framebuffer_manager
           ->GetEFBColorTexture();
