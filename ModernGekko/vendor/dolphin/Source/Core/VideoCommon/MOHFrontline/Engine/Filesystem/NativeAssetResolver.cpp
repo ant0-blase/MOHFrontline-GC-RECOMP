@@ -22,6 +22,21 @@ std::string Normalize(std::string_view input)
   while (out.starts_with('/')) out.erase(0, 1);
   return out;
 }
+std::string ContentPath(std::string_view input)
+{
+  std::string path = Normalize(input);
+  if (path.starts_with("data/"))
+    return path;
+
+  // Retail PKGs commonly store the authored game tree below USRDIR (or
+  // another package prefix). Keep the semantic resolver rooted at DATA so
+  // level scoping and exact GC->PS3 identity matching work identically for
+  // extracted folders and extraction-less PKG mounts.
+  const auto marker = path.find("/data/");
+  if (marker != std::string::npos)
+    path.erase(0, marker + 1);
+  return path;
+}
 std::string Filename(std::string_view p)
 {
   return std::string(p.substr(p.find_last_of("/:") == p.npos ? 0 : p.find_last_of("/:") + 1));
@@ -98,7 +113,7 @@ void Refresh()
   if (!PS3RemasterAssets::IsReady()) return;
   for (const auto& a : PS3RemasterAssets::GetAssets())
   {
-    const auto path = Normalize(a.relative_path);
+    const auto path = ContentPath(a.relative_path);
     const auto level = LevelOf(path);
     if (!level.empty()) levels.insert(level);
     index[Normalize(a.filename)].push_back({&a, path, level, Classify(a.filename)});
