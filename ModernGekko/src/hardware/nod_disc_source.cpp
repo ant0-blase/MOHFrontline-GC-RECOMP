@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -136,7 +137,7 @@ public:
     const std::uint64_t size = GetSize();
     if (offset > size || output.size() > size - offset)
       return false;
-    if (nod_seek(m_disc.value, static_cast<std::int64_t>(offset), NOD_SEEK_SET) < 0)
+    if (nod_seek(m_disc.value, static_cast<std::int64_t>(offset), SEEK_SET) < 0)
       return false;
 
     std::size_t done = 0;
@@ -178,7 +179,7 @@ public:
         !raw_file)
       return false;
     NodHandleOwner file(raw_file);
-    if (offset && nod_seek(file.value, static_cast<std::int64_t>(offset), NOD_SEEK_SET) < 0)
+    if (offset && nod_seek(file.value, static_cast<std::int64_t>(offset), SEEK_SET) < 0)
       return false;
 
     std::size_t done = 0;
