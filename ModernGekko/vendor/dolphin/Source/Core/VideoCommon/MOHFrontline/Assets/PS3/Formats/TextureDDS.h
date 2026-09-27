@@ -22,7 +22,8 @@ inline std::vector<std::uint8_t> DDSHeader(unsigned width, unsigned height, unsi
 inline std::vector<std::uint8_t> EncodeDDS(std::span<const PS3TextureDecoder::Level> levels)
 {
   if (levels.empty()) return {};
-  auto bytes = DDSHeader(levels[0].width, levels[0].height, levels.size(), levels[0].width*4, 0);
+  auto bytes = DDSHeader(levels[0].width, levels[0].height,
+                         static_cast<unsigned>(levels.size()), levels[0].width * 4, 0);
   for (const auto& level : levels) bytes.insert(bytes.end(), level.rgba.begin(), level.rgba.end());
   return bytes;
 }
@@ -32,7 +33,9 @@ inline std::vector<std::uint8_t> EncodeDDS(std::span<const PS3TextureDecoder::Co
   const auto format = levels[0].format;
   const unsigned fourcc = format == PS3TextureDecoder::BlockFormat::BC1 ? 0x31545844 :
       format == PS3TextureDecoder::BlockFormat::BC2 ? 0x33545844 : 0x35545844;
-  auto bytes = DDSHeader(levels[0].width, levels[0].height, levels.size(), levels[0].blocks.size(), fourcc);
+  auto bytes = DDSHeader(levels[0].width, levels[0].height,
+                         static_cast<unsigned>(levels.size()),
+                         static_cast<unsigned>(levels[0].blocks.size()), fourcc);
   for (const auto& level : levels) bytes.insert(bytes.end(), level.blocks.begin(), level.blocks.end());
   return bytes;
 }

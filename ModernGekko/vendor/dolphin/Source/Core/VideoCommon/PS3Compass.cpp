@@ -2656,7 +2656,8 @@ std::optional<DrawTPKIdentity> ResolveDrawTPKIdentity()
 u64 DrawTPKKey(const DrawTPKIdentity& identity)
 {
   const std::string text = identity.level + "/" + identity.name;
-  u64 key = Common::GetHash64(reinterpret_cast<const u8*>(text.data()), text.size(), 0);
+  u64 key = Common::GetHash64(reinterpret_cast<const u8*>(text.data()),
+                              static_cast<u32>(text.size()), 0);
   return key ? key : 1;
 }
 
@@ -5164,11 +5165,13 @@ void Register(int index, u32 address, u32 width, u32 height, u32 format, std::ve
   registration.height = height;
   registration.format = format;
   registration.texture_size = original.size();
-  registration.texture_hash = Common::GetHash64(original.data(), original.size(), 0);
+  registration.texture_hash =
+      Common::GetHash64(original.data(), static_cast<u32>(original.size()), 0);
   registration.palette_format = palette_format;
   registration.palette_size = palette.size();
   if (!palette.empty())
-    registration.palette_hash = Common::GetHash64(palette.data(), palette.size(), 0);
+    registration.palette_hash =
+        Common::GetHash64(palette.data(), static_cast<u32>(palette.size()), 0);
 
   registrations[registration.address] = std::move(registration);
   if (gc_native)
@@ -5245,7 +5248,8 @@ std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
       registration.height != info.GetRawHeight() ||
       registration.format != static_cast<u32>(info.GetTextureFormat()) ||
       registration.texture_size != info.GetTextureSize() ||
-      registration.texture_hash != Common::GetHash64(info.GetData(), info.GetTextureSize(), 0))
+      registration.texture_hash !=
+          Common::GetHash64(info.GetData(), static_cast<u32>(info.GetTextureSize()), 0))
   {
     return nullptr;
   }
@@ -5256,7 +5260,8 @@ std::shared_ptr<VideoCommon::CustomTextureData> Find(const TextureInfo& info)
         info.GetPaletteSize().value_or(0) != registration.palette_size ||
         !info.GetTlutAddress() ||
         registration.palette_hash !=
-            Common::GetHash64(info.GetTlutAddress(), registration.palette_size, 0))
+            Common::GetHash64(info.GetTlutAddress(),
+                              static_cast<u32>(registration.palette_size), 0))
     {
       return nullptr;
     }

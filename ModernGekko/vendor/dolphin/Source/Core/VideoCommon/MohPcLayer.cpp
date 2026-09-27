@@ -1407,11 +1407,6 @@ bool RunScenePostProcessOnGpu()
   auto* presenter_post =
       g_presenter->GetPostProcessor();
 
-  auto* presenter_config =
-      presenter_post->GetConfig();
-
-
-
   AbstractTexture* efb =
       g_framebuffer_manager
           ->GetEFBColorTexture();

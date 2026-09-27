@@ -1100,7 +1100,8 @@ bool DecodeCompressed(std::span<const std::uint8_t> file, std::vector<Compressed
   const unsigned mips = file[25], pitch = BE32(file.data()+40);
   const std::size_t payload_size = BE32(file.data()+20);
   if (!width || !height || width > 4096 || height > 4096 || !mips ||
-      mips > std::bit_width(std::max(width, height)) || payload_size > file.size()-48)
+      mips > static_cast<unsigned>(std::bit_width(std::max(width, height))) ||
+      payload_size > file.size()-48)
     return false;
   std::size_t offset = 0;
   std::vector<CompressedLevel> parsed;

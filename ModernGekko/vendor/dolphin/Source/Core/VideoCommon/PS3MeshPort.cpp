@@ -1976,7 +1976,7 @@ void ResolveDMFDisplayList(u32 address, std::span<const u8> commands)
     if (g_dmf_prefixes.contains({command_size, prefix}))
     {
       const DisplayListSignatureKey key{
-          command_size, Common::GetHash64(commands.data(), commands.size(), 0)};
+          command_size, Common::GetHash64(commands.data(), command_size, 0)};
       if (const auto it = g_dmf_display_list_candidates.find(key);
           it != g_dmf_display_list_candidates.end())
       {
@@ -2490,19 +2490,19 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
     bool structural_index = false;
 
     // 1. Exact authored identity by bone strings and coefficient.
-    if (const auto it = gc_by_key.find(name_key); it != gc_by_key.end())
+    if (const auto exact_it = gc_by_key.find(name_key); exact_it != gc_by_key.end())
     {
-      matches = &it->second;
+      matches = &exact_it->second;
       occurrence = &next_occurrence[name_key];
     }
 
     // 2. Exact mathematical identity with reversed two-bone ordering.
     else if (blend_q >= 0 && blend_q <= 4096)
     {
-      if (const auto it = gc_by_swapped_key.find(name_key);
-          it != gc_by_swapped_key.end())
+      if (const auto swapped_it = gc_by_swapped_key.find(name_key);
+          swapped_it != gc_by_swapped_key.end())
       {
-        matches = &it->second;
+        matches = &swapped_it->second;
         occurrence = &next_swapped_occurrence[name_key];
         swapped_equivalent = true;
       }
@@ -2513,19 +2513,19 @@ void BuildExactSkinGroupMap(std::span<const u8> gc_bytes, ExactDMFPair* pair)
     // that ordering has already been independently proven.
     if (!matches && bone_order_proven)
     {
-      if (const auto it = gc_by_index_key.find(index_key);
-          it != gc_by_index_key.end())
+      if (const auto index_it = gc_by_index_key.find(index_key);
+          index_it != gc_by_index_key.end())
       {
-        matches = &it->second;
+        matches = &index_it->second;
         occurrence = &next_index_occurrence[index_key];
         structural_index = true;
       }
       else if (blend_q >= 0 && blend_q <= 4096)
       {
-        if (const auto it = gc_by_swapped_index_key.find(index_key);
-            it != gc_by_swapped_index_key.end())
+        if (const auto swapped_index_it = gc_by_swapped_index_key.find(index_key);
+            swapped_index_it != gc_by_swapped_index_key.end())
         {
-          matches = &it->second;
+          matches = &swapped_index_it->second;
           occurrence = &next_swapped_index_occurrence[index_key];
           swapped_equivalent = true;
           structural_index = true;
@@ -4037,16 +4037,16 @@ void PreloadCurrentLevelDMF(std::string_view level)
               if (probe_reported)
                 break;
 
-              const std::size_t next =
+              const std::size_t next_geometry =
                   (index_start +
                    index_bytes + 15) &
                   ~std::size_t(15);
 
-              if (next > bytes.size())
+              if (next_geometry > bytes.size())
               {
                 probe_fail(material, cluster,
                            "next-geometry-oob",
-                           static_cast<u32>(next),
+                           static_cast<u32>(next_geometry),
                            geometry,
                            index_count,
                            vertex_count);
@@ -4055,7 +4055,7 @@ void PreloadCurrentLevelDMF(std::string_view level)
               }
 
               geometry =
-                  static_cast<u32>(next);
+                  static_cast<u32>(next_geometry);
             }
           }
         }
@@ -4455,7 +4455,7 @@ StaticDrawMatch FindDisplayList(u32 address, std::span<const u8> commands)
   const u32 runtime_address = address & 0x1fffffff;
   const u32 size = static_cast<u32>(commands.size());
   const u64 command_hash =
-      Common::GetHash64(commands.data() + 52, commands.size() - 52, 0);
+      Common::GetHash64(commands.data() + 52, size - 52u, 0);
 
   g_pending_display_list_hash =
       {runtime_address, size, commands.data(), command_hash, true};
@@ -4563,7 +4563,7 @@ void SetDisplayListContext(u32 address, std::span<const u8> commands)
   else
   {
     command_hash =
-        Common::GetHash64(commands.data() + 52, commands.size() - 52, 0);
+        Common::GetHash64(commands.data() + 52, command_size - 52u, 0);
   }
 
   g_pending_display_list_hash.valid = false;
