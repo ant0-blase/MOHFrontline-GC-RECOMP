@@ -177,26 +177,26 @@ bool OpenFolder(const fs::path& path, std::string* error)
   return true;
 }
 
-bool IsReady(const fs::path& root)
+bool IsReady(const fs::path& root, const Settings& settings)
 {
+  if (settings.iso.empty() || !fs::is_regular_file(settings.iso))
+    return false;
 #if defined(_WIN32)
   return fs::is_regular_file(root / "runtime" / "moderngekko-run.exe") &&
-         fs::is_regular_file(root / "module" / "gGMFE69_recomp.dll") &&
-         fs::is_regular_file(root / "extracted" / "sys" / "main.dol");
+         fs::is_regular_file(root / "module" / "gGMFE69_recomp.dll");
 #else
   return fs::is_regular_file(root / "runtime" / "moderngekko-run") &&
-         fs::is_regular_file(root / "module" / "gGMFE69_recomp.so") &&
-         fs::is_regular_file(root / "extracted" / "sys" / "main.dol");
+         fs::is_regular_file(root / "module" / "gGMFE69_recomp.so");
 #endif
 }
 
-std::string ReadyText(const fs::path& root)
+std::string ReadyText(const fs::path& root, const Settings& settings)
 {
-  if (IsReady(root))
-    return "Ready to launch";
-  if (!fs::is_regular_file(root / "extracted" / "sys" / "main.dol"))
-    return "Game not prepared yet";
-  return "Runtime/module build incomplete";
+  if (IsReady(root, settings))
+    return "Ready to launch directly from disc image";
+  if (settings.iso.empty() || !fs::is_regular_file(settings.iso))
+    return "Select a supported GMFE69 disc image";
+  return "Native module has not been built yet";
 }
 
 bool StartBuild(const fs::path& root, const Settings& settings, SDL_Process** process,
@@ -204,17 +204,17 @@ bool StartBuild(const fs::path& root, const Settings& settings, SDL_Process** pr
 {
   if (settings.iso.empty() || !fs::is_regular_file(settings.iso))
   {
-    *error = "Select your legally owned GMFE69 ISO first.";
+    *error = "Select your legally owned GMFE69 disc image first.";
     return false;
   }
 
 #if defined(_WIN32)
   return Spawn({"powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-File", (root / "scripts" / "build-windows.ps1").string(),
-                "-Iso", settings.iso.string()},
+                "-File", (root / "scripts" / "build-portable.ps1").string(),
+                "-DiscImage", settings.iso.string()},
                process, error);
 #else
-  return Spawn({"bash", (root / "scripts" / "launcher-build.sh").string(),
+  return Spawn({"bash", (root / "scripts" / "build-portable.sh").string(),
                 settings.iso.string()},
                process, error);
 #endif
@@ -223,7 +223,7 @@ bool StartBuild(const fs::path& root, const Settings& settings, SDL_Process** pr
 bool StartGame(const fs::path& root, const Settings& settings, SDL_Process** process,
                std::string* error)
 {
-  if (!IsReady(root))
+  if (!IsReady(root, settings))
   {
     *error = "Build the recompilation before launching.";
     return false;
@@ -292,7 +292,7 @@ int main(int argc, char** argv)
   DialogState ps3_dialog;
   SDL_Process* build_process = nullptr;
   SDL_Process* game_process = nullptr;
-  std::string status = ReadyText(root);
+  std::string status = ReadyText(root, settings);
   std::string error;
   bool done = false;
 
@@ -368,15 +368,16 @@ int main(int argc, char** argv)
 
     ImGui::TextUnformatted("GameCube game");
     if (settings.iso.empty())
-      ImGui::TextDisabled("No ISO selected");
+      ImGui::TextDisabled("No disc image selected");
     else
       ImGui::TextWrapped("%s", settings.iso.string().c_str());
 
-    if (ImGui::Button("Select GMFE69 ISO"))
+    if (ImGui::Button("Select GMFE69 disc image"))
     {
       static constexpr SDL_DialogFileFilter filters[] = {
-          {"GameCube ISO", "iso;gcm"},
-          {"Disc images", "iso;gcm;rvz"}};
+          {"GameCube disc images", "iso;gcm;rvz;wia;wbfs;ciso;gcz;tgc;nfs"},
+          {"ISO / GCM", "iso;gcm"},
+          {"Compressed images", "rvz;wia;wbfs;ciso;gcz;tgc;nfs"}};
       SDL_ShowOpenFileDialog(FileDialogCallback, &iso_dialog, window, filters,
                              static_cast<int>(std::size(filters)), nullptr, false);
     }
@@ -419,18 +420,18 @@ int main(int argc, char** argv)
     if (ImGui::Button("Open logs"))
       OpenFolder(root / "user" / "Logs", &error);
     ImGui::SameLine();
-    if (ImGui::Button("Open extracted game"))
-      OpenFolder(root / "extracted", &error);
+    if (ImGui::Button("Open AOT cache"))
+      OpenFolder(root / "disc-cache" / "GMFE69", &error);
 
     ImGui::Spacing();
     ImGui::Separator();
-    status = build_process ? "Building recompilation..." : ReadyText(root);
+    status = build_process ? "Building recompilation..." : ReadyText(root, settings);
     ImGui::Text("Status: %s", status.c_str());
     if (!error.empty())
       ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.30f, 1.0f), "%s", error.c_str());
 
     ImGui::Spacing();
-    ImGui::BeginDisabled(!IsReady(root));
+    ImGui::BeginDisabled(!IsReady(root, settings));
     if (ImGui::Button("PLAY", ImVec2(220 * scale, 52 * scale)))
     {
       error.clear();

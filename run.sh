@@ -7,6 +7,13 @@ RUNTIME="$ROOT/runtime/moderngekko-run"
 MODULE="$ROOT/module/g${GAME_ID}_recomp.so"
 GAME="$ROOT/extracted"
 USER_DIR="$ROOT/user"
+DISC_SOURCE_FILE="$USER_DIR/disc-image.txt"
+if [[ -f "$DISC_SOURCE_FILE" ]]; then
+  IFS= read -r DISC_SOURCE < "$DISC_SOURCE_FILE" || true
+  if [[ -n "${DISC_SOURCE:-}" && -f "$DISC_SOURCE" ]]; then
+    GAME="$DISC_SOURCE"
+  fi
+fi
 
 FOV="default"
 WEAPON_FOV="follow"
@@ -215,9 +222,12 @@ if [[ ! -f "$MODULE" ]]; then
   echo "run $ROOT/build.sh first" >&2
   exit 1
 fi
-if [[ ! -f "$GAME/sys/main.dol" ]]; then
-  echo "error: extracted Medal of Honor: Frontline game is missing" >&2
-  echo "run $ROOT/build.sh after placing your own GMFE69 ISO in iso/" >&2
+if [[ -d "$GAME" && ! -f "$GAME/sys/main.dol" ]]; then
+  echo "error: extracted Medal of Honor: Frontline game is incomplete" >&2
+  exit 1
+fi
+if [[ ! -d "$GAME" && ! -f "$GAME" ]]; then
+  echo "error: selected Medal of Honor: Frontline disc image is missing" >&2
   exit 1
 fi
 mkdir -p "$USER_DIR"

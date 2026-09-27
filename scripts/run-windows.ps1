@@ -12,9 +12,17 @@ $Runtime = Join-Path $Root "runtime\moderngekko-run.exe"
 $Module = Join-Path $Root "module\gGMFE69_recomp.dll"
 $Game = Join-Path $Root "extracted"
 $User = Join-Path $Root "user"
+$DiscSourceFile = Join-Path $User "disc-image.txt"
+if (Test-Path $DiscSourceFile) {
+    $DiscSource = (Get-Content $DiscSourceFile -Raw).Trim()
+    if ($DiscSource -and (Test-Path $DiscSource)) { $Game = $DiscSource }
+}
 if (!(Test-Path $Runtime)) { throw "Missing runtime: $Runtime (run scripts\build-windows.ps1)" }
 if (!(Test-Path $Module)) { throw "Missing module: $Module (run scripts\build-windows.ps1)" }
-if (!(Test-Path (Join-Path $Game "sys\main.dol"))) { throw "Missing extracted GMFE69 game data" }
+if (!(Test-Path $Game)) { throw "Missing selected GMFE69 game source: $Game" }
+if ((Get-Item $Game).PSIsContainer -and !(Test-Path (Join-Path $Game "sys\main.dol"))) {
+    throw "Incomplete extracted GMFE69 game data"
+}
 New-Item -ItemType Directory -Force -Path $User | Out-Null
 
 if (!$Ps3Files) { $Ps3Files = Join-Path $Root "HD\PS3_FILES" }
@@ -30,7 +38,11 @@ $env:MOH_PS3_FONTS = "1"
 $env:MOH_PS3_FONT_RENDER = "1"
 $env:MOH_PS3_FONT_AA = "1"
 $env:MOH_PS3_CSM = "0"
-$env:MOH_GC_FILES = Join-Path $Game "files"
+if ((Get-Item $Game).PSIsContainer -and (Test-Path (Join-Path $Game "files"))) {
+    $env:MOH_GC_FILES = Join-Path $Game "files"
+} else {
+    Remove-Item Env:MOH_GC_FILES -ErrorAction SilentlyContinue
+}
 $env:MOH_NATIVE_PC_ASSETS = "1"
 $env:MOH_NATIVE_VFS_DISC = "1"
 $env:MOH_NATIVE_AUDIO = "1"
