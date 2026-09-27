@@ -26,6 +26,11 @@ option(MODERNGEKKO_ENABLE_DISC_TOOL
        "Build Dolphin's disc conversion and verification tool" OFF)
 option(MODERNGEKKO_ENABLE_MOH_MOBILE_BRIDGE
        "Build the MOH Frontline logical touch/controller bridge" OFF)
+
+option(MODERNGEKKO_ENABLE_NOD_DISC
+       "Use encounter/nod for direct GameCube disc-image inspection (ISO/GCM/RVZ/WIA/WBFS/CISO/GCZ/TGC)" OFF)
+set(MODERNGEKKO_NOD_VERSION "v2.0.0-alpha.12" CACHE STRING
+    "encounter/nod release used for direct disc-image access")
 set(MODERNGEKKO_FRONTEND_NAME "ModernGekko" CACHE STRING
     "Branded frontend display name")
 set(MODERNGEKKO_LAUNCHER_OUTPUT_NAME "ModernGekko" CACHE STRING
@@ -149,6 +154,38 @@ else()
     add_subdirectory(vendor/dolphin/DolRecomp EXCLUDE_FROM_ALL)
 endif()
 
+if(MODERNGEKKO_ENABLE_NOD_DISC)
+    find_package(nod QUIET CONFIG)
+    if(NOT TARGET nod::nod)
+        string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _moderngekko_nod_arch)
+        set(_moderngekko_nod_platform "")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND _moderngekko_nod_arch MATCHES "^(x86_64|amd64)$")
+            set(_moderngekko_nod_platform "linux-x86_64")
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND _moderngekko_nod_arch MATCHES "^(x86_64|amd64)$")
+            set(_moderngekko_nod_platform "windows-x86_64")
+        endif()
+        if(NOT _moderngekko_nod_platform)
+            message(FATAL_ERROR "No bundled nod package for ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
+        endif()
+        include(FetchContent)
+        FetchContent_Declare(moderngekko_nod_prebuilt
+            URL "https://github.com/encounter/nod/releases/download/${MODERNGEKKO_NOD_VERSION}/libnod-${_moderngekko_nod_platform}.tar.gz"
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+            EXCLUDE_FROM_ALL)
+        FetchContent_MakeAvailable(moderngekko_nod_prebuilt)
+        set(_moderngekko_saved_build_shared_libs "${BUILD_SHARED_LIBS}")
+        set(BUILD_SHARED_LIBS OFF)
+        find_package(nod REQUIRED CONFIG
+            PATHS "${moderngekko_nod_prebuilt_SOURCE_DIR}"
+            NO_DEFAULT_PATH
+            NO_CMAKE_FIND_ROOT_PATH)
+        set(BUILD_SHARED_LIBS "${_moderngekko_saved_build_shared_libs}")
+    endif()
+    if(NOT TARGET nod::nod)
+        message(FATAL_ERROR "encounter/nod did not provide nod::nod")
+    endif()
+endif()
+
 add_library(moderngekko_abi INTERFACE)
 add_library(ModernGekko::ABI ALIAS moderngekko_abi)
 
@@ -248,11 +285,19 @@ target_include_directories(moderngekko_dolphin_video
 target_link_libraries(moderngekko_dolphin_video PUBLIC fmt::fmt)
 
 target_link_libraries(moderngekko_legacy PUBLIC ModernGekko::ABI fmt::fmt)
+if(MODERNGEKKO_ENABLE_NOD_DISC)
+    target_link_libraries(moderngekko_legacy PUBLIC nod::nod)
+    target_compile_definitions(moderngekko_legacy PUBLIC MODERNGEKKO_HAVE_NOD=1)
+endif()
 target_compile_features(moderngekko_legacy PUBLIC cxx_std_23)
 target_include_directories(moderngekko_legacy PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin_legacy")
 
 target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
+if(MODERNGEKKO_ENABLE_NOD_DISC)
+    target_link_libraries(moderngekko PRIVATE nod::nod)
+    target_compile_definitions(moderngekko PUBLIC MODERNGEKKO_HAVE_NOD=1)
+endif()
 if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     target_sources(moderngekko PRIVATE
         src/runtime/dolphin_runtime.cpp
