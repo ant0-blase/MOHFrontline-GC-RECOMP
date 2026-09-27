@@ -17,6 +17,16 @@ Windows input and PS3 remaster asset hotfix release.
 - Expanded Win32 keyboard translation for navigation, modifiers and function keys used by the standalone runtime.
 - Fixes the Windows behavior where the settings UI could be opened but could not be clicked and where keyboard/mouse input was only partially functional.
 
+### Default enhanced PC profile
+
+- Fresh configurations now start at **1920x1200 / 16:10**.
+- World FOV defaults to **105°** with the weapon FOV following the world FOV.
+- Internal rendering defaults to **5× EFB** with **16× anisotropic filtering**.
+- Enhanced graphics/post-processing is enabled by default.
+- The default Enhanced preset keeps bloom, filmic tone mapping, enhanced screen-space lighting, ambient occlusion, contact shadows and sharpening enabled; DOF, vignette and film grain remain disabled by default.
+- PS3 texture and font replacement remain enabled when a valid user-supplied PS3 source is mounted.
+- Existing saved user settings are preserved and continue to override these fresh-install defaults.
+
 ### PS3 remaster assets
 
 - Preserved per-level path scope for package-backed PS3 assets instead of flattening lookups that lost the current level context.
