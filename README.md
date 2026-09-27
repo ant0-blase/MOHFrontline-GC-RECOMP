@@ -8,6 +8,9 @@
 
 Linux · PowerPC → native C recompilation · Vulkan · Wayland · Multi-image ABI v5
 
+[![CI](https://github.com/ant0-blase/MOHFrontline-GC-RECOMP/actions/workflows/ci.yml/badge.svg)](https://github.com/ant0-blase/MOHFrontline-GC-RECOMP/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ant0-blase/MOHFrontline-GC-RECOMP?include_prereleases&label=release)](https://github.com/ant0-blase/MOHFrontline-GC-RECOMP/releases)
+
 </div>
 
 <p align="center">
