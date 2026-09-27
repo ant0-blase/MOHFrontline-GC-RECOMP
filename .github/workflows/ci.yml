@@ -41,6 +41,14 @@ jobs:
       - name: Validate Python tools
         run: python3 -m compileall -q tools
 
+      - name: Validate changelog release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/extract_changelog.py CHANGELOG.md --version v0.0.1 --output /tmp/v0.0.1-notes.md
+          test -s /tmp/v0.0.1-notes.md
+          grep -q "Static recompilation core" /tmp/v0.0.1-notes.md
+
       - name: Validate minimal portable payload
         shell: bash
         run: |

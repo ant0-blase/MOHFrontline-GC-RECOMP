@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -26,10 +29,11 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
+      - uses: actions/checkout@v5
       - id: version
         shell: bash
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
           VERSION="${VERSION#"${VERSION%%[![:space:]]*}"}"
@@ -40,6 +44,14 @@ jobs:
             exit 1
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Validate changelog release notes
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          python3 tools/extract_changelog.py CHANGELOG.md --version "$VERSION" --output /tmp/release-notes.md
+          test -s /tmp/release-notes.md
 
   linux:
     name: Portable · Linux x86_64
@@ -263,18 +275,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.validate.outputs.version }}
-          REPLACE: ${{ inputs.replace_assets }}
+          REPLACE: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_assets || false }}
         run: |
           set -euo pipefail
+          python3 tools/extract_changelog.py CHANGELOG.md --version "$VERSION" --output release-notes.md
           if gh release view "$VERSION" >/dev/null 2>&1; then
             if [[ "$REPLACE" != "true" ]]; then
               echo "::error::Release $VERSION already exists. Re-run with replace_assets=true."
               exit 1
             fi
+            gh release edit "$VERSION" \
+              --title "MOHFrontline-GC-RECOMP $VERSION" \
+              --notes-file release-notes.md
             gh release upload "$VERSION" dist/* --clobber
             exit 0
           fi
           extra=()
           [[ "$VERSION" == v0.* ]] && extra+=(--prerelease)
           gh release create "$VERSION" dist/* --target "$GITHUB_SHA" \
-            --title "MOHFrontline-GC-RECOMP $VERSION" --generate-notes "${extra[@]}"
+            --title "MOHFrontline-GC-RECOMP $VERSION" \
+            --notes-file release-notes.md "${extra[@]}"

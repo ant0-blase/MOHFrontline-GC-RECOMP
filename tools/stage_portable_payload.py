@@ -9,6 +9,7 @@ import shutil
 FILES = (
     "LICENSE",
     "README.md",
+    "CHANGELOG.md",
     "run.sh",
     "scripts/run-windows.ps1",
     "scripts/build-portable.sh",
