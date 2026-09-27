@@ -134,6 +134,17 @@ def stage(root: Path, platform: str) -> None:
             elif name == "python":
                 if platform == "windows":
                     copy_contents(src, tc / "python")
+                    # CPython's embeddable distribution uses an isolated ._pth
+                    # file. Keep its stdlib path and add the package's tools/
+                    # directory so build_all_exec_module.py can import the
+                    # project-local post-generation helpers.
+                    pth = next((p for p in (tc / "python").glob("python*._pth")), None)
+                    if pth:
+                        lines = [line for line in pth.read_text(encoding="utf-8").splitlines()
+                                 if line.strip() and line.strip() != "#import site"]
+                        if "../../tools" not in lines:
+                            lines.append("../../tools")
+                        pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
                 else:
                     pyroot = src / "python" if (src / "python").is_dir() else src
                     copy_contents(pyroot, tc / "python")

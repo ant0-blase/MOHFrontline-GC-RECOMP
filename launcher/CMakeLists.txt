@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 get_filename_component(MOH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(SDL_ROOT "${MOH_ROOT}/ModernGekko/vendor/dolphin/Externals/SDL/SDL")
 set(IMGUI_ROOT "${MOH_ROOT}/ModernGekko/vendor/dolphin/Externals/imgui/imgui")

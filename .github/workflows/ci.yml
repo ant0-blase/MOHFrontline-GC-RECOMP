@@ -119,6 +119,7 @@ jobs:
         run: |
           mkdir -p dist/launcher-linux
           install -m755 launcher/bin/MOHFrontline-Launcher dist/launcher-linux/
+          install -m755 launcher/bin/MOHFrontline-DiscCache dist/launcher-linux/
           cp LICENSE dist/launcher-linux/
       - uses: actions/upload-artifact@v4
         with:
@@ -141,14 +142,17 @@ jobs:
           cmake -S launcher -B build/launcher-ci `
             -G "Visual Studio 17 2022" -A x64
       - name: Build standalone launcher
-        run: cmake --build build/launcher-ci --config Release --target MOHFrontline-Launcher --parallel 2
+        run: cmake --build build/launcher-ci --config Release --target MOHFrontline-Launcher MOHFrontline-DiscCache --parallel 2
       - name: Stage artifact
         shell: pwsh
         run: |
           $launcher = Get-ChildItem launcher/bin -Filter MOHFrontline-Launcher.exe -Recurse | Select-Object -First 1
           if (!$launcher) { throw "MOHFrontline-Launcher.exe was not produced" }
           New-Item -ItemType Directory -Force dist/launcher-windows | Out-Null
+          $discCache = Get-ChildItem launcher/bin -Filter MOHFrontline-DiscCache.exe -Recurse | Select-Object -First 1
+          if (!$discCache) { throw "MOHFrontline-DiscCache.exe was not produced" }
           Copy-Item $launcher.FullName dist/launcher-windows/MOHFrontline-Launcher.exe
+          Copy-Item $discCache.FullName dist/launcher-windows/MOHFrontline-DiscCache.exe
           Copy-Item LICENSE dist/launcher-windows/
       - uses: actions/upload-artifact@v4
         with:

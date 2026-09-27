@@ -32,59 +32,107 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-
-          # Accept both "0.1.0" and "v0.1.0" from the workflow form.
           VERSION="${VERSION#"${VERSION%%[![:space:]]*}"}"
           VERSION="${VERSION%"${VERSION##*[![:space:]]}"}"
-          if [[ "$VERSION" != v* ]]; then
-            VERSION="v$VERSION"
-          fi
-
+          [[ "$VERSION" == v* ]] || VERSION="v$VERSION"
           if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::version must look like 0.1.0 or v0.1.0"
             exit 1
           fi
-
-          echo "Normalized release version: $VERSION"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
   linux:
-    name: Package · Linux x86_64
+    name: Portable · Linux x86_64
     needs: validate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - name: Install launcher dependencies
+      - name: Install release build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ pkg-config \
+            cmake ninja-build g++ python3 pkg-config patchelf \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
             libxi-dev libxss-dev libwayland-dev libxkbcommon-dev wayland-protocols \
             libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
             libgl1-mesa-dev libegl1-mesa-dev
-      - name: Build launcher
+
+      - name: Build launcher and nod disc cache
         run: ./scripts/build-launcher.sh
-      - name: Package
+
+      - name: Build portable DolRecomp
+        run: |
+          cmake -S ModernGekko/vendor/dolphin/DolRecomp -B build/release-dol-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DDOLRECOMP_ENABLE_LLVM=OFF
+          cmake --build build/release-dol-linux --target dolrecomp --parallel 2
+
+      - name: Build precompiled runtime with direct nod disc support
+        run: |
+          cmake -S ModernGekko -B build/release-runtime-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DMODERNGEKKO_ENABLE_DOLPHIN_RUNTIME=ON \
+            -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF \
+            -DMODERNGEKKO_ENABLE_NOD_DISC=ON \
+            -DMODERNGEKKO_REQUIRED_DISC_ID=GMFE69 \
+            -DMODERNGEKKO_DEFAULT_WINDOW_TITLE="Medal of Honor: Frontline"
+          cmake --build build/release-runtime-linux --target moderngekko-run --parallel 2
+
+      - name: Stage self-contained bundle
         shell: bash
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
           NAME="MOHFrontline-GC-RECOMP-${VERSION}-Linux-x86_64"
-          mkdir -p "dist/$NAME"
-          git archive --format=tar HEAD | tar -xf - -C "dist/$NAME"
-          install -m755 launcher/bin/MOHFrontline-Launcher "dist/$NAME/MOHFrontline-Launcher"
-          printf '%s\n' \
-            "Medal of Honor: Frontline - GameCube Static Recompilation" \
-            "Release: $VERSION" \
-            "Platform: Linux x86_64" \
-            "" \
-            "No retail game data or PS3 assets are included." \
-            "Start MOHFrontline-Launcher and select your own legally obtained GMFE69 ISO." \
-            > "dist/$NAME/RELEASE.txt"
+          STAGE="$PWD/dist/$NAME"
+          mkdir -p "$STAGE"
+          git archive --format=tar HEAD | tar -xf - -C "$STAGE"
+
+          python3 tools/stage_portable_toolchain.py --root "$STAGE" --platform linux
+
+          DOL="$(find build/release-dol-linux -type f -name dolrecomp -perm -111 | head -n1)"
+          [[ -n "$DOL" ]] || { echo "::error::dolrecomp not found"; exit 1; }
+          install -m755 "$DOL" "$STAGE/toolchain/bin/dolrecomp"
+          install -m755 launcher/bin/MOHFrontline-Launcher "$STAGE/MOHFrontline-Launcher"
+          install -m755 launcher/bin/MOHFrontline-DiscCache "$STAGE/MOHFrontline-DiscCache"
+
+          RUNNER="$(find build/release-runtime-linux -type f -name moderngekko-run -perm -111 | head -n1)"
+          [[ -n "$RUNNER" ]] || { echo "::error::moderngekko-run not found"; exit 1; }
+          mkdir -p "$STAGE/runtime" "$STAGE/lib" "$STAGE/module" "$STAGE/user" "$STAGE/disc-cache"
+          install -m755 "$RUNNER" "$STAGE/runtime/moderngekko-run"
+          cp -a "$(dirname "$RUNNER")/Sys" "$STAGE/runtime/Sys"
+
+          collect_libs() {
+            local bin="$1"
+            ldd "$bin" | awk '/=> \/.* \(0x/ {print $3} /^\/.* \(0x/ {print $1}' | while read -r lib; do
+              [[ -f "$lib" ]] || continue
+              case "$(basename "$lib")" in
+                libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux-*.so.*) continue ;;
+              esac
+              cp -L "$lib" "$STAGE/lib/$(basename "$lib")"
+            done
+          }
+          collect_libs "$STAGE/MOHFrontline-Launcher"
+          collect_libs "$STAGE/MOHFrontline-DiscCache"
+          collect_libs "$STAGE/runtime/moderngekko-run"
+          patchelf --set-rpath '$ORIGIN/lib' "$STAGE/MOHFrontline-Launcher"
+          patchelf --set-rpath '$ORIGIN/lib' "$STAGE/MOHFrontline-DiscCache"
+          patchelf --set-rpath '$ORIGIN/../lib' "$STAGE/runtime/moderngekko-run"
+
+          cat > "$STAGE/RELEASE.txt" <<EOF
+          Medal of Honor: Frontline - GameCube Static Recompilation
+          Release: $VERSION
+          Platform: Linux x86_64
+
+          Portable package: CMake, Ninja, Zig, Python, DolRecomp and encounter/nod are bundled.
+          No retail game data or PS3 assets are included.
+          Launch MOHFrontline-Launcher and select your legally obtained GMFE69 disc image.
+          Supported image containers: ISO/GCM, RVZ, WIA, WBFS, CISO, GCZ, TGC and NFS.
+          EOF
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
           sha256sum "dist/$NAME.tar.gz" > "dist/$NAME.tar.gz.sha256"
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux
@@ -94,7 +142,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: Package · Windows x86_64
+    name: Portable · Windows x86_64
     needs: validate
     runs-on: windows-2022
     steps:
@@ -102,14 +150,38 @@ jobs:
         shell: pwsh
         run: git config --global core.longpaths true
       - uses: actions/checkout@v5
-      - name: Configure launcher
+
+      - name: Configure and build launcher plus nod disc cache
         shell: pwsh
         run: |
-          cmake -S launcher -B build/launcher-release `
-            -G "Visual Studio 17 2022" -A x64
-      - name: Build launcher
-        run: cmake --build build/launcher-release --config Release --target MOHFrontline-Launcher --parallel 2
-      - name: Package
+          cmake -S launcher -B build/launcher-release -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build/launcher-release --config Release --target MOHFrontline-Launcher MOHFrontline-DiscCache --parallel 2
+
+      - name: Build portable DolRecomp
+        shell: pwsh
+        run: |
+          cmake -S ModernGekko/vendor/dolphin/DolRecomp -B build/release-dol-windows `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DDOLRECOMP_ENABLE_LLVM=OFF
+          cmake --build build/release-dol-windows --config Release --target dolrecomp --parallel 2
+
+      - name: Build precompiled runtime with direct nod disc support
+        shell: pwsh
+        run: |
+          cmake -S ModernGekko -B build/release-runtime-windows `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DBUILD_TESTING=OFF `
+            -DMODERNGEKKO_ENABLE_DOLPHIN_RUNTIME=ON `
+            -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF `
+            -DMODERNGEKKO_ENABLE_NOD_DISC=ON `
+            -DMODERNGEKKO_REQUIRED_DISC_ID=GMFE69 `
+            "-DMODERNGEKKO_DEFAULT_WINDOW_TITLE=Medal of Honor: Frontline"
+          cmake --build build/release-runtime-windows --config Release --target moderngekko-run --parallel 2
+
+      - name: Stage self-contained bundle
         shell: pwsh
         env:
           VERSION: ${{ needs.validate.outputs.version }}
@@ -118,35 +190,46 @@ jobs:
           $name = "MOHFrontline-GC-RECOMP-$env:VERSION-Windows-x86_64"
           New-Item -ItemType Directory -Force dist, dist/add | Out-Null
           $zip = "dist/$name.zip"
-
-          # Keep the source tree inside the ZIP without expanding its very long
-          # SPIRV-Cross reference paths onto the Windows filesystem.
           git archive --format=zip --output $zip HEAD
           if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
 
+          python tools/stage_portable_toolchain.py --root dist/add --platform windows
+          if ($LASTEXITCODE -ne 0) { throw "portable toolchain staging failed" }
+
           $launcher = Get-ChildItem launcher/bin -Filter MOHFrontline-Launcher.exe -Recurse | Select-Object -First 1
-          if (!$launcher) { throw "MOHFrontline-Launcher.exe was not produced" }
+          $discCache = Get-ChildItem launcher/bin -Filter MOHFrontline-DiscCache.exe -Recurse | Select-Object -First 1
+          $dol = Get-ChildItem build/release-dol-windows -Filter dolrecomp.exe -Recurse | Select-Object -First 1
+          $runner = Get-ChildItem build/release-runtime-windows -Filter moderngekko-run.exe -Recurse | Select-Object -First 1
+          foreach ($item in @($launcher,$discCache,$dol,$runner)) { if (!$item) { throw "missing release binary" } }
+
           Copy-Item $launcher.FullName dist/add/MOHFrontline-Launcher.exe
+          Copy-Item $discCache.FullName dist/add/MOHFrontline-DiscCache.exe
+          Copy-Item $dol.FullName dist/add/toolchain/bin/dolrecomp.exe
+          New-Item -ItemType Directory -Force dist/add/runtime, dist/add/module, dist/add/user, dist/add/disc-cache | Out-Null
+          Copy-Item $runner.FullName dist/add/runtime/moderngekko-run.exe
+          if (Test-Path (Join-Path $runner.DirectoryName "Sys")) { Copy-Item -Recurse (Join-Path $runner.DirectoryName "Sys") dist/add/runtime/Sys }
+          Get-ChildItem $runner.DirectoryName -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination dist/add/runtime
+
           @(
             "Medal of Honor: Frontline - GameCube Static Recompilation",
             "Release: $env:VERSION",
             "Platform: Windows x86_64",
             "",
+            "Portable package: CMake, Ninja, Zig, Python, DolRecomp and encounter/nod are bundled.",
             "No retail game data or PS3 assets are included.",
-            "Start MOHFrontline-Launcher.exe and select your own legally obtained GMFE69 ISO."
+            "Launch MOHFrontline-Launcher.exe and select your legally obtained GMFE69 disc image.",
+            "Supported image containers: ISO/GCM, RVZ, WIA, WBFS, CISO, GCZ, TGC and NFS."
           ) | Set-Content dist/add/RELEASE.txt
 
           $zipAbsolute = (Resolve-Path $zip).Path
           Push-Location dist/add
           try {
-            7z a -tzip $zipAbsolute MOHFrontline-Launcher.exe RELEASE.txt | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw "7z failed to append release files" }
-          } finally {
-            Pop-Location
-          }
-
+            7z a -tzip $zipAbsolute "*" -r | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "7z failed to append portable files" }
+          } finally { Pop-Location }
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $name.zip" | Set-Content "$zip.sha256"
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
@@ -189,9 +272,6 @@ jobs:
             exit 0
           fi
           extra=()
-          if [[ "$VERSION" == v0.* ]]; then extra+=(--prerelease); fi
-          gh release create "$VERSION" dist/* \
-            --target "$GITHUB_SHA" \
-            --title "MOHFrontline-GC-RECOMP $VERSION" \
-            --generate-notes \
-            "${extra[@]}"
+          [[ "$VERSION" == v0.* ]] && extra+=(--prerelease)
+          gh release create "$VERSION" dist/* --target "$GITHUB_SHA" \
+            --title "MOHFrontline-GC-RECOMP $VERSION" --generate-notes "${extra[@]}"
