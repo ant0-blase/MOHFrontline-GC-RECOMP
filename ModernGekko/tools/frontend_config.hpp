@@ -26,16 +26,16 @@ struct ConfigResult {
   // current launcher; `display_resolution` describes the future PC window or
   // monitor mode and is intentionally not applied by the runtime yet.
   std::string display_mode = "windowed";
-  std::string display_resolution = "desktop";
-  std::string aspect_ratio = "auto";
+  std::string display_resolution = "1920x1200";
+  std::string aspect_ratio = "16:10";
   bool vsync = true;
 
   // Graphics and frame pacing. These settings are persisted now so future
   // frontends and per-game patches can share one validated schema.
   int dolphin_scale = 0;
-  std::string resolution = "1920x1080";
+  std::string resolution = "3200x2640";
   std::string graphics_backend = "Vulkan";
-  int anisotropic_filtering = 1;
+  int anisotropic_filtering = 16;
   std::string texture_filtering = "default";
   int anti_aliasing = 1;
   std::string shader_compilation = "hybrid";
