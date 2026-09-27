@@ -111,6 +111,14 @@ First public pre-alpha release of the native PC recompilation of the USA GameCub
 ### Optional PS3 remaster asset layer
 
 - Added support for user-supplied PS3 `PS3_FILES` assets.
+- Added **extraction-less finalized PS3 PKG mounting** for the remaster layer:
+  - the launcher can select a retail/finalized `.pkg` directly;
+  - the package header and encrypted item table are parsed in place;
+  - AES-128-CTR package data is decrypted by range on demand;
+  - textures, TPK/material data, lighting files, meshes and ordinary package files are indexed without extracting the package;
+  - EA BIG/VIV/C0FB containers stored inside the PKG are indexed through random-access decrypted reads;
+  - `PS3_FILES` remains available as the directory-based fallback.
+- PKG contents are never installed or materialized as a full extracted tree by the runtime.
 - Added PS3 texture replacement paths.
 - Added PS3 font replacement/rendering paths.
 - Added PS3 TPK/material processing and experimental mesh/material porting paths.
@@ -126,7 +134,7 @@ First public pre-alpha release of the native PC recompilation of the USA GameCub
   - select a supported GMFE69 disc image;
   - prepare/build the local game-derived native module;
   - launch the recompilation;
-  - select the local PS3 asset directory;
+  - select a local `PS3_FILES` directory **or a finalized PS3 `.pkg` directly**;
   - enable/disable PS3 assets;
   - enable/disable enhanced graphics;
   - open the user directory;

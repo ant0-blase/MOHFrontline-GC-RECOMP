@@ -29,6 +29,9 @@ Linux · PowerPC → native C recompilation · Vulkan · Wayland · Multi-image 
 > [!IMPORTANT]
 > This repository does **not** contain the original game ISO, extracted game data, or **PS3 textures, fonts or other PS3 assets**. You must provide your own legally obtained USA GameCube copy of **Medal of Honor: Frontline** (**`GMFE69`**) and your own legally obtained PS3 assets to use the optional remaster layer.
 
+> [!TIP]
+> The remaster layer can now use either an extracted `PS3_FILES` directory or a **finalized retail PS3 `.pkg` directly**. With a PKG source, texture/material/lighting/mesh data is decrypted and read on demand; the package is not fully extracted to disk.
+
 ## Visual comparison
 
 **Original GC presentation → enhanced native recompilation with PS3 assets.** Both columns show the GameCube project: “PS3 assets” means the optional textures and fonts used by the recompilation, not the game running on a PS3.
@@ -203,7 +206,14 @@ disc image
 
 ModernGekko also contains a native nod-backed `DiscSource` / FST VFS for its native/legacy DI path. It can perform logical DI reads and file-by-path reads directly from compressed images without materializing the retail filesystem.
 
-The launcher also provides PS3 `PS3_FILES` selection, PS3/enhanced-graphics toggles, and shortcuts to the user, logs and AOT-cache folders.
+The launcher also provides PS3 remaster source selection. You can point it at either:
+
+- an extracted `PS3_FILES` directory; or
+- a finalized retail PS3 `.pkg` using **Choose PS3 PKG**.
+
+For a PKG source, the runtime parses the package table and performs AES-CTR random-access reads directly from the package. TPK/VIV/BIG/C0FB containers can therefore feed the existing texture/material resolver without a full PKG extraction. The launcher also exposes PS3/enhanced-graphics toggles and shortcuts to the user, logs and AOT-cache folders.
+
+The legacy SFNH font directory scanner is still directory-oriented; the new PKG path currently targets the remaster texture/material/lighting/mesh asset pipeline first.
 
 > The launcher does not contain or download the original game or PS3 assets. You provide your own legally obtained files.
 
