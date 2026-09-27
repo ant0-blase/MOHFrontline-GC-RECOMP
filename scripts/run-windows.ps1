@@ -43,6 +43,11 @@ if ((Get-Item $Game).PSIsContainer -and (Test-Path (Join-Path $Game "files"))) {
 } else {
     Remove-Item Env:MOH_GC_FILES -ErrorAction SilentlyContinue
 }
+if ((Get-Item $Game).PSIsContainer) {
+    Remove-Item Env:MOH_NATIVE_DISC_IMAGE -ErrorAction SilentlyContinue
+} else {
+    $env:MOH_NATIVE_DISC_IMAGE = (Resolve-Path $Game).Path
+}
 $env:MOH_NATIVE_PC_ASSETS = "1"
 $env:MOH_NATIVE_VFS_DISC = "1"
 $env:MOH_NATIVE_AUDIO = "1"

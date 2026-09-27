@@ -11,6 +11,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#if defined(MOH_NATIVE_VFS_NOD)
+#include <nod.h>
+#endif
+
 #include "Core/HW/DVD/MOHNativeVFSBridge.h"
 #include "VideoCommon/MOHFrontline/Engine/Filesystem/NativeGCAssets.h"
 #include "VideoCommon/MOHFrontline/Engine/Audio/NativeAudio.h"
@@ -32,6 +36,219 @@ struct GCCacheEntry
   std::uint64_t size = 0;
 };
 std::unordered_map<std::string, GCCacheEntry> s_gc_path_cache;
+
+std::string Lower(std::string value);
+bool SamePathString(const std::filesystem::path& a, const std::filesystem::path& b);
+
+#if defined(MOH_NATIVE_VFS_NOD)
+struct NodFileEntry
+{
+  u32 index = 0;
+  u32 size = 0;
+};
+
+struct NodDirFrame
+{
+  u32 end = 0;
+  std::string path;
+};
+
+NodHandle* s_nod_disc = nullptr;
+NodHandle* s_nod_partition = nullptr;
+std::unordered_map<std::string, NodFileEntry> s_nod_files;
+std::mutex s_nod_mutex;
+std::filesystem::path s_nod_image;
+
+void CloseNodDisc()
+{
+  std::scoped_lock lock(s_nod_mutex);
+  nod_free(s_nod_partition);
+  nod_free(s_nod_disc);
+  s_nod_partition = nullptr;
+  s_nod_disc = nullptr;
+  s_nod_files.clear();
+  s_nod_image.clear();
+}
+
+std::string NormalizeNodPath(std::string_view value)
+{
+  std::string path(value);
+  std::replace(path.begin(), path.end(), '\\', '/');
+  while (path.rfind("./", 0) == 0)
+    path.erase(0, 2);
+  while (!path.empty() && path.front() == '/')
+    path.erase(path.begin());
+  return Lower(std::move(path));
+}
+
+struct NodWalkContext
+{
+  std::vector<NodDirFrame> dirs;
+  bool ok = true;
+};
+
+u32 NodWalk(u32 index, NodNodeKind kind, const char* raw_name, u32 size, void* user)
+{
+  auto& context = *static_cast<NodWalkContext*>(user);
+  while (!context.dirs.empty() && index >= context.dirs.back().end)
+    context.dirs.pop_back();
+
+  const std::string name = raw_name ? std::string(raw_name) : std::string{};
+  if (index == 0 && kind == NOD_NODE_KIND_DIRECTORY)
+  {
+    context.dirs.push_back({size, {}});
+    return 1;
+  }
+
+  if (name.empty() || name == "." || name == ".." ||
+      name.find('/') != std::string::npos || name.find('\\') != std::string::npos)
+  {
+    context.ok = false;
+    return NOD_FST_STOP;
+  }
+
+  const std::string path =
+      context.dirs.empty() ? name : context.dirs.back().path + "/" + name;
+  if (kind == NOD_NODE_KIND_DIRECTORY)
+  {
+    if (size <= index)
+    {
+      context.ok = false;
+      return NOD_FST_STOP;
+    }
+    context.dirs.push_back({size, path});
+    return index + 1;
+  }
+
+  s_nod_files.emplace(Lower(path), NodFileEntry{index, size});
+  return index + 1;
+}
+
+bool OpenNodDiscFromEnvironment()
+{
+  const char* value = std::getenv("MOH_NATIVE_DISC_IMAGE");
+  if (!value || !*value)
+    return false;
+
+  const std::filesystem::path requested(value);
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(requested, ec) || ec)
+    return false;
+
+  {
+    std::scoped_lock lock(s_nod_mutex);
+    if (s_nod_disc && SamePathString(s_nod_image, requested))
+      return true;
+  }
+
+  CloseNodDisc();
+
+  NodDiscOptions options{};
+  options.preloader_threads = 2u;
+  NodHandle* disc = nullptr;
+  const auto utf8_path = requested.u8string();
+  const std::string utf8(utf8_path.begin(), utf8_path.end());
+  if (nod_disc_open(utf8.c_str(), &options, &disc) != NOD_RESULT_OK || !disc)
+    return false;
+
+  NodPartitionOptions partition_options{};
+  NodHandle* partition = nullptr;
+  if (nod_disc_open_partition_kind(disc, NOD_PARTITION_KIND_DATA,
+                                   &partition_options, &partition) != NOD_RESULT_OK ||
+      !partition)
+  {
+    nod_free(disc);
+    return false;
+  }
+
+  {
+    std::scoped_lock lock(s_nod_mutex);
+    s_nod_disc = disc;
+    s_nod_partition = partition;
+    s_nod_image = requested;
+    s_nod_files.clear();
+    NodWalkContext context;
+    nod_partition_iterate_fst(s_nod_partition, &NodWalk, &context);
+    if (!context.ok)
+    {
+      nod_free(s_nod_partition);
+      nod_free(s_nod_disc);
+      s_nod_partition = nullptr;
+      s_nod_disc = nullptr;
+      s_nod_files.clear();
+      s_nod_image.clear();
+      return false;
+    }
+  }
+
+  std::fprintf(stderr, "[moh-native-vfs] nod mount: %s files=%zu\n",
+               requested.string().c_str(), s_nod_files.size());
+  return true;
+}
+
+File ResolveNod(std::string_view guest_path, PS3AssetPort::Class wanted)
+{
+  if (!OpenNodDiscFromEnvironment())
+    return {};
+
+  const std::string normalized = NormalizeNodPath(guest_path);
+  if (normalized.empty())
+    return {};
+
+  std::scoped_lock lock(s_nod_mutex);
+  const auto it = s_nod_files.find(normalized);
+  if (it == s_nod_files.end())
+    return {};
+
+  File out;
+  out.source = Source::GameCubeDisc;
+  out.asset_class =
+      wanted == PS3AssetPort::Class::Unknown ? PS3AssetPort::Classify(guest_path) : wanted;
+  out.disc_index = it->second.index;
+  out.guest_path = std::string(guest_path);
+  out.resolved_path = "nod:" + normalized;
+  out.size = it->second.size;
+  return out;
+}
+
+bool ReadNodRange(const File& file, std::uint64_t offset, std::span<u8> destination)
+{
+  if (!file.IsGCDisc() || offset > file.size ||
+      destination.size() > static_cast<std::size_t>(file.size - offset))
+    return false;
+  if (destination.empty())
+    return true;
+
+  std::scoped_lock lock(s_nod_mutex);
+  if (!s_nod_partition)
+    return false;
+
+  NodHandle* raw_file = nullptr;
+  if (nod_partition_open_file(s_nod_partition, file.disc_index, &raw_file) != NOD_RESULT_OK ||
+      !raw_file)
+    return false;
+
+  struct ScopedFile
+  {
+    NodHandle* handle;
+    ~ScopedFile() { nod_free(handle); }
+  } scoped{raw_file};
+
+  if (offset && nod_seek(raw_file, static_cast<std::int64_t>(offset), SEEK_SET) < 0)
+    return false;
+
+  std::size_t done = 0;
+  while (done < destination.size())
+  {
+    const std::int64_t got =
+        nod_read(raw_file, destination.data() + done, destination.size() - done);
+    if (got <= 0)
+      return false;
+    done += static_cast<std::size_t>(got);
+  }
+  return true;
+}
+#endif
 
 std::string Lower(std::string value)
 {
@@ -204,6 +421,11 @@ File ResolvePS3(std::string_view guest_path, PS3AssetPort::Class wanted)
 
 File ResolveGC(std::string_view guest_path, PS3AssetPort::Class wanted)
 {
+#if defined(MOH_NATIVE_VFS_NOD)
+  if (File direct = ResolveNod(guest_path, wanted); direct)
+    return direct;
+#endif
+
   const std::string normalized = NormalizeGuest(guest_path);
   if (normalized.empty())
     return {};
@@ -289,7 +511,8 @@ bool DiscReadCallback(std::string_view guest_path, u64 file_offset, std::span<u8
   }
 
   NativePCStatus::Native(NativePCStatus::Domain::FileIO, guest_path, file.resolved_path);
-  NativeGCAssets::ObserveHostRead(file.host_path, guest_path, file_offset, destination.size());
+  if (!file.IsGCDisc())
+    NativeGCAssets::ObserveHostRead(file.host_path, guest_path, file_offset, destination.size());
   static std::uint64_t hits = 0;
   const std::uint64_t hit = ++hits;
   if (hit <= 256 || (hit % 1024) == 0)
@@ -336,6 +559,9 @@ void Shutdown()
   s_gc_roots.clear();
   s_gc_path_cache.clear();
   s_initialized = false;
+#if defined(MOH_NATIVE_VFS_NOD)
+  CloseNodDisc();
+#endif
 }
 
 Policy GetPolicy()
@@ -360,6 +586,7 @@ const char* SourceName(Source source)
   switch (source)
   {
   case Source::GameCubeHost: return "GC-host";
+  case Source::GameCubeDisc: return "GC-disc/nod";
   case Source::PlayStation3Host: return "PS3-host";
   default: return "none";
   }
@@ -463,6 +690,18 @@ std::vector<u8> Read(const File& file)
   if (file.IsPS3())
     return PS3AssetPort::Read(file.ps3);
 
+#if defined(MOH_NATIVE_VFS_NOD)
+  if (file.IsGCDisc())
+  {
+    std::vector<u8> bytes(static_cast<std::size_t>(file.size));
+    if (!ReadNodRange(file, 0, bytes))
+      return {};
+    NativePCStatus::Native(NativePCStatus::Domain::FileIO, file.guest_path,
+                           file.resolved_path);
+    return bytes;
+  }
+#endif
+
   std::ifstream stream(file.host_path, std::ios::binary | std::ios::ate);
   if (!stream)
     return {};
@@ -482,7 +721,8 @@ std::vector<u8> Read(const File& file)
   if (file.IsGC())
   {
     NativePCStatus::Native(NativePCStatus::Domain::FileIO, file.guest_path, file.resolved_path);
-    NativeGCAssets::ObserveHostRead(file.host_path, file.guest_path, 0, bytes.size());
+    if (!file.IsGCDisc())
+      NativeGCAssets::ObserveHostRead(file.host_path, file.guest_path, 0, bytes.size());
   }
   return bytes;
 }
@@ -495,6 +735,11 @@ bool ReadRange(const File& file, std::uint64_t offset, std::span<u8> destination
 
   if (destination.empty())
     return true;
+
+#if defined(MOH_NATIVE_VFS_NOD)
+  if (file.IsGCDisc())
+    return ReadNodRange(file, offset, destination);
+#endif
 
   if (file.IsPS3())
   {

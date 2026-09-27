@@ -313,7 +313,13 @@ fi
 # and every remaining fallback is reported explicitly in the runtime log.
 # ---------------------------------------------------------------------------
 if [[ "${MOH_NATIVE_PC_ASSETS:-1}" != "0" ]]; then
-  export MOH_GC_FILES="${MOH_GC_FILES:-$GAME/files}"
+  if [[ -f "$GAME" ]]; then
+    export MOH_NATIVE_DISC_IMAGE="$GAME"
+    unset MOH_GC_FILES 2>/dev/null || true
+  else
+    export MOH_GC_FILES="${MOH_GC_FILES:-$GAME/files}"
+    unset MOH_NATIVE_DISC_IMAGE 2>/dev/null || true
+  fi
   export MOH_NATIVE_VFS_DISC="${MOH_NATIVE_VFS_DISC:-1}"
   export MOH_NATIVE_AUDIO="${MOH_NATIVE_AUDIO:-1}"
   export MOH_NATIVE_AUDIO_AUTOPLAY="${MOH_NATIVE_AUDIO_AUTOPLAY:-1}"
