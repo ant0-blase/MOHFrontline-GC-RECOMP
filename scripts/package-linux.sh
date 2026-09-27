@@ -8,6 +8,9 @@ install -m755 "$ROOT/runtime/moderngekko-run" "$OUT/runtime/moderngekko-run"
 cp -a "$ROOT/runtime/Sys" "$OUT/runtime/" 2>/dev/null || true
 install -m755 "$ROOT/module/gGMFE69_recomp.so" "$OUT/module/gGMFE69_recomp.so"
 cp "$ROOT/run.sh" "$ROOT/LICENSE" "$OUT/"
+if [[ -x "$ROOT/launcher/bin/MOHFrontline-Launcher" ]]; then
+  install -m755 "$ROOT/launcher/bin/MOHFrontline-Launcher" "$OUT/MOHFrontline-Launcher"
+fi
 cat > "$OUT/extracted/README.md" <<'TXT'
 Extract your legally owned USA GameCube release of Medal of Honor: Frontline (GMFE69) here.
 Retail game data is intentionally not included in release packages.

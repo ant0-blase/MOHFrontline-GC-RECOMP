@@ -147,6 +147,35 @@ Detailed optimization notes live in [`docs/GMFE69_OPTIMIZATIONS.md`](docs/GMFE69
 
 ---
 
+## Recompilation launcher
+
+The repository now includes a **standalone MOHFrontline-Recompiled launcher** for Windows and Linux. It is separate from the generic ModernGekko frontend and exists only to manage this recompilation.
+
+It provides:
+
+- GMFE69 ISO selection;
+- one-click preparation/build of the recompilation;
+- direct game launch;
+- PS3 `PS3_FILES` folder selection;
+- PS3 asset and enhanced-graphics toggles;
+- shortcuts to the user, logs and extracted-game folders.
+
+Build it with:
+
+```bash
+./scripts/build-launcher.sh
+```
+
+or on Windows:
+
+```powershell
+.\scripts\build-launcher.ps1
+```
+
+The binary is written to `launcher/bin/`.
+
+> The launcher does not contain or download the original game or PS3 assets. You provide your own legally obtained files.
+
 ## Quick start
 
 ### 1. Clone

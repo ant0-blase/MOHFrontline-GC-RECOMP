@@ -9,6 +9,8 @@ if (Test-Path "$Root\runtime\Sys") { Copy-Item -Recurse "$Root\runtime\Sys" "$Ou
 Copy-Item "$Root\module\gGMFE69_recomp.dll" "$Output\module\"
 Copy-Item "$Root\scripts\run-windows.ps1" "$Output\"
 Copy-Item "$Root\LICENSE" "$Output\"
+$Launcher = Join-Path $Root "launcher\bin\MOHFrontline-Launcher.exe"
+if (Test-Path $Launcher) { Copy-Item $Launcher "$Output\" }
 "Extract your legally owned GMFE69 game here. Retail data is not distributed." | Set-Content "$Output\extracted\README.txt"
 Compress-Archive -Path "$Output\*" -DestinationPath "$Output.zip" -Force
 Write-Host "Created $Output.zip"
