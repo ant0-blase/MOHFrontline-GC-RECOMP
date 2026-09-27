@@ -25,10 +25,10 @@ int main() {
 
   const auto defaults = moderngekko::frontend::LoadConfig(directory, true);
   if (!defaults || defaults.display_mode != "windowed" ||
-      defaults.display_resolution != "desktop" ||
-      defaults.aspect_ratio != "auto" || !defaults.vsync ||
-      defaults.resolution != "1920x1080" || defaults.dolphin_scale != 3 ||
-      defaults.fps_target != "original" ||
+      defaults.display_resolution != "1920x1200" ||
+      defaults.aspect_ratio != "16:10" || !defaults.vsync ||
+      defaults.resolution != "3200x2640" || defaults.dolphin_scale != 5 ||
+      defaults.anisotropic_filtering != 16 || defaults.fps_target != "original" ||
       defaults.controller_device_id != "auto" || defaults.audio_volume != 100 ||
       defaults.texture_packs_enabled ||
       defaults.texture_pack_path != "texturepacks" ||
