@@ -32,6 +32,8 @@
 /recomp-llvm/
 /module/
 /runtime/
+/toolchain/
+/disc-cache/
 /.build.lock
 
 # ModernGekko local out-of-tree/in-tree build directories

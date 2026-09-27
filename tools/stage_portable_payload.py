@@ -26,6 +26,7 @@ FILES = (
 TREES = (
     "multi-module-template",
     "ModernGekko/vendor/dolphin/GXRuntime/include",
+    "ModernGekko/vendor/dolphin/GXRuntime/src/core",
     "ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp",
 )
 
