@@ -87,8 +87,7 @@ jobs:
           NAME="MOHFrontline-GC-RECOMP-${VERSION}-Linux-x86_64"
           STAGE="$PWD/dist/$NAME"
           mkdir -p "$STAGE"
-          git archive --format=tar HEAD | tar -xf - -C "$STAGE"
-
+          python3 tools/stage_portable_payload.py --source "$PWD" --destination "$STAGE"
           python3 tools/stage_portable_toolchain.py --root "$STAGE" --platform linux
 
           DOL="$(find build/release-dol-linux -type f -name dolrecomp -perm -111 | head -n1)"
@@ -188,12 +187,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $name = "MOHFrontline-GC-RECOMP-$env:VERSION-Windows-x86_64"
-          New-Item -ItemType Directory -Force dist, dist/add | Out-Null
+          $stage = Join-Path $PWD "dist/$name"
+          New-Item -ItemType Directory -Force dist, $stage | Out-Null
           $zip = "dist/$name.zip"
-          git archive --format=zip --output $zip HEAD
-          if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
 
-          python tools/stage_portable_toolchain.py --root dist/add --platform windows
+          python tools/stage_portable_payload.py --source $PWD --destination $stage
+          if ($LASTEXITCODE -ne 0) { throw "portable payload staging failed" }
+          python tools/stage_portable_toolchain.py --root $stage --platform windows
           if ($LASTEXITCODE -ne 0) { throw "portable toolchain staging failed" }
 
           $launcher = Get-ChildItem launcher/bin -Filter MOHFrontline-Launcher.exe -Recurse | Select-Object -First 1
@@ -202,13 +202,13 @@ jobs:
           $runner = Get-ChildItem build/release-runtime-windows -Filter moderngekko-run.exe -Recurse | Select-Object -First 1
           foreach ($item in @($launcher,$discCache,$dol,$runner)) { if (!$item) { throw "missing release binary" } }
 
-          Copy-Item $launcher.FullName dist/add/MOHFrontline-Launcher.exe
-          Copy-Item $discCache.FullName dist/add/MOHFrontline-DiscCache.exe
-          Copy-Item $dol.FullName dist/add/toolchain/bin/dolrecomp.exe
-          New-Item -ItemType Directory -Force dist/add/runtime, dist/add/module, dist/add/user, dist/add/disc-cache | Out-Null
-          Copy-Item $runner.FullName dist/add/runtime/moderngekko-run.exe
-          if (Test-Path (Join-Path $runner.DirectoryName "Sys")) { Copy-Item -Recurse (Join-Path $runner.DirectoryName "Sys") dist/add/runtime/Sys }
-          Get-ChildItem $runner.DirectoryName -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination dist/add/runtime
+          Copy-Item $launcher.FullName $stage/MOHFrontline-Launcher.exe
+          Copy-Item $discCache.FullName $stage/MOHFrontline-DiscCache.exe
+          Copy-Item $dol.FullName $stage/toolchain/bin/dolrecomp.exe
+          New-Item -ItemType Directory -Force $stage/runtime, $stage/module, $stage/user, $stage/disc-cache | Out-Null
+          Copy-Item $runner.FullName $stage/runtime/moderngekko-run.exe
+          if (Test-Path (Join-Path $runner.DirectoryName "Sys")) { Copy-Item -Recurse (Join-Path $runner.DirectoryName "Sys") $stage/runtime/Sys }
+          Get-ChildItem $runner.DirectoryName -Filter *.dll -ErrorAction SilentlyContinue | Copy-Item -Destination $stage/runtime
 
           @(
             "Medal of Honor: Frontline - GameCube Static Recompilation",
@@ -219,14 +219,10 @@ jobs:
             "No retail game data or PS3 assets are included.",
             "Launch MOHFrontline-Launcher.exe and select your legally obtained GMFE69 disc image.",
             "Supported image containers: ISO/GCM, RVZ, WIA, WBFS, CISO, GCZ, TGC and NFS."
-          ) | Set-Content dist/add/RELEASE.txt
+          ) | Set-Content $stage/RELEASE.txt
 
-          $zipAbsolute = (Resolve-Path $zip).Path
-          Push-Location dist/add
-          try {
-            7z a -tzip $zipAbsolute "*" -r | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw "7z failed to append portable files" }
-          } finally { Pop-Location }
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $name.zip" | Set-Content "$zip.sha256"
 
