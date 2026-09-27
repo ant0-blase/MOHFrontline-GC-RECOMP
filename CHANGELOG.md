@@ -159,6 +159,7 @@ First public pre-alpha release of the native PC recompilation of the USA GameCub
 - Windows launcher/runtime packaging uses the static MSVC runtime where configured to reduce external redistributable requirements.
 - Added compact/minimal release payload staging so the end-user ZIP does not contain the complete Dolphin source tree or its very long SPIRV-Cross paths.
 - Added SHA-256 sidecar files for release archives.
+- Windows portable module generation pins **Zig 0.15.1** because Zig 0.16.0 regresses the Windows GNU shared-library link used by `gGMFE69_recomp.dll`; CI now performs a real ThinLTO DLL link smoke-test with the bundled toolchain.
 - No original GameCube game data or PS3 assets are included in release archives.
 
 ### CI/CD

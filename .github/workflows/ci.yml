@@ -216,6 +216,75 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  portable-toolchain-windows:
+    name: Portable toolchain · Windows DLL link
+    runs-on: windows-2022
+    steps:
+      - name: Enable Win32 long paths for Git
+        shell: pwsh
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v5
+      - name: Stage bundled Windows toolchain
+        shell: pwsh
+        run: |
+          python tools/stage_portable_toolchain.py --root build/portable-smoke --platform windows
+          if ($LASTEXITCODE -ne 0) { throw "portable toolchain staging failed" }
+          $zigVersion = & build/portable-smoke/toolchain/zig/zig.exe version
+          if ($LASTEXITCODE -ne 0) { throw "zig version probe failed" }
+          Write-Host "Bundled Zig: $zigVersion"
+          if ($zigVersion.Trim() -ne "0.15.1") { throw "unexpected Windows Zig version: $zigVersion" }
+      - name: Create DLL link smoke project
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/portable-smoke-src | Out-Null
+          @'
+          cmake_minimum_required(VERSION 3.16)
+          project(moh_portable_link_smoke C)
+          add_library(moh_portable_link_smoke SHARED smoke.c)
+          target_compile_options(moh_portable_link_smoke PRIVATE -O3 -flto=thin)
+          target_link_options(moh_portable_link_smoke PRIVATE -flto=thin)
+          '@ | Set-Content build/portable-smoke-src/CMakeLists.txt
+          @'
+          #include <math.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <wchar.h>
+
+          #ifdef _WIN32
+          #define API __declspec(dllexport)
+          #else
+          #define API
+          #endif
+
+          API float moh_portable_link_smoke(float value, wchar_t* out, const wchar_t* in)
+          {
+              int exponent = 0;
+              float fraction = frexpf(value, &exponent);
+              if (out && in)
+                  wmemcpy(out, in, 1);
+              return fraction + (float)exponent;
+          }
+          '@ | Set-Content build/portable-smoke-src/smoke.c
+      - name: Configure portable DLL link smoke test
+        shell: pwsh
+        run: |
+          $toolchain = Join-Path $PWD "build/portable-smoke/toolchain/moh-zig.cmake"
+          & build/portable-smoke/toolchain/cmake/bin/cmake.exe `
+            -S build/portable-smoke-src `
+            -B build/portable-smoke-build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
+          if ($LASTEXITCODE -ne 0) { throw "portable DLL smoke configure failed" }
+      - name: Build and verify portable DLL
+        shell: pwsh
+        run: |
+          & build/portable-smoke/toolchain/cmake/bin/cmake.exe `
+            --build build/portable-smoke-build --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "portable DLL smoke link failed" }
+          $dll = Get-ChildItem build/portable-smoke-build -Filter moh_portable_link_smoke.dll -Recurse | Select-Object -First 1
+          if (!$dll) { throw "portable DLL smoke test did not produce a DLL" }
+          Write-Host "portable DLL link OK: $($dll.FullName)"
   launcher-windows:
     name: Launcher · Windows x86_64
     runs-on: windows-2022

@@ -12,7 +12,11 @@ import zipfile
 
 CMAKE_VERSION = "4.4.3"
 NINJA_VERSION = "1.13.2"
-ZIG_VERSION = "0.16.0"
+# Zig 0.16.0 currently regresses the Windows GNU shared-library link used
+# for the locally generated GMFE69 module. Linux keeps 0.16.0; Windows uses
+# the known-good 0.15.1 release until that linker regression is resolved.
+ZIG_WINDOWS_VERSION = "0.15.1"
+ZIG_LINUX_VERSION = "0.16.0"
 PYTHON_WINDOWS_VERSION = "3.13.13"
 PYTHON_LINUX_VERSION = "3.13.12"
 PYTHON_LINUX_RELEASE = "20260303"
@@ -21,13 +25,13 @@ URLS = {
     "windows": {
         "cmake": f"https://github.com/Kitware/CMake/releases/download/v{CMAKE_VERSION}/cmake-{CMAKE_VERSION}-windows-x86_64.zip",
         "ninja": f"https://github.com/ninja-build/ninja/releases/download/v{NINJA_VERSION}/ninja-win.zip",
-        "zig": f"https://ziglang.org/download/{ZIG_VERSION}/zig-x86_64-windows-{ZIG_VERSION}.zip",
+        "zig": f"https://ziglang.org/download/{ZIG_WINDOWS_VERSION}/zig-x86_64-windows-{ZIG_WINDOWS_VERSION}.zip",
         "python": f"https://www.python.org/ftp/python/{PYTHON_WINDOWS_VERSION}/python-{PYTHON_WINDOWS_VERSION}-embed-amd64.zip",
     },
     "linux": {
         "cmake": f"https://github.com/Kitware/CMake/releases/download/v{CMAKE_VERSION}/cmake-{CMAKE_VERSION}-linux-x86_64.tar.gz",
         "ninja": f"https://github.com/ninja-build/ninja/releases/download/v{NINJA_VERSION}/ninja-linux.zip",
-        "zig": f"https://ziglang.org/download/{ZIG_VERSION}/zig-x86_64-linux-{ZIG_VERSION}.tar.xz",
+        "zig": f"https://ziglang.org/download/{ZIG_LINUX_VERSION}/zig-x86_64-linux-{ZIG_LINUX_VERSION}.tar.xz",
         "python": (
             "https://github.com/astral-sh/python-build-standalone/releases/download/"
             f"{PYTHON_LINUX_RELEASE}/cpython-{PYTHON_LINUX_VERSION}+{PYTHON_LINUX_RELEASE}-"
@@ -168,7 +172,7 @@ def stage(root: Path, platform: str) -> None:
         f"platform={platform}\n"
         f"cmake={CMAKE_VERSION}\n"
         f"ninja={NINJA_VERSION}\n"
-        f"zig={ZIG_VERSION}\n"
+        f"zig={ZIG_WINDOWS_VERSION if platform == 'windows' else ZIG_LINUX_VERSION}\n"
         f"python={PYTHON_WINDOWS_VERSION if platform == 'windows' else PYTHON_LINUX_VERSION}\n"
     )
     print(f"[portable] ready: {tc}")
