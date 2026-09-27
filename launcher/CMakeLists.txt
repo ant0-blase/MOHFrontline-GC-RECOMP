@@ -30,6 +30,39 @@ if(UNIX AND NOT APPLE)
 endif()
 add_subdirectory("${SDL_ROOT}" "${CMAKE_BINARY_DIR}/_deps/sdl3" EXCLUDE_FROM_ALL)
 
+set(MOH_NOD_VERSION "v2.0.0-alpha.12" CACHE STRING "encounter/nod version")
+find_package(nod QUIET CONFIG)
+if(NOT TARGET nod::nod)
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _moh_nod_arch)
+  set(_moh_nod_platform "")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND _moh_nod_arch MATCHES "^(x86_64|amd64)$")
+    set(_moh_nod_platform "linux-x86_64")
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND _moh_nod_arch MATCHES "^(x86_64|amd64)$")
+    set(_moh_nod_platform "windows-x86_64")
+  endif()
+  if(NOT _moh_nod_platform)
+    message(FATAL_ERROR "No prebuilt encounter/nod package for this platform")
+  endif()
+  include(FetchContent)
+  FetchContent_Declare(moh_nod
+    URL "https://github.com/encounter/nod/releases/download/${MOH_NOD_VERSION}/libnod-${_moh_nod_platform}.tar.gz"
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+    EXCLUDE_FROM_ALL)
+  FetchContent_MakeAvailable(moh_nod)
+  set(_moh_saved_shared "${BUILD_SHARED_LIBS}")
+  set(BUILD_SHARED_LIBS OFF)
+  find_package(nod REQUIRED CONFIG
+    PATHS "${moh_nod_SOURCE_DIR}"
+    NO_DEFAULT_PATH
+    NO_CMAKE_FIND_ROOT_PATH)
+  set(BUILD_SHARED_LIBS "${_moh_saved_shared}")
+endif()
+
+add_executable(MOHFrontline-DiscCache src/disc_cache.cpp)
+target_link_libraries(MOHFrontline-DiscCache PRIVATE nod::nod)
+set_target_properties(MOHFrontline-DiscCache PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${MOH_ROOT}/launcher/bin"
+)
 add_executable(MOHFrontline-Launcher
   src/main.cpp
   "${IMGUI_ROOT}/imgui.cpp"
