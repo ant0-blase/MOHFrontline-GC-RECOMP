@@ -330,7 +330,7 @@ const std::vector<ResolutionOption> &SupportedResolutions() {
   // scales.
   static const std::vector<ResolutionOption> resolutions = {
       {"640x528", 1},   {"1280x720", 2},  {"1920x1080", 3},  {"2560x1440", 4},
-      {"3840x2160", 6}, {"5120x2880", 8}, {"7680x4320", 12},
+      {"3200x2640", 5}, {"3840x2160", 6}, {"5120x2880", 8}, {"7680x4320", 12},
   };
   return resolutions;
 }
@@ -345,7 +345,7 @@ const std::vector<GraphicsBackendOption> &SupportedGraphicsBackends() {
 
 ConfigResult DefaultConfig() {
   ConfigResult config;
-  config.dolphin_scale = 3;
+  config.dolphin_scale = 5;
   return config;
 }
 
