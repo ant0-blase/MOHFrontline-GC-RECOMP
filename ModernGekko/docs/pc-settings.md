@@ -17,8 +17,8 @@ rejected rather than silently misinterpreted.
 
 | Section | Keys and defaults | Validation |
 | --- | --- | --- |
-| `Display` | `mode=windowed`, `resolution=desktop`, `aspect_ratio=auto`, `vsync=true` | Mode is `windowed`, `borderless`, or `fullscreen`; resolution is `desktop`, `native`, or `WIDTHxHEIGHT`; aspect ratio is `original`, `16:9`, `16:10`, `21:9`, or `auto`. |
-| `Graphics` | `backend=Vulkan`, `internal_resolution=1920x1080`, `anisotropic_filtering=1`, `texture_filtering=default`, `anti_aliasing=1`, `shader_compilation=hybrid` | Backend is Vulkan or OpenGL; filtering, sample count, and shader modes use bounded enumerations; the existing Dolphin EFB-scale validation is retained. |
+| `Display` | `mode=windowed`, `resolution=1920x1200`, `aspect_ratio=16:10`, `vsync=true` | Mode is `windowed`, `borderless`, or `fullscreen`; resolution is `desktop`, `native`, or `WIDTHxHEIGHT`; aspect ratio is `original`, `16:9`, `16:10`, `21:9`, or `auto`. |
+| `Graphics` | `backend=Vulkan`, `internal_resolution=3200x2640` (5× EFB), `anisotropic_filtering=16`, `texture_filtering=default`, `anti_aliasing=1`, `shader_compilation=hybrid` | Backend is Vulkan or OpenGL; filtering, sample count, and shader modes use bounded enumerations; the existing Dolphin EFB-scale validation is retained. |
 | `FPS` | `target=original`, `show_in_title=true` | Target is `original`, `30`, `60`, `90`, `120`, `144`, `165`, `240`, or `unlimited`. Persisting a target does not assert that a title has a safe timing patch for it. |
 | `Controller` | `device_id=auto`, `profile=default`, `deadzone=0.15`, `sensitivity=1.0`, inversion off, vibration on | Deadzone is 0–1, sensitivity is 0.1–4, and text values must be single-line. `device_id` is intended for a stable SDL GUID or `auto`, not an enumeration index. Legacy Dolphin `controller1` through `controller4` values remain supported during the controller-abstraction transition. |
 | `ControllerMappings` | empty | Arbitrary action-to-binding entries with simple action names and single-line values. |
