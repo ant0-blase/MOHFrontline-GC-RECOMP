@@ -35,6 +35,11 @@ struct AssetInfo
 
   bool embedded = false;
   bool refpack = false;
+  // Package-backed assets stay inside the selected PS3 PKG. package_entry is
+  // an index into PS3Pkg::Reader; archive_offset remains relative to that
+  // entry when an EA VIV/BIG container embeds the logical asset.
+  bool package_backed = false;
+  std::uint32_t package_entry = 0;
   std::uint64_t archive_offset = 0;
   std::uint64_t packed_size = 0;
 };

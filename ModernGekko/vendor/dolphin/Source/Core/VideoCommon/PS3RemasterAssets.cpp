@@ -9,6 +9,7 @@
 #include "VideoCommon/PS3RemasterAssets.h"
 #include "VideoCommon/PS3Compass.h"
 #include "VideoCommon/PS3FontParser.h"
+#include "VideoCommon/PS3PkgReader.h"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <span>
 #include <string>
@@ -35,6 +37,7 @@ struct State
   std::uint64_t generation = 0;
 
   std::filesystem::path root;
+  std::unique_ptr<PS3Pkg::Reader> package;
 
   std::vector<AssetInfo> assets;
   std::unordered_map<std::string, std::size_t> by_relative;
@@ -415,9 +418,283 @@ bool ReadArchiveSlice(const std::filesystem::path& archive, std::uint64_t offset
                                      static_cast<std::streamsize>(out->size())));
 }
 
+bool ReadBackingSlice(const AssetInfo& asset, std::uint64_t offset,
+                      std::uint64_t size, std::vector<u8>* out)
+{
+  if (!out || !size || size > std::numeric_limits<std::size_t>::max())
+    return false;
+
+  out->resize(static_cast<std::size_t>(size));
+  if (asset.package_backed)
+  {
+    if (!s.package ||
+        !s.package->Read(asset.package_entry, offset,
+                         std::span<u8>(out->data(), out->size())))
+    {
+      out->clear();
+      return false;
+    }
+    return true;
+  }
+
+  if (!ReadArchiveSlice(asset.absolute_path, offset, size, out))
+  {
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
+bool ReadBackingBytes(const AssetInfo& asset, std::uint64_t offset, std::span<u8> output)
+{
+  if (output.empty())
+    return true;
+  if (asset.package_backed)
+    return s.package && s.package->Read(asset.package_entry, offset, output);
+
+  std::ifstream file(asset.absolute_path, std::ios::binary);
+  if (!file)
+    return false;
+  file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+  return file && static_cast<bool>(
+      file.read(reinterpret_cast<char*>(output.data()),
+                static_cast<std::streamsize>(output.size())));
+}
+
+AssetInfo EmbeddedAsset(const AssetInfo& archive, std::string relative,
+                        std::string filename, Kind kind, std::uint64_t logical_size,
+                        bool refpack, std::uint64_t offset, std::uint64_t packed_size)
+{
+  AssetInfo asset;
+  asset.absolute_path = archive.absolute_path;
+  asset.relative_path = std::move(relative);
+  asset.filename = std::move(filename);
+  asset.kind = kind;
+  asset.size = logical_size;
+  asset.embedded = true;
+  asset.refpack = refpack;
+  asset.package_backed = archive.package_backed;
+  asset.package_entry = archive.package_entry;
+  asset.archive_offset = archive.archive_offset + offset;
+  asset.packed_size = packed_size;
+  return asset;
+}
+
 bool PlausibleArchiveEntry(std::uint64_t file_size, u32 offset, u32 size)
 {
   return size != 0 && offset < file_size && std::uint64_t(offset) + size <= file_size;
+}
+
+bool IndexC0FBArchivePackage(const AssetInfo& archive,
+                               const std::filesystem::path& archive_relative)
+{
+  if (archive.size < 6)
+    return false;
+
+  std::array<u8, 6> header{};
+  if (!ReadBackingBytes(archive, archive.archive_offset, header) ||
+      header[0] != 0xC0 || header[1] != 0xFB)
+    return false;
+
+  const u32 header_size = ((u32(header[2]) << 8) | u32(header[3])) + 4u;
+  const u32 entry_count = (u32(header[4]) << 8) | u32(header[5]);
+  if (header_size < 6 || header_size > archive.size ||
+      !entry_count || entry_count > 65535u)
+    return false;
+
+  std::uint64_t cursor = 6;
+  std::size_t added = 0;
+  std::size_t refpacked = 0;
+
+  for (u32 index = 0; index < entry_count; ++index)
+  {
+    if (cursor + 6u > header_size)
+      break;
+
+    std::array<u8, 6> raw_entry{};
+    if (!ReadBackingBytes(archive, archive.archive_offset + cursor, raw_entry))
+      break;
+    cursor += raw_entry.size();
+
+    const u32 offset = ReadBE24(raw_entry.data());
+    const u32 packed_size = ReadBE24(raw_entry.data() + 3);
+    if (!PlausibleArchiveEntry(archive.size, offset, packed_size))
+      break;
+
+    std::string name;
+    name.reserve(96);
+    for (std::size_t n = 0; n < 1024 && cursor < header_size; ++n, ++cursor)
+    {
+      u8 ch = 0;
+      if (!ReadBackingBytes(archive, archive.archive_offset + cursor,
+                            std::span<u8>(&ch, 1)))
+      {
+        name.clear();
+        break;
+      }
+      if (ch == 0)
+      {
+        ++cursor;
+        break;
+      }
+      if (ch < 0x20 || ch > 0x7e)
+      {
+        name.clear();
+        break;
+      }
+      name.push_back(static_cast<char>(ch));
+    }
+    if (name.empty())
+      continue;
+
+    std::array<u8, 9> prefix{};
+    const std::size_t prefix_size =
+        std::min<std::size_t>(prefix.size(), packed_size);
+    if (!ReadBackingBytes(archive, archive.archive_offset + offset,
+                          std::span<u8>(prefix.data(), prefix_size)))
+      continue;
+
+    const std::span<const u8> prefix_span(prefix.data(), prefix_size);
+    const bool refpack = IsRefPack(prefix_span);
+    std::uint64_t logical_size = packed_size;
+    if (refpack)
+    {
+      if (const std::uint64_t expanded = RefPackExpandedSize(prefix_span))
+        logical_size = expanded;
+      ++refpacked;
+    }
+
+    const std::string relative =
+        Normalize(archive_relative.generic_string()) + "::" + Normalize(name);
+    s.assets.emplace_back(EmbeddedAsset(
+        archive, relative, std::filesystem::path(name).filename().string(),
+        Classify(std::filesystem::path(name)), logical_size, refpack,
+        offset, packed_size));
+    ++added;
+  }
+
+  ++s.stats.ea_archives_opened;
+  s.stats.refpack_entries += refpacked;
+  std::fprintf(stderr,
+               "[moh-ps3-pkg] indexed C0FB %s: %zu entries (%zu RefPack)\n",
+               archive_relative.generic_string().c_str(), added, refpacked);
+  return added != 0;
+}
+
+bool IndexEAArchivePackage(const AssetInfo& archive,
+                           const std::filesystem::path& archive_relative)
+{
+  if (archive.size < 16)
+    return false;
+
+  std::array<u8, 16> header{};
+  if (!ReadBackingBytes(archive, archive.archive_offset, header))
+    return false;
+
+  if (header[0] == 0xC0 && header[1] == 0xFB)
+    return IndexC0FBArchivePackage(archive, archive_relative);
+
+  const std::string magic(reinterpret_cast<const char*>(header.data()), 4);
+  if (magic != "BIGF" && magic != "BIG4" && magic != "BIGH")
+    return false;
+
+  auto plausible_count = [](u32 v) { return v > 0 && v < 1000000u; };
+  auto plausible_header = [&](u32 v) { return v >= 16 && v <= archive.size; };
+
+  u32 entry_count = ReadBE32(header.data() + 8);
+  u32 table_end = ReadBE32(header.data() + 12);
+  bool big_endian = true;
+  if (!plausible_count(entry_count) || !plausible_header(table_end))
+  {
+    entry_count = ReadLE32(header.data() + 8);
+    table_end = ReadLE32(header.data() + 12);
+    big_endian = false;
+    if (!plausible_count(entry_count) || !plausible_header(table_end))
+      return false;
+  }
+
+  std::uint64_t cursor = 16;
+  std::size_t added = 0;
+  std::size_t compressed = 0;
+  for (u32 i = 0; i < entry_count; ++i)
+  {
+    if (cursor + 8u > table_end)
+      break;
+
+    std::array<u8, 8> eh{};
+    if (!ReadBackingBytes(archive, archive.archive_offset + cursor, eh))
+      break;
+    cursor += eh.size();
+
+    u32 offset = big_endian ? ReadBE32(eh.data()) : ReadLE32(eh.data());
+    u32 packed = big_endian ? ReadBE32(eh.data() + 4) : ReadLE32(eh.data() + 4);
+    if (!PlausibleArchiveEntry(archive.size, offset, packed))
+    {
+      const u32 alt_offset = big_endian ? ReadLE32(eh.data()) : ReadBE32(eh.data());
+      const u32 alt_packed = big_endian ? ReadLE32(eh.data() + 4) : ReadBE32(eh.data() + 4);
+      if (!PlausibleArchiveEntry(archive.size, alt_offset, alt_packed))
+        break;
+      offset = alt_offset;
+      packed = alt_packed;
+    }
+
+    std::string name;
+    for (std::size_t n = 0; n < 1024 && cursor < table_end; ++n, ++cursor)
+    {
+      u8 ch = 0;
+      if (!ReadBackingBytes(archive, archive.archive_offset + cursor,
+                            std::span<u8>(&ch, 1)))
+      {
+        name.clear();
+        break;
+      }
+      if (ch == 0)
+      {
+        ++cursor;
+        break;
+      }
+      if (ch < 0x20 || ch > 0x7e)
+      {
+        name.clear();
+        break;
+      }
+      name.push_back(static_cast<char>(ch));
+    }
+    if (name.empty())
+      continue;
+
+    std::array<u8, 9> prefix{};
+    const std::size_t prefix_size =
+        std::min<std::size_t>(prefix.size(), packed);
+    if (!ReadBackingBytes(archive, archive.archive_offset + offset,
+                          std::span<u8>(prefix.data(), prefix_size)))
+      continue;
+
+    const std::span<const u8> prefix_span(prefix.data(), prefix_size);
+    const bool refpack = IsRefPack(prefix_span);
+    std::uint64_t logical = packed;
+    if (refpack)
+    {
+      if (const std::uint64_t expanded = RefPackExpandedSize(prefix_span))
+        logical = expanded;
+      ++compressed;
+    }
+
+    const std::string relative =
+        Normalize(archive_relative.generic_string()) + "::" + Normalize(name);
+    s.assets.emplace_back(EmbeddedAsset(
+        archive, relative, std::filesystem::path(name).filename().string(),
+        Classify(std::filesystem::path(name)), logical, refpack,
+        offset, packed));
+    ++added;
+  }
+
+  ++s.stats.ea_archives_opened;
+  s.stats.refpack_entries += compressed;
+  std::fprintf(stderr,
+               "[moh-ps3-pkg] indexed %s: %zu entries (%zu RefPack)\n",
+               archive_relative.generic_string().c_str(), added, compressed);
+  return added != 0;
 }
 
 bool IndexC0FBArchive(
@@ -802,6 +1079,7 @@ void Reset()
   ++s.generation;
   s.ready = false;
 
+  s.package.reset();
   s.assets.clear();
   s.by_relative.clear();
   s.by_filename.clear();
@@ -809,74 +1087,8 @@ void Reset()
   s.stats = {};
 }
 
-void BuildIndex()
+void FinalizeIndex()
 {
-  Reset();
-
-  if (!s.enabled || s.root.empty())
-    return;
-
-  std::error_code ec;
-
-  if (!std::filesystem::exists(s.root, ec) ||
-      !std::filesystem::is_directory(s.root, ec))
-  {
-    std::fprintf(stderr,
-                 "[moh-ps3] asset directory does not exist: %s\n",
-                 s.root.string().c_str());
-    return;
-  }
-
-  const auto options =
-      std::filesystem::directory_options::skip_permission_denied;
-
-  std::filesystem::recursive_directory_iterator it(
-      s.root, options, ec);
-
-  std::filesystem::recursive_directory_iterator end;
-
-  for (; !ec && it != end; it.increment(ec))
-  {
-    const auto& entry = *it;
-
-    std::error_code file_ec;
-
-    if (!entry.is_regular_file(file_ec))
-      continue;
-
-    const std::filesystem::path path = entry.path();
-
-    AssetInfo asset;
-    asset.absolute_path = path;
-
-    std::filesystem::path relative =
-        std::filesystem::relative(path, s.root, file_ec);
-
-    if (file_ec)
-      relative = path.filename();
-
-    asset.relative_path =
-        Normalize(relative.generic_string());
-
-    asset.filename =
-        path.filename().string();
-
-    asset.kind =
-        Classify(relative);
-
-    asset.size =
-        entry.file_size(file_ec);
-
-    if (file_ec)
-      asset.size = 0;
-
-    const Kind kind = asset.kind;
-    s.assets.emplace_back(std::move(asset));
-
-    if (kind == Kind::Container)
-      IndexEAArchive(path, relative);
-  }
-
   std::sort(s.assets.begin(), s.assets.end(),
             [](const AssetInfo& a, const AssetInfo& b) {
               return a.relative_path < b.relative_path;
@@ -885,20 +1097,13 @@ void BuildIndex()
   for (std::size_t i = 0; i < s.assets.size(); ++i)
   {
     const AssetInfo& asset = s.assets[i];
-
-    s.by_relative.emplace(
-        Normalize(asset.relative_path), i);
+    s.by_relative.emplace(Normalize(asset.relative_path), i);
 
     const std::string filename_key = Lower(asset.filename);
     const auto existing = s.by_filename.find(filename_key);
-
-    // Prefer directly extracted files; otherwise archive entries remain usable
-    // through exact relative-path lookup and as filename fallbacks.
     if (existing == s.by_filename.end() ||
         (s.assets[existing->second].embedded && !asset.embedded))
-    {
       s.by_filename[filename_key] = i;
-    }
 
     AddStats(asset.kind);
     if (asset.embedded)
@@ -907,6 +1112,111 @@ void BuildIndex()
 
   s.ready = true;
   ++s.generation;
+}
+
+void BuildPackageIndex()
+{
+  std::string error;
+  s.package = PS3Pkg::Reader::Open(s.root, &error);
+  if (!s.package)
+  {
+    std::fprintf(stderr, "[moh-ps3-pkg] open failed: %s (%s)\n",
+                 s.root.string().c_str(), error.c_str());
+    return;
+  }
+
+  const auto& entries = s.package->GetEntries();
+  for (std::size_t index = 0; index < entries.size(); ++index)
+  {
+    const auto& entry = entries[index];
+    if (entry.directory || entry.size == 0)
+      continue;
+
+    const std::filesystem::path relative(entry.path);
+    AssetInfo asset;
+    asset.absolute_path = s.root;
+    asset.relative_path = Normalize(entry.path);
+    asset.filename = entry.filename;
+    asset.kind = Classify(relative);
+    asset.size = entry.size;
+    asset.package_backed = true;
+    asset.package_entry = static_cast<std::uint32_t>(index);
+
+    const Kind kind = asset.kind;
+    const AssetInfo archive = asset;
+    s.assets.emplace_back(std::move(asset));
+    if (kind == Kind::Container)
+      IndexEAArchivePackage(archive, relative);
+  }
+
+  std::fprintf(stderr,
+               "[moh-ps3-pkg] mounted %s content-id=%s entries=%zu assets=%zu\n",
+               s.root.string().c_str(), s.package->GetContentId().c_str(),
+               entries.size(), s.assets.size());
+}
+
+void BuildDirectoryIndex()
+{
+  std::error_code ec;
+  const auto options = std::filesystem::directory_options::skip_permission_denied;
+  std::filesystem::recursive_directory_iterator it(s.root, options, ec);
+  std::filesystem::recursive_directory_iterator end;
+
+  for (; !ec && it != end; it.increment(ec))
+  {
+    const auto& entry = *it;
+    std::error_code file_ec;
+    if (!entry.is_regular_file(file_ec))
+      continue;
+
+    const std::filesystem::path path = entry.path();
+    AssetInfo asset;
+    asset.absolute_path = path;
+
+    std::filesystem::path relative = std::filesystem::relative(path, s.root, file_ec);
+    if (file_ec)
+      relative = path.filename();
+
+    asset.relative_path = Normalize(relative.generic_string());
+    asset.filename = path.filename().string();
+    asset.kind = Classify(relative);
+    asset.size = entry.file_size(file_ec);
+    if (file_ec)
+      asset.size = 0;
+
+    const Kind kind = asset.kind;
+    s.assets.emplace_back(std::move(asset));
+    if (kind == Kind::Container)
+      IndexEAArchive(path, relative);
+  }
+}
+
+void BuildIndex()
+{
+  Reset();
+  if (!s.enabled || s.root.empty())
+    return;
+
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(s.root, ec) && !ec &&
+      Lower(s.root.extension().string()) == ".pkg")
+  {
+    BuildPackageIndex();
+  }
+  else if (std::filesystem::is_directory(s.root, ec) && !ec)
+  {
+    BuildDirectoryIndex();
+  }
+  else
+  {
+    std::fprintf(stderr, "[moh-ps3] asset source does not exist: %s\n",
+                 s.root.string().c_str());
+    return;
+  }
+
+  if (!s.package && s.assets.empty())
+    return;
+  FinalizeIndex();
 }
 
 const AssetInfo* FindFilenameInternal(std::string_view filename)
@@ -933,29 +1243,21 @@ void Initialize()
     return;
   }
 
-  const char* path =
-      std::getenv("MOH_PS3_FILES");
+  const char* pkg = std::getenv("MOH_PS3_PKG");
+  const char* path = std::getenv("MOH_PS3_FILES");
 
-  if (path && *path)
-  {
-    s.root =
-        std::filesystem::path(path);
-  }
+  if (pkg && *pkg)
+    s.root = std::filesystem::path(pkg);
+  else if (path && *path)
+    s.root = std::filesystem::path(path);
   else
-  {
-    // Allows Windows/manual launches without run.sh as long as the runtime
-    // is started from the project root.
-    s.root =
-        std::filesystem::current_path() /
-        "HD" /
-        "PS3_FILES";
-  }
+    s.root = std::filesystem::current_path() / "HD" / "PS3_FILES";
 
   std::error_code ec;
-
-  s.enabled =
-      std::filesystem::exists(s.root, ec) &&
-      std::filesystem::is_directory(s.root, ec);
+  s.enabled = std::filesystem::exists(s.root, ec) && !ec &&
+              (std::filesystem::is_directory(s.root, ec) ||
+               (std::filesystem::is_regular_file(s.root, ec) &&
+                Lower(s.root.extension().string()) == ".pkg"));
 
   if (!s.enabled)
   {
@@ -965,9 +1267,11 @@ void Initialize()
 
   BuildIndex();
 
-  // Parse the actual PS3 SFNH fonts independently of the old experimental
-  // fuzzy texture bridge.
-  PS3FontParser::Initialize(s.root);
+  // The texture/material/mesh layer is fully package-backed. The legacy SFNH
+  // font scanner still expects a host directory, so only initialize it for
+  // directory sources; package font streaming can be added independently.
+  if (std::filesystem::is_directory(s.root, ec))
+    PS3FontParser::Initialize(s.root);
 
   const Stats& st = s.stats;
 
@@ -1178,29 +1482,10 @@ std::vector<std::uint8_t> ReadBinaryRange(
     }
   }
 
-  std::ifstream file(
-      asset.absolute_path,
-      std::ios::binary);
-
-  if (!file)
+  std::vector<std::uint8_t> data;
+  const std::uint64_t base = asset.embedded ? asset.archive_offset : 0;
+  if (!ReadBackingSlice(asset, base + offset, size, &data))
     return {};
-
-  file.seekg(
-      static_cast<std::streamoff>(offset),
-      std::ios::beg);
-
-  if (!file)
-    return {};
-
-  std::vector<std::uint8_t> data(size);
-
-  if (!file.read(
-          reinterpret_cast<char*>(data.data()),
-          static_cast<std::streamsize>(data.size())))
-  {
-    return {};
-  }
-
   return data;
 }
 
@@ -1214,7 +1499,7 @@ std::vector<std::uint8_t> ReadBinary(
       return {};
 
     std::vector<u8> packed;
-    if (!ReadArchiveSlice(asset.absolute_path, asset.archive_offset, asset.packed_size, &packed))
+    if (!ReadBackingSlice(asset, asset.archive_offset, asset.packed_size, &packed))
       return {};
 
     if (asset.refpack || IsRefPack(std::span<const u8>(packed.data(), packed.size())))
@@ -1252,32 +1537,12 @@ std::vector<std::uint8_t> ReadBinary(
     return {};
   }
 
-  std::ifstream file(
-      asset.absolute_path,
-      std::ios::binary |
-      std::ios::ate);
-
-  if (!file)
+  if (!asset.size || asset.size > std::numeric_limits<std::size_t>::max())
     return {};
 
-  const std::streamoff end =
-      file.tellg();
-
-  if (end <= 0)
+  std::vector<std::uint8_t> data;
+  if (!ReadBackingSlice(asset, 0, asset.size, &data))
     return {};
-
-  file.seekg(0, std::ios::beg);
-
-  std::vector<std::uint8_t> data(
-      static_cast<std::size_t>(end));
-
-  if (!file.read(
-          reinterpret_cast<char*>(data.data()),
-          static_cast<std::streamsize>(data.size())))
-  {
-    return {};
-  }
-
   return data;
 }
 
@@ -1294,7 +1559,7 @@ std::vector<std::uint8_t> ReadRange(const AssetInfo& asset, std::uint64_t offset
   std::vector<u8> result;
   const auto base = asset.embedded ? asset.archive_offset : 0;
   if (base > std::numeric_limits<std::uint64_t>::max() - offset ||
-      !ReadArchiveSlice(asset.absolute_path, base + offset, size, &result)) return {};
+      !ReadBackingSlice(asset, base + offset, size, &result)) return {};
   return result;
 }
 
