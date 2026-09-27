@@ -558,6 +558,17 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     endif()
     target_link_libraries(moderngekko-run PRIVATE
         ModernGekko::Runtime core uicommon imgui ${_moderngekko_sdl_target})
+    # VideoCommon registers every backend compiled for the host.  On Windows
+    # that includes DX11/DX12, so the standalone runner must link their
+    # implementation libraries just like Dolphin's normal frontends do.
+    foreach(_moderngekko_video_backend IN ITEMS
+            videod3d
+            videod3d12)
+        if(TARGET ${_moderngekko_video_backend})
+            target_link_libraries(moderngekko-run PRIVATE
+                ${_moderngekko_video_backend})
+        endif()
+    endforeach()
     set_target_properties(moderngekko-run PROPERTIES
         OUTPUT_NAME "${MODERNGEKKO_RUNNER_OUTPUT_NAME}")
     target_compile_definitions(moderngekko-run PRIVATE
