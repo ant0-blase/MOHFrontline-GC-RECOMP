@@ -314,6 +314,16 @@ std::mutex s_request_mutex;
 std::vector<std::string> s_pending_guests;
 std::string s_last_detected_guest;
 
+// These synchronization/playback flags are part of the public native-video
+// state machine, not the optional FFmpeg decoder. Keep them available in the
+// decoder-less build so queueing, skip suppression and Stop()/IsPlaying()
+// retain identical semantics when host video decode is unavailable.
+std::atomic<bool> s_host_movie_active{false};
+std::atomic<bool> s_skip_requested{false};
+// Protected by s_request_mutex. Prevents the same guest movie from being
+// re-queued by trailing DVD reads after the user skipped it.
+std::string s_skipped_guest;
+
 std::optional<double> RequestedDisplayAspect()
 {
   const char* value = std::getenv("MOH_NATIVE_VIDEO_ASPECT");
@@ -407,11 +417,6 @@ struct Decoder
 };
 
 std::unique_ptr<Decoder> s_decoder;
-std::atomic<bool> s_host_movie_active{false};
-std::atomic<bool> s_skip_requested{false};
-// Protected by s_request_mutex. Prevents the same guest movie from being
-// re-queued by trailing DVD reads after the user skipped it.
-std::string s_skipped_guest;
 
 int ReadPacket(void* opaque, u8* buffer, int buffer_size)
 {
