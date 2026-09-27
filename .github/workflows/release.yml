@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag, for example v0.1.0"
+        description: "Release version, for example 0.1.0 or v0.1.0"
         required: true
         type: string
       replace_assets:
@@ -32,10 +32,20 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+
+          # Accept both "0.1.0" and "v0.1.0" from the workflow form.
+          VERSION="${VERSION#"${VERSION%%[![:space:]]*}"}"
+          VERSION="${VERSION%"${VERSION##*[![:space:]]}"}"
+          if [[ "$VERSION" != v* ]]; then
+            VERSION="v$VERSION"
+          fi
+
           if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::version must look like v0.1.0"
+            echo "::error::version must look like 0.1.0 or v0.1.0"
             exit 1
           fi
+
+          echo "Normalized release version: $VERSION"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
   linux:
