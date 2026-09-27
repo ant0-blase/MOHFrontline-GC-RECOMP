@@ -131,18 +131,19 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
     add_subdirectory(vendor/dolphin EXCLUDE_FROM_ALL)
     set(_moderngekko_cpu_exception_source
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/src/core/cpu_exception.c")
-    target_sources(core PRIVATE
+    # The Dolphin 'core' target links the MSVC 'use_pch' interface target,
+    # which injects both /Yu and /FI pch.h. A C source added directly to core
+    # therefore still inherits the C++ forced include even if /Y- is used.
+    # Compile the GXRuntime C shim in an isolated OBJECT library and inject
+    # only the resulting object into core.
+    add_library(moderngekko_gxruntime_cpu_exception OBJECT
         "${_moderngekko_cpu_exception_source}")
-    # Dolphin's core target owns a C++ PCH. Source-file properties are
-    # directory-scoped in CMake, so apply them in the directory where the
-    # 'core' target was created as well. /Y- is the MSVC hard stop that
-    # prevents this C translation unit from consuming dolphin.pch.
-    set_source_files_properties(
-        "${_moderngekko_cpu_exception_source}"
-        TARGET_DIRECTORY core
-        PROPERTIES
-            SKIP_PRECOMPILE_HEADERS ON
-            COMPILE_OPTIONS "$<$<C_COMPILER_ID:MSVC>:/Y->")
+    target_include_directories(moderngekko_gxruntime_cpu_exception PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
+    set_target_properties(moderngekko_gxruntime_cpu_exception PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_sources(core PRIVATE
+        $<TARGET_OBJECTS:moderngekko_gxruntime_cpu_exception>)
     target_include_directories(core PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
     if(MODERNGEKKO_FRONTEND_SDK)
