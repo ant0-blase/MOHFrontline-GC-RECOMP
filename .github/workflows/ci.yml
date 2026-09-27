@@ -56,6 +56,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DMODERNGEKKO_ENABLE_DOLPHIN_RUNTIME=OFF
           -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF
+          -DMODERNGEKKO_ENABLE_NOD_DISC=ON
           -DBUILD_TESTING=ON
           -DDOLRECOMP_ENABLE_LLVM=OFF
       - name: Build
@@ -92,6 +93,7 @@ jobs:
             -G "Visual Studio 17 2022" -A x64 `
             -DMODERNGEKKO_ENABLE_DOLPHIN_RUNTIME=OFF `
             -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF `
+            -DMODERNGEKKO_ENABLE_NOD_DISC=ON `
             -DBUILD_TESTING=ON `
             -DDOLRECOMP_ENABLE_LLVM=OFF
       - name: Build

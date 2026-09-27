@@ -3,6 +3,7 @@
 #include "Core/Boot/BootMemory.h"
 #include "Core/Boot/DolReader.h"
 #include "moderngekko/interpreter.hpp"
+#include "moderngekko/nod_disc_source.hpp"
 
 #include <limits>
 
@@ -64,6 +65,33 @@ LegacyDolLoadResult LegacyRuntime::LoadDol(std::span<const std::uint8_t> image)
 
   m_cpu.pc = reader.GetEntryPoint();
   return {LegacyDolLoadStatus::Ok, reader.GetEntryPoint(), reader.IsWii()};
+}
+
+bool LegacyRuntime::MountDiscImage(const std::filesystem::path& image,
+                                   std::string* error)
+{
+  auto source = CreateNodDiscSource(image, error);
+  if (!source)
+    return false;
+  m_disc_source = std::move(source);
+  m_disc_interface.SetSource(m_disc_source.get());
+  return true;
+}
+
+void LegacyRuntime::UnmountDiscImage()
+{
+  m_disc_interface.SetSource(nullptr);
+  m_disc_source.reset();
+}
+
+DiscVfsSource* LegacyRuntime::GetDiscVfsSource()
+{
+  return m_disc_source.get();
+}
+
+const DiscVfsSource* LegacyRuntime::GetDiscVfsSource() const
+{
+  return m_disc_source.get();
 }
 
 void LegacyRuntime::UnloadModule()

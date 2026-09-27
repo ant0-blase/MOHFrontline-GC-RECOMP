@@ -5,6 +5,7 @@
 #include "moderngekko/cpu_state.h"
 #include "moderngekko/controller.hpp"
 #include "moderngekko/disc_interface.hpp"
+#include "moderngekko/nod_disc_source.hpp"
 #include "moderngekko/event_scheduler.hpp"
 #include "moderngekko/gx_command_processor.hpp"
 #include "moderngekko/gx_state_backend.hpp"
@@ -16,6 +17,8 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <filesystem>
+#include <memory>
 
 namespace moderngekko
 {
@@ -60,6 +63,10 @@ public:
   ModuleLoadResult AttachModule(const ModernGekkoModuleDesc* descriptor,
                                 const std::string& game_id);
   LegacyDolLoadResult LoadDol(std::span<const std::uint8_t> image);
+  bool MountDiscImage(const std::filesystem::path& image, std::string* error = nullptr);
+  void UnmountDiscImage();
+  DiscVfsSource* GetDiscVfsSource();
+  const DiscVfsSource* GetDiscVfsSource() const;
   void UnloadModule();
   void Reset();
 
@@ -94,6 +101,7 @@ private:
   EventScheduler m_event_scheduler;
   ProcessorInterface m_processor_interface;
   DiscInterface m_disc_interface;
+  std::unique_ptr<DiscVfsSource> m_disc_source;
   AudioSystem m_audio_system;
   GxStateBackend m_gx_state_backend;
   GxCommandProcessor m_gx_command_processor;

@@ -199,6 +199,7 @@ add_library(moderngekko_legacy STATIC
     src/audio/audio_system.cpp
     src/hardware/mmio_bus.cpp
     src/hardware/disc_interface.cpp
+    src/hardware/nod_disc_source.cpp
     src/hardware/processor_interface.cpp
     src/gpu/gx_command_processor.cpp
     src/gpu/gx_state_backend.cpp
@@ -221,6 +222,7 @@ add_library(moderngekko_legacy STATIC
 add_library(ModernGekko::LegacyRuntime ALIAS moderngekko_legacy)
 
 add_library(moderngekko STATIC
+    src/hardware/nod_disc_source.cpp
     src/runtime/module.cpp
     src/runtime/module_loader.cpp
     src/runtime/mod_loader.cpp
